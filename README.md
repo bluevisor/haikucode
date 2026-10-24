@@ -1,16 +1,37 @@
-# picoder
+# Haiku Code
 
-A tiny full-screen **agentic coding CLI** written in Rust, small enough to run
-on a **Raspberry Pi Zero W** (ARMv6, single core, ~512 MB RAM) — and equally at
-home on a Pi 5 or your laptop. It talks to any OpenAI-compatible chat API
-(default: DeepSeek), plus Anthropic's Messages API and OpenAI's Responses API
-natively, and drives a Codex / Claude-Code-style tool loop inside a
-[ratatui](https://ratatui.rs) terminal UI.
+A full-screen **agentic coding CLI** for [Haiku](https://www.haiku-os.org/),
+the BeOS-inspired open-source OS. It runs in Haiku's Terminal, talks to any
+OpenAI-compatible chat API (default: DeepSeek) plus Anthropic's Messages API
+and OpenAI's Responses API natively, and drives a Codex / Claude-Code-style
+tool loop inside a [ratatui](https://ratatui.rs) terminal UI.
 
-The whole thing is one ~2.5 MB statically linked binary with no runtime
-dependencies.
+Haiku Code is a port of [picoder](https://github.com/bluevisor/picoder), the
+coding agent built for the Raspberry Pi Zero W. It is one ~5 MB native Haiku
+binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 
-![picoder screenshot](assets/screenshot.png)
+![Haiku Code in Haiku's Terminal](assets/screenshot.png)
+
+## What's different on Haiku
+
+- **Knows it's on Haiku.** The agent is told the OS release (read from
+  `uname`, e.g. `Haiku R1~beta6+development (hrev60290)`) and Haiku's ground
+  rules: no `sudo` or `which`, no `/proc`, `/boot/system` is read-only
+  packagefs, software comes from `pkgman`, settings live in `~/config/settings`,
+  files carry BFS attributes, and `open` / `hey` drive GUI apps.
+- **Haiku paths.** User state lives in `~/config/settings/haikucode/`
+  (`B_USER_SETTINGS_DIRECTORY`), not `~/.config`.
+- **Live system panel.** The launch banner reads RAM from the kernel
+  (`get_system_info`) instead of `/proc/meminfo`.
+- **Terminal-safe rendering.** The logo is drawn as colored cells rather than
+  block glyphs, which Haiku Terminal's fallback font draws wider than a cell.
+- **Input that keeps working.** Keyboard input uses crossterm's plain `poll(2)`
+  source on Haiku (its default mio source stops delivering keys after the
+  first batch there), and the TUI exits when its terminal goes away, since
+  Haiku sends no `SIGHUP` on hangup.
+- **Sign-in in the right browser.** OAuth logins open with Haiku's `open`.
+- **Deskbar launcher.** *Applications → Haiku Code* opens it in its own
+  Terminal window.
 
 ## Features
 
@@ -26,10 +47,10 @@ dependencies.
 - **Git auto-checkpoint** — every successful edit is committed to the
   working-directory repo (`auto_commit`, on by default), so each change is
   restorable; recent git history is fed into context as a clue. Set
-  `"auto_bump_version": true` (config or `.picoder/settings.json`) to also bump
+  `"auto_bump_version": true` (config or `.haikucode/settings.json`) to also bump
   the `[package]` patch version in `Cargo.toml` with each checkpoint.
 - **Crash-safe state** — `config.json` and session transcripts are written
-  atomically (temp file → fsync → rename), so a power loss on the Pi's SD card
+  atomically (temp file → fsync → rename), so a power loss or VM crash
   leaves the old or new file intact, never a truncated one.
 - **Forgiving edits** — `read_file` numbers lines `cat -n` style (number, tab,
   text) so the number can't be mistaken for indentation. When `edit_file`'s
@@ -62,24 +83,24 @@ dependencies.
   built-in table (128k for unknown models).
 - **Queued input** — keep typing while the agent works; Enter queues messages
   that send as turns finish.
-- **One-shot `--output`** — `picoder "task" -o out.md` writes the final reply to
+- **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to
   disk after the run.
 - **Permission modes** (`Shift+Tab` / `Ctrl+P` to cycle) — *ask* / *bypass* /
   *plan* (read-only).
 - **Permission rules** — Claude-Code-style `allow` / `deny` patterns
   (`bash(cargo test:*)`, `edit_file(src/**)`, `mcp__fs__*`) in `config.json` or
-  the project's `.picoder/settings.json`. Deny rules hold even in bypass mode;
+  the project's `.haikucode/settings.json`. Deny rules hold even in bypass mode;
   pressing **P** at an approval prompt saves a "don't ask again" rule for that
   command prefix or directory. `/permissions` lists, adds, and removes them.
 - **OS sandbox for shell commands** — off by default. `"sandbox": "workspace"`
   lets `bash`, background jobs and `!cmd` write only under the working
-  directory, its repo root, the temp dirs, picoder's config dir and any
+  directory, its repo root, the temp dirs, haikucode's config dir and any
   `"sandbox_allow_write"` paths; `"readonly"` allows temp dirs only;
   `"sandbox_network": false` also blocks network access. Reads are never
   restricted. macOS uses `sandbox-exec`, Linux uses Landlock (network blocking
   needs kernel 6.7+; a kernel without Landlock runs commands unsandboxed and
   says so once). A blocked command comes back with a note naming the sandbox,
-  so the model asks instead of working around it. A repo's `.picoder/` settings
+  so the model asks instead of working around it. A repo's `.haikucode/` settings
   can tighten the sandbox but never loosen it, and only your own config.json
   can add writable paths.
 - **Search that respects .gitignore** — inside a git repo, `grep` and `glob`
@@ -94,12 +115,12 @@ dependencies.
   `SessionStart` shell hooks (same JSON shape as Claude Code's) receive the
   event on stdin; exit `2` blocks the action and feeds stderr back to the model.
 - **Custom slash commands** — drop a Markdown prompt in
-  `.picoder/commands/<name>.md` (or a `.picoder/skills/<name>/SKILL.md`, or the
-  same under `~/.config/picoder/`) and `/name args` runs it with `$ARGUMENTS`
+  `.haikucode/commands/<name>.md` (or a `.haikucode/skills/<name>/SKILL.md`, or the
+  same under `~/config/settings/haikucode/`) and `/name args` runs it with `$ARGUMENTS`
   substituted. `.claude/commands/*.md` is read too.
-- **Skills the model uses itself** — any `<name>/SKILL.md` in `.picoder/skills`,
+- **Skills the model uses itself** — any `<name>/SKILL.md` in `.haikucode/skills`,
   `.claude/skills` or `.agents/skills` (working directory up to the repo root)
-  or `~/.config/picoder/skills` is listed to the model by name and description
+  or `~/config/settings/haikucode/skills` is listed to the model by name and description
   only; when a task matches, it calls the `skill` tool to load the full
   instructions and the paths of the skill's other files. Other agents'
   user-wide folders (`~/.agents/skills`, `~/.claude/skills`) join the list only
@@ -109,9 +130,9 @@ dependencies.
 - **`!cmd`** — run a shell command straight from the composer; the output shows
   in the transcript and is added to the model's context.
 - **`/diff`, `/undo`, `/review`** — see everything changed since the session
-  started, revert the last picoder checkpoint commit, or ask for a code review
+  started, revert the last haikucode checkpoint commit, or ask for a code review
   of the working tree / branch. `/status` and `/cost` report where you stand.
-- **`/rewind`** — pick any earlier prompt from this run: picoder's checkpoint
+- **`/rewind`** — pick any earlier prompt from this run: haikucode's checkpoint
   commits since then are reverted (as one new commit; your own commits and
   unstaged work are left alone), the conversation is cut back to before that
   prompt, and the prompt returns to the composer to edit and resend. Edits made
@@ -119,7 +140,7 @@ dependencies.
 - **Loop breaker** — a response that turns into one block of text repeated
   back to back (a sampling loop, common with local reasoning models) is cut
   off with an error instead of streaming forever.
-- **Sampling** — picoder sends no `temperature` unless you set one in
+- **Sampling** — haikucode sends no `temperature` unless you set one in
   `config.json` (`"temperature": 0.7`), so each model's recommended sampling
   applies; the DeepSeek preset keeps `0.2`.
 - **Reasoning effort** — `/effort auto|off|low|medium|high` (or the `/config`
@@ -140,24 +161,24 @@ dependencies.
   `price_in`); `/cost` and the one-shot JSON usage show cached tokens.
 - **Thrashing guard** — the same tool call with identical arguments three times
   in a row is short-circuited with a nudge to change approach.
-- **Scripting** — `git diff | picoder "review this"` attaches stdin as context
+- **Scripting** — `git diff | haikucode "review this"` attaches stdin as context
   (or uses it as the task), and `--json` / `--stream-json` print a result
   object or JSON-lines events for CI and automation. One-shot runs use your
   `permission` setting (`--auto` forces bypass); with no one to ask, approval
   prompts are declined, never silently approved. Exit status: `0` ok, `1` the
   run reported an error, `2` bad usage.
-- **Context files** — in `~/.config/picoder/` and in every directory from the
+- **Context files** — in `~/config/settings/haikucode/` and in every directory from the
   repo root down to the working directory (just the working directory outside
-  a repo), loads the first of `PICODER.md` / `AGENTS.md` / `CLAUDE.md` /
+  a repo), loads the first of `HAIKUCODE.md` / `AGENTS.md` / `CLAUDE.md` /
   `GEMINI.md`. They stack general to specific, so the nearest file wins on
   conflicts; 12k chars per file, 32k in all, spent nearest-first.
 - **Sessions** — every TUI run is a saved session, many per working directory,
-  titled by its first prompt. `picoder -c` resumes the latest, `picoder -r
+  titled by its first prompt. `haikucode -c` resumes the latest, `haikucode -r
   <id|name>` (or `/resume`, a picker) any of them; `/rename` names one, `/fork`
   (or `--fork-session` at launch) carries on in a copy, `/export [--all] [file]`
   writes a Markdown transcript, and `/new` starts another without deleting the
-  last. `picoder sessions [--json]` lists them for scripts; `/sessions delete`
-  or `picoder sessions delete <id>` removes one. The least recently used go
+  last. `haikucode sessions [--json]` lists them for scripts; `/sessions delete`
+  or `haikucode sessions delete <id>` removes one. The least recently used go
   past 50 per directory or 400 overall. One-shot runs are saved only with
   `-c` / `-r`.
 - **Composer niceties** — a `/` command palette (suggestions ranked by your
@@ -178,52 +199,54 @@ dependencies.
   auth mode, reasoning effort, default permission mode, auto-commit, theme, context
   window, max tool calls, and price currency, edited in-TUI; changes apply live
   and persist to `config.json`.
-- **Themes** (`/theme`) — `Default`, `Apple ][` (green phosphor), `MSDOS`,
-  `macOS`, `SUN`, `NeXT`, and `SGI`.
-- **Tuned for the Pi framebuffer console** — ASCII fallback and clear-on-exit
-  under `TERM=linux`, plus a launch banner with live MEM / Wi-Fi / IP.
+- **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
+  and blue desktop), `Rainbow` (picoder's original Apple-rainbow look),
+  `Apple ][` (green phosphor), `MSDOS`, `macOS`, `SUN`, `NeXT`, and `SGI`.
+- **Launch banner** — a live SYSTEM panel with the Haiku release, cores,
+  memory and IP; ASCII fallback under `TERM=linux` or `HAIKUCODE_ASCII=1`.
 
 ## Install / build
 
-picoder is cross-compiled from macOS to static musl binaries (the Pi can't
-compile Rust itself). Three targets are produced: **ARMv6** for the Pi Zero W,
-**ARMv7** for 32-bit Pi OS on the Pi 2/3/4, and **aarch64** for the Pi 5 —
-`deploy` picks the matching one per host via `uname -m`.
+Rust can't cross-compile to Haiku from macOS here, so Haiku Code builds
+natively on Haiku. You need `rustc`/`cargo` for your Haiku architecture (the
+arm64 VM uses a self-built `aarch64-unknown-haiku` nightly in
+`/boot/system/non-packaged`; on x86_64, `pkgman install rust_bin` works).
+
+On Haiku:
 
 ```sh
-# one-time toolchain setup
-brew install messense/macos-cross-toolchains/arm-unknown-linux-musleabihf
-brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
-rustup target add arm-unknown-linux-musleabihf
-rustup target add aarch64-unknown-linux-musl
-
-./build.sh                        # build both targets
-./build.sh deploy                 # build + install the right binary to every host in PICODER_HOSTS
-PICODER_HOSTS="pi@host-a pi@host-b" ./build.sh deploy   # custom targets
-PI=user@host ./build.sh deploy    # build + install to a single host
-./build.sh pull                   # pull on-device self-edits back to the Mac
+cargo build --release            # target/release/haikucode
+haiku/package.sh                 # build + wrap in dist/haikucode-<ver>-1-<arch>.hpkg
+cp dist/haikucode-*.hpkg ~/config/packages/   # activates at once, no reboot
+# or: pkgman install dist/haikucode-*.hpkg    (system-wide)
 ```
 
-Deploy targets are configurable via the `PICODER_HOSTS` env var (space-separated
-`user@host` list) or `PI=user@host` for a single host — set `PICODER_HOSTS` in
-your shell profile to make it permanent. `deploy` queries each host's `uname -m`
-and installs the matching ~2.5 MB static binary to `~/.local/bin/picoder`.
+From a Mac, with the Haiku box reachable over ssh:
+
+```sh
+haiku/deploy.sh                  # sync source, build + package on Haiku, activate it
+haiku/deploy.sh fetch            # ...and copy the .hpkg back into ./dist
+HAIKU_HOST=haiku haiku/deploy.sh # another ssh destination (default: haiku-dbg)
+```
+
+The package installs `bin/haikucode`, the `apps/Haiku Code` launcher and its
+Deskbar entry. Run `haikucode` from any Terminal, or pick *Haiku Code* from the
+Deskbar's Applications menu.
 
 ## Testing / CI
 
 ```sh
-cargo test          # host unit tests
+cargo test --bins         # unit tests (run on Haiku and on the Mac)
 cargo test -- --ignored   # also runs the live MCP / web tests
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite plus a
-`cross build --release` for all three deploy targets, so a broken cross-compile
-is caught in CI instead of at deploy time.
+GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite on Linux;
+Haiku itself is covered by running the suite on the VM.
 
 ## Configuration
 
-On first run, picoder walks you through provider, model, and API key. State lives
-in `~/.config/picoder/`:
+On first run, Haiku Code walks you through provider, model, and API key. State lives
+in `~/config/settings/haikucode/`:
 
 ```
 config.json   provider / model / key (0600), max_tool_calls, prices
@@ -237,14 +260,14 @@ sessions/     saved sessions: one folder per working directory, each
               session a <id>.json conversation + <id>.meta.json
 ```
 
-Per-project settings live in `.picoder/` inside the working directory:
+Per-project settings live in `.haikucode/` inside the working directory:
 
 ```
-.picoder/settings.json        permissions, hooks, auto_bump_version (shared)
-.picoder/settings.local.json  your own rules (P at an approval prompt writes
+.haikucode/settings.json        permissions, hooks, auto_bump_version (shared)
+.haikucode/settings.local.json  your own rules (P at an approval prompt writes
                               here) — add it to .gitignore
-.picoder/commands/*.md        project slash commands
-.picoder/skills/<name>/SKILL.md
+.haikucode/commands/*.md        project slash commands
+.haikucode/skills/<name>/SKILL.md
 ```
 
 ### Permissions and hooks
@@ -321,14 +344,14 @@ to over Streamable HTTP, with optional static `headers`. `${VAR}` and
 }
 ```
 
-An HTTP server that answers 401 waits for `/mcp login <server>`: picoder finds
+An HTTP server that answers 401 waits for `/mcp login <server>`: haikucode finds
 its authorization server (protected-resource and authorization-server
 metadata), registers itself as a client when the server allows dynamic
 registration, and signs you in through the browser with PKCE. The token is kept
-in `~/.config/picoder/mcp-oauth.json` (mode `0600`) and refreshed when it
+in `~/config/settings/haikucode/mcp-oauth.json` (mode `0600`) and refreshed when it
 expires; `/mcp logout <server>` forgets it. For a server without dynamic
 registration, give its client id: `"oauth": {"client_id": "…", "callback_port": 8976}`.
-Set `PICODER_BROWSER` to the command that opens the sign-in URL on a headless
+Set `HAIKUCODE_BROWSER` to the command that opens the sign-in URL on a headless
 box.
 
 A project can also ship its servers in `.mcp.json` (`{"mcpServers": {…}}`, the
@@ -347,8 +370,8 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `/effort [level]` | reasoning effort: auto, off, low, medium, high |
 | `/compact [focus]` | summarize older turns to free context (auto at 80%) |
 | `/diff` | show everything changed since the session started |
-| `/undo` | revert the last picoder checkpoint commit |
-| `/rewind` | pick an earlier prompt: undo picoder's edits since then and resume from there |
+| `/undo` | revert the last haikucode checkpoint commit |
+| `/rewind` | pick an earlier prompt: undo haikucode's edits since then and resume from there |
 | `/review [base]` | review uncommitted + branch changes vs `base` |
 | `/status` · `/cost` | model, cwd, git, rules, context · token usage and cost |
 | `/permissions [allow\|deny\|remove <rule>]` | list or edit permission rules |
@@ -366,7 +389,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `/mcp approve\|deny\|login\|logout <server>` | allow a project server, sign in to an HTTP one, … |
 | `/memory` | show the persistent memory this directory sees |
 | `/theme [n]` | open the theme picker, or switch directly |
-| `/init` | summarize this project into `PICODER.md` |
+| `/init` | summarize this project into `HAIKUCODE.md` |
 | `/clear` | clear the screen transcript |
 | `/help` · `/exit` | show help · quit |
 
@@ -375,7 +398,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | Key | Action |
 | --- | --- |
 | `Enter` | send |
-| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` / `\` then `Enter` | new line in the composer (the last two work on the Pi's console) |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` / `\` then `Enter` | new line in the composer (the last two work on any terminal) |
 | `Shift+Tab` / `Ctrl+P` | cycle permission mode |
 | `↑` / `↓` | move between the composer's lines; on its first/last line, previous / next prompt |
 | `Home` / `End` | start / end of the composer line |
@@ -391,15 +414,15 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `Y` / `N` / `P` / `A` | approval prompt: yes / no (model continues) / don't ask again for this pattern / bypass all |
 | `Ctrl+C` | clear line, or quit (press twice) |
 
-picoder enables the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+haikucode enables the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 when the terminal supports it, so modified keys are reported unambiguously.
 Without it, some terminals (e.g. Warp in full-screen mode) flatten
 `Option+Backspace` to a plain Backspace.
 
 Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) because it grabs
 click-drag text selection with no modifier to bypass it — Warp users scroll with
-`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn` instead. Set `PICODER_MOUSE=1` to force capture on
-(wheel scrolling, at the cost of native selection), or `PICODER_MOUSE=0` to turn
+`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn` instead. Set `HAIKUCODE_MOUSE=1` to force capture on
+(wheel scrolling, at the cost of native selection), or `HAIKUCODE_MOUSE=0` to turn
 it off everywhere.
 
 ## Architecture
@@ -413,9 +436,9 @@ events, diffs, and approval requests. This keeps the UI responsive and lets
 The transcript render is cached: the static (already-printed) lines are wrapped
 once and reused until their content or the terminal width changes, so streaming
 a reply doesn't re-wrap the whole backlog every token — the difference is
-visible on a single-core Pi.
+visible on a slow VM.
 
-See [`PICODER.md`](PICODER.md) for the per-file source map and deeper notes.
+See [`HAIKUCODE.md`](HAIKUCODE.md) for the per-file source map and deeper notes.
 
 ## License
 

@@ -43,11 +43,11 @@ use types::{
 };
 
 /// The current working directory as a display string, with `$HOME` collapsed to
-/// `~`. Falls back to `picoder` if the cwd can't be read.
+/// `~`. Falls back to `haikucode` if the cwd can't be read.
 fn cwd_label() -> String {
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
-        Err(_) => return "picoder".to_string(),
+        Err(_) => return "haikucode".to_string(),
     };
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
@@ -191,13 +191,13 @@ pub struct App {
     balance_units_flagged: bool,
     settings: Config,
     /// Current working directory shown in the output box title, with $HOME
-    /// collapsed to `~`. Computed once at startup (picoder never chdirs).
+    /// collapsed to `~`. Computed once at startup (haikucode never chdirs).
     cwd_label: String,
     /// The "don't ask again" rule offered with the current approval prompt.
     appr_rule: Option<String>,
     /// HEAD when this session started, so /diff can show everything since.
     session_rev: Option<String>,
-    /// Custom slash commands from .picoder/commands etc. (see commands.rs).
+    /// Custom slash commands from .haikucode/commands etc. (see commands.rs).
     custom_cmds: Vec<crate::commands::CustomCommand>,
     /// The same, as palette rows (name/description leaked to 'static — they
     /// live as long as the process, and reloads are rare and tiny).
@@ -576,7 +576,7 @@ impl App {
                         Kind::Notice,
                         format!(
                             "balance is in {} but prices are quoted in {} — set \"price_currency\": \"{}\" \
-                             and that currency's price list in ~/.config/picoder/config.json (price_in/price_out, \
+                             and that currency's price list in ~/config/settings/haikucode/config.json (price_in/price_out, \
                              or the `price currency` row in /config) to compare them",
                             b.currency.code, self.price_currency.code, b.currency.code
                         ),
@@ -1931,8 +1931,8 @@ impl App {
                 if n == 0 {
                     self.push(
                         Kind::Notice,
-                        "no custom commands. Add .picoder/commands/<name>.md (body = prompt, \
-                         $ARGUMENTS = what you type after /name) or ~/.config/picoder/commands/.",
+                        "no custom commands. Add .haikucode/commands/<name>.md (body = prompt, \
+                         $ARGUMENTS = what you type after /name) or ~/config/settings/haikucode/commands/.",
                     );
                 } else {
                     self.push(Kind::Notice, format!("{n} custom command(s):"));
@@ -1989,10 +1989,10 @@ impl App {
                 self.set_busy();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let task = format!(
-                    "Summarise this codebase into a PICODER.md (or AGENTS.md / CLAUDE.md \
-                     if one already exists) that picoder (a coding agent) can read at \
+                    "Summarise this codebase into a HAIKUCODE.md (or AGENTS.md / CLAUDE.md \
+                     if one already exists) that Haiku Code (a coding agent) can read at \
                      startup. Include key architecture, conventions, and safety notes. \
-                     Keep it under 300 lines. Use the existing PICODER.md as a starting \
+                     Keep it under 300 lines. Use the existing HAIKUCODE.md as a starting \
                      point if it exists. Working directory: {}",
                     cwd.display()
                 );
@@ -2083,8 +2083,8 @@ impl App {
         self.after_push();
     }
 
-    /// `/undo`: revert the most recent picoder checkpoint commit (only ever a
-    /// commit picoder made, so a user's own commit is never touched).
+    /// `/undo`: revert the most recent haikucode checkpoint commit (only ever a
+    /// commit haikucode made, so a user's own commit is never touched).
     fn undo_checkpoint(&mut self, h: &Handles) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         if !crate::tools::in_git_repo(&cwd) {
@@ -2102,8 +2102,8 @@ impl App {
             self.push(Kind::Notice, "nothing to undo.");
             return;
         };
-        if !msg.starts_with("picoder:") {
-            self.push(Kind::Notice, format!("last commit isn't a picoder checkpoint ({subject}); nothing undone."));
+        if !msg.starts_with("haikucode:") {
+            self.push(Kind::Notice, format!("last commit isn't a haikucode checkpoint ({subject}); nothing undone."));
             return;
         }
         match crate::tools::git_run(&cwd, &["revert", "--no-edit", "HEAD"], 30) {
@@ -2184,7 +2184,7 @@ impl App {
         let policy = crate::policy::Policy::load();
         let hooks = crate::hooks::Hooks::load();
         let mut lines = vec![
-            format!("picoder {}", env!("CARGO_PKG_VERSION")),
+            format!("Haiku Code {}", env!("CARGO_PKG_VERSION")),
             format!("model:       {} ({} · {})", self.model_info, self.settings.provider, self.settings.auth_mode),
             format!("cwd:         {cwd}"),
             format!("git:         {git}"),
@@ -2293,7 +2293,7 @@ impl App {
 
     pub fn welcome(&mut self) {
         let model = self.model_info.clone();
-        self.push(Kind::Notice, format!("picoder ({model}) — theme: {} · type a task, or /help for commands", self.palette.name));
+        self.push(Kind::Notice, format!("Haiku Code ({model}) — theme: {} · type a task, or /help for commands", self.palette.name));
     }
 
     pub fn note(&mut self, s: String) {
@@ -2962,7 +2962,7 @@ impl App {
         ];
         spans.extend(hint);
         spans.push(Span::styled("  (shift+tab/ctrl+p to cycle)", Style::default().fg(self.dim_text())));
-        spans.push(Span::styled(format!("   picoder v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(self.dim_text())));
+        spans.push(Span::styled(format!("   Haiku Code v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(self.dim_text())));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
@@ -3054,9 +3054,9 @@ mod tests {
             let full = palette_for(theme);
             assert_eq!(full.assistant, palette_by_name(theme).assistant);
         }
-        // The default theme's near-white still reads as a bright color, and the
+        // The Rainbow theme's near-white still reads as a bright color, and the
         // dim gray still as a dim one: the snap must not collapse them together.
-        let safe = super::palette::for_16color(palette_by_name("Default"));
+        let safe = super::palette::for_16color(palette_by_name("Rainbow"));
         assert_eq!(safe.assistant, Color::White);
         assert_eq!(safe.reasoning, Color::DarkGray);
     }
@@ -3336,7 +3336,7 @@ mod tests {
 
         UiConfig {
             model: "m0".into(),
-            theme: "Default".into(),
+            theme: "Rainbow".into(),
             ascii: false,
             ctx_limit: 128_000,
             price_in: 0.0,
@@ -3621,7 +3621,7 @@ mod tests {
         assert!(!app.slash_suggestions().is_empty());
         app.input = "/mo\nmore".into();
         assert!(app.slash_suggestions().is_empty());
-        let dir = std::env::temp_dir().join(format!("picoder_ml_tab_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_ml_tab_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shader.glsl"), "").unwrap();
         let (h, _rx) = test_handles();
@@ -3712,7 +3712,7 @@ mod tests {
     /// around it (it used to work only when the whole line began with `@`).
     #[test]
     fn tab_completes_an_at_path_anywhere_in_the_line() {
-        let dir = std::env::temp_dir().join(format!("picoder_tab_mid-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_tab_mid-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("main_file.rs"), "").unwrap();
         let mut app = App::new(test_ui_config(), Vec::new());
@@ -4141,6 +4141,13 @@ pub fn run<B: ratatui::backend::Backend>(
         if app.should_quit() {
             break;
         }
+        // Haiku sends no SIGHUP when the terminal goes away (window closed,
+        // ssh dropped): the tty just polls as hung up, which crossterm ignores,
+        // so this loop would spin on as an orphan. Leave as if quit.
+        #[cfg(target_os = "haiku")]
+        if helpers::tty_hung_up() {
+            break;
+        }
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(k)
@@ -4196,7 +4203,7 @@ pub fn run<B: ratatui::backend::Backend>(
 /// no modifier to bypass a grabbed mouse, so users couldn't copy anything. Other
 /// terminals (iTerm, …) let you hold Option/Fn to select, so capture stays.
 ///
-/// `PICODER_MOUSE` overrides either way: a truthy value (`1`/`true`/`on`/`yes`)
+/// `HAIKUCODE_MOUSE` overrides either way: a truthy value (`1`/`true`/`on`/`yes`)
 /// forces wheel scrolling on even under Warp, a falsy one (`0`/`false`/`off`/
 /// `no`) turns capture off everywhere. Anything else means "decide from the
 /// terminal". Scrolling is also on ↑/↓ and PgUp/PgDn, so a terminal without
@@ -4216,7 +4223,7 @@ pub fn setup_terminal() -> std::io::Result<Terminal<ratatui::backend::CrosstermB
     let _ = execute!(std::io::stdout(), event::EnableBracketedPaste);
     let mouse = want_mouse_capture(
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-        std::env::var("PICODER_MOUSE").ok().as_deref(),
+        std::env::var("HAIKUCODE_MOUSE").ok().as_deref(),
     );
     if mouse {
         let _ = execute!(std::io::stdout(), event::EnableMouseCapture);

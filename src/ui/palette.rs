@@ -16,8 +16,8 @@ pub const APPLE_RAINBOW: [Color; 6] = [
 ];
 /// Per-row brightness factors that turn a theme's banner color into a shaded
 /// top→bottom gradient, so the logo reads with depth (darkest row = the drop
-/// shadow). Each non-default theme thus gets a distinct shaded ramp of its own
-/// color; the default theme uses the Apple rainbow instead.
+/// shadow). Each theme with a `mono_banner` color thus gets a distinct shaded
+/// ramp of its own color; the Rainbow theme uses the Apple rainbow instead.
 pub const BANNER_SHADE: [f32; 6] = [1.0, 0.86, 0.72, 0.60, 0.49, 0.40];
 /// 16-color approximation for the framebuffer console.
 pub const APPLE_RAINBOW_16: [Color; 6] = [
@@ -48,6 +48,8 @@ pub struct Palette {
     pub diff_ctx: Color,
     pub error: Color,
     pub mono_banner: Option<Color>,
+    /// A hand-picked top→bottom logo gradient; wins over `mono_banner`.
+    pub banner_ramp: Option<[Color; 6]>,
     /// UI chrome: borders, rules, separators.
     pub chrome: Color,
     /// Secondary / dimmed text (hints, status values, picker dim).
@@ -62,8 +64,51 @@ pub struct Palette {
     pub cursor: CursorKind,
 }
 
-pub const DEFAULT_PALETTE: Palette = Palette {
-    name: "Default",
+// HaikuOS (the default) — Haiku's own look: the yellow window tab as accent
+// and logo, panel-gray text, a dark take on the blue desktop, and the stock
+// bash `~>` prompt.
+pub const HAIKU_YELLOW: Color = Color::Rgb(255, 203, 0);
+pub const HAIKU_BLUE: Color = Color::Rgb(116, 166, 222);
+pub const HAIKU_PANEL: Color = Color::Rgb(216, 216, 216);
+/// The logo as a lit window tab: pale butter on top, the tab's own yellow in
+/// the middle, warm amber at the foot — not a fade toward black.
+pub const HAIKU_TAB_RAMP: [Color; 6] = [
+    Color::Rgb(255, 232, 120),
+    Color::Rgb(255, 218, 56),
+    Color::Rgb(255, 203, 0),
+    Color::Rgb(252, 184, 0),
+    Color::Rgb(246, 164, 0),
+    Color::Rgb(236, 146, 0),
+];
+pub const HAIKU_PALETTE: Palette = Palette {
+    name: "HaikuOS",
+    accent: HAIKU_YELLOW,
+    assistant: HAIKU_PANEL,
+    assistant_glyph: HAIKU_YELLOW,
+    reasoning: Color::Rgb(128, 142, 160),
+    tool: HAIKU_BLUE,
+    tool_result: Color::Rgb(160, 170, 184),
+    notice: Color::Rgb(150, 160, 176),
+    code: Color::Rgb(150, 210, 120),
+    heading: Color::Rgb(255, 255, 255),
+    diff_add: Color::Rgb(120, 200, 100),
+    diff_del: Color::Rgb(232, 96, 80),
+    diff_ctx: Color::Rgb(84, 100, 122),
+    error: Color::Rgb(255, 104, 90),
+    mono_banner: Some(HAIKU_YELLOW),
+    banner_ramp: Some(HAIKU_TAB_RAMP),
+    chrome: Color::Rgb(66, 88, 116),
+    secondary: Color::Rgb(150, 160, 176),
+    user_bg: Color::Rgb(38, 60, 88),
+    bg: Color::Rgb(22, 34, 50),
+    prompt: Some("~> "),
+    cursor: CursorKind::Block,
+};
+
+// Rainbow — the original picoder look: Apple-rainbow logo, cyan accent, and
+// the terminal's own background.
+pub const RAINBOW_PALETTE: Palette = Palette {
+    name: "Rainbow",
     accent: Color::Cyan,
     assistant: Color::Rgb(242, 242, 247),        // systemWhite (slightly warm)
     assistant_glyph: Color::Green,
@@ -78,6 +123,7 @@ pub const DEFAULT_PALETTE: Palette = Palette {
     diff_ctx: Color::DarkGray,
     error: Color::Red,
     mono_banner: None,
+    banner_ramp: None,
     chrome: Color::DarkGray,
     secondary: Color::Rgb(140, 140, 140),
     user_bg: Color::Rgb(48, 48, 48),
@@ -104,6 +150,7 @@ pub const APPLE2_PALETTE: Palette = Palette {
     diff_ctx: Color::Rgb(0, 70, 0),
     error: Color::Rgb(200, 255, 200),
     mono_banner: Some(APPLE2_GREEN),
+    banner_ramp: None,
     chrome: Color::Rgb(0, 120, 0),
     secondary: Color::Rgb(0, 155, 0),
     user_bg: Color::Rgb(0, 30, 0),
@@ -129,6 +176,7 @@ pub const MSDOS_PALETTE: Palette = Palette {
     diff_ctx: Color::DarkGray,
     error: Color::LightRed,
     mono_banner: Some(Color::White),
+    banner_ramp: None,
     chrome: Color::DarkGray,
     secondary: Color::Gray,
     user_bg: Color::DarkGray,
@@ -157,6 +205,7 @@ pub const MACOS_PALETTE: Palette = Palette {
     diff_ctx: Color::Rgb(99, 99, 102),
     error: Color::Rgb(255, 95, 86),
     mono_banner: Some(MACOS_BLUE),
+    banner_ramp: None,
     chrome: Color::Rgb(72, 72, 74),
     secondary: Color::Rgb(152, 152, 157),
     user_bg: Color::Rgb(38, 38, 38),
@@ -182,6 +231,7 @@ pub const SUN_PALETTE: Palette = Palette {
     diff_ctx: Color::Rgb(100, 80, 50),
     error: Color::Rgb(255, 120, 70),
     mono_banner: Some(Color::Rgb(255, 183, 0)),
+    banner_ramp: None,
     chrome: Color::Rgb(100, 80, 50),
     secondary: Color::Rgb(160, 140, 100),
     user_bg: Color::Rgb(40, 30, 15),
@@ -207,6 +257,7 @@ pub const NEXTS_PALETTE: Palette = Palette {
     diff_ctx: Color::Rgb(60, 60, 60),
     error: Color::Rgb(255, 255, 255),
     mono_banner: Some(Color::White),
+    banner_ramp: None,
     chrome: Color::Rgb(80, 80, 80),
     secondary: Color::Rgb(120, 120, 120),
     user_bg: Color::Rgb(40, 40, 40),
@@ -232,6 +283,7 @@ pub const SGI_PALETTE: Palette = Palette {
     diff_ctx: Color::Rgb(50, 70, 90),
     error: Color::Rgb(255, 100, 120),
     mono_banner: Some(Color::Rgb(0, 191, 165)),
+    banner_ramp: None,
     chrome: Color::Rgb(50, 70, 90),
     secondary: Color::Rgb(100, 130, 145),
     user_bg: Color::Rgb(20, 30, 50),
@@ -240,24 +292,30 @@ pub const SGI_PALETTE: Palette = Palette {
     cursor: CursorKind::Block,
 };
 
-pub const THEMES: &[&str] = &["Default", "Apple ][", "MSDOS", "macOS", "SUN", "NeXT", "SGI"];
+pub const THEMES: &[&str] = &["HaikuOS", "Rainbow", "Apple ][", "MSDOS", "macOS", "SUN", "NeXT", "SGI"];
+
+/// Names that pick the default theme. "Default" was the Rainbow theme's old
+/// name, so configs saved with it now get the new default.
+const HAIKU_NAMES: &[&str] = &["HaikuOS", "haikuos", "haiku", "Default", "default"];
 
 pub fn palette_by_name(name: &str) -> Palette {
     match name {
+        "Rainbow" | "rainbow" => RAINBOW_PALETTE,
         "Apple ][" | "apple2" | "apple][" | "appleii" | "apple2e" => APPLE2_PALETTE,
         "MSDOS" | "msdos" | "dos" => MSDOS_PALETTE,
         "macOS" | "macos" | "macintosh" | "mac" => MACOS_PALETTE,
         "SUN" | "sun" | "solaris" | "sunos" => SUN_PALETTE,
         "NeXT" | "next" | "nextstep" => NEXTS_PALETTE,
         "SGI" | "sgi" | "irix" | "indigo" => SGI_PALETTE,
-        _ => DEFAULT_PALETTE,
+        _ => HAIKU_PALETTE,
     }
 }
 
 /// Whether `name` is a known theme name (used by the CLI to avoid consuming
 /// the next argument after --banner as a theme if it's a task description).
 pub fn is_theme_name(name: &str) -> bool {
-    matches!(name, "Default" | "default" | "Apple ][" | "apple2" | "apple][" | "appleii" | "apple2e" | "MSDOS" | "msdos" | "dos" | "macOS" | "macos" | "macintosh" | "mac" | "SUN" | "sun" | "solaris" | "sunos" | "NeXT" | "next" | "nextstep" | "SGI" | "sgi" | "irix" | "indigo")
+    HAIKU_NAMES.contains(&name)
+        || matches!(name, "Rainbow" | "rainbow" | "Apple ][" | "apple2" | "apple][" | "appleii" | "apple2e" | "MSDOS" | "msdos" | "dos" | "macOS" | "macos" | "macintosh" | "mac" | "SUN" | "sun" | "solaris" | "sunos" | "NeXT" | "next" | "nextstep" | "SGI" | "sgi" | "irix" | "indigo")
 }
 
 pub fn ansi_fg(c: Color) -> String {
@@ -363,6 +421,7 @@ pub fn for_16color(mut p: Palette) -> Palette {
     p.diff_ctx = nearest_16(p.diff_ctx);
     p.error = nearest_16(p.error);
     p.mono_banner = p.mono_banner.map(nearest_16);
+    p.banner_ramp = p.banner_ramp.map(|r| r.map(nearest_16));
     p.chrome = nearest_16(p.chrome);
     p.secondary = nearest_16(p.secondary);
     p.user_bg = if p.user_bg == Color::Reset { Color::Reset } else { Color::DarkGray };
@@ -382,6 +441,28 @@ pub fn shade(c: Color, i: usize) -> Color {
     Color::Rgb(s(r), s(g), s(b))
 }
 
+/// How far the logo's drop shadow moves from the background toward its row's
+/// color.
+const SHADOW_MIX: f32 = 0.24;
+
+/// The logo's drop shadow: its row's color washed into the theme background,
+/// a tint that's never darker than the background in any channel. On the
+/// terminal's own background (unknown; assumed dark) it's the row color dimmed.
+/// 16-color consoles get gray, since they ignore RGB.
+pub fn shadow_color(c: Color, bg: Color, sixteen: bool) -> Color {
+    if sixteen {
+        return Color::DarkGray;
+    }
+    let (r, g, b) = color_to_rgb(c);
+    if bg == Color::Reset {
+        let s = |v: u8| (v as f32 * 0.35).round() as u8;
+        return Color::Rgb(s(r), s(g), s(b));
+    }
+    let (br, bg_g, bb) = color_to_rgb(bg);
+    let mix = |v: u8, base: u8| (base as f32 + (v as f32 - base as f32) * SHADOW_MIX).round().max(base as f32) as u8;
+    Color::Rgb(mix(r, br), mix(g, bg_g), mix(b, bb))
+}
+
 /// Color for art row `i`: the Apple rainbow for the default theme, or a shaded
 /// top→bottom gradient of the theme's own banner color for any non-default
 /// theme. `i` may exceed the ramp on the ASCII shadow row, so it's clamped.
@@ -390,9 +471,10 @@ pub fn shade(c: Color, i: usize) -> Color {
 /// escape, so the logo would otherwise lose its gradient entirely and come out
 /// in whatever color was last in effect.
 pub fn banner_row_color(p: &Palette, rainbow: &[Color; 6], i: usize, sixteen: bool) -> Color {
-    let c = match p.mono_banner {
-        Some(c) => shade(c, i),
-        None => rainbow[i % rainbow.len()],
+    let c = match (p.banner_ramp, p.mono_banner) {
+        (Some(ramp), _) => ramp[i.min(ramp.len() - 1)],
+        (None, Some(c)) => shade(c, i),
+        (None, None) => rainbow[i % rainbow.len()],
     };
     if sixteen {
         nearest_16(c)
@@ -423,5 +505,42 @@ pub fn colors(kind: Kind, p: &Palette) -> (Style, Style) {
         Kind::Heading => (bold(p.heading), s(p.assistant_glyph)),
         Kind::Banner => (bold(p.accent), s(p.accent)),
         Kind::BannerDim => (s(p.notice), Style::default()),
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// HaikuOS is the default; "Default" (the Rainbow theme's old name) and
+    /// unknown names land on it, and Rainbow keeps the old look.
+    #[test]
+    fn haikuos_is_the_default_and_rainbow_keeps_the_old_look() {
+        assert_eq!(THEMES[0], "HaikuOS");
+        for name in ["HaikuOS", "haiku", "Default", "no-such-theme"] {
+            assert_eq!(palette_by_name(name).name, "HaikuOS", "{name}");
+        }
+        let rainbow = palette_by_name("Rainbow");
+        assert!(rainbow.mono_banner.is_none() && rainbow.bg == Color::Reset);
+        assert!(THEMES.iter().all(|t| is_theme_name(t) && palette_by_name(t).name == *t), "{THEMES:?}");
+        assert!(is_theme_name("Default") && is_theme_name("rainbow"));
+    }
+
+    /// The logo's drop shadow is a tint of the background, never darker.
+    #[test]
+    fn logo_shadows_never_go_darker_than_the_background() {
+        let rainbow = APPLE_RAINBOW;
+        for t in THEMES {
+            let p = palette_by_name(t);
+            if p.bg == Color::Reset {
+                continue;
+            }
+            let bg = color_to_rgb(p.bg);
+            for i in 0..6 {
+                let row = banner_row_color(&p, &rainbow, i, false);
+                let (r, g, b) = color_to_rgb(shadow_color(row, p.bg, false));
+                assert!(r >= bg.0 && g >= bg.1 && b >= bg.2, "{t} row {i}: {:?} vs bg {bg:?}", (r, g, b));
+            }
+        }
     }
 }

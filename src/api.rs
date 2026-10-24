@@ -39,7 +39,7 @@ impl std::fmt::Display for OutputLoop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the model got stuck repeating itself, so picoder stopped the response. Try again or \
+            "the model got stuck repeating itself, so haikucode stopped the response. Try again or \
              rephrase; a local reasoning model may need its reasoning switched off."
         )
     }
@@ -151,7 +151,7 @@ fn messages_payload(messages: &[Message], supports_images: bool) -> Vec<serde_js
             let plain = |m: &Message| {
                 let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
                 if let Some(o) = v.as_object_mut() {
-                    o.remove("native"); // picoder's own bookkeeping, not the wire format
+                    o.remove("native"); // haikucode's own bookkeeping, not the wire format
                 }
                 v
             };
@@ -218,7 +218,7 @@ pub fn agent_http() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(20))
         .timeout_read(std::time::Duration::from_secs(60))
-        .user_agent("picoder/0.1")
+        .user_agent("haikucode/0.1")
         .build()
 }
 
@@ -297,7 +297,7 @@ pub fn tools_spec() -> serde_json::Value {
             "properties":{"pattern":{"type":"string"}},
             "required":["pattern"]
         })),
-        tool("remember","Persist a one-line note into long-term memory (~/.config/picoder/memory.md) for future sessions. The note belongs to the current working directory and is shown only in sessions there, unless global is true. Write it so it stands alone: say what the project is, not which tool built it.", serde_json::json!({
+        tool("remember","Persist a one-line note into long-term memory (~/config/settings/haikucode/memory.md) for future sessions. The note belongs to the current working directory and is shown only in sessions there, unless global is true. Write it so it stands alone: say what the project is, not which tool built it.", serde_json::json!({
             "type":"object",
             "properties":{
                 "note":{"type":"string"},
@@ -570,7 +570,7 @@ pub(crate) fn cache_key(messages: &[Message]) -> String {
     for b in messages.first().map(|m| m.content.as_bytes()).unwrap_or_default() {
         h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
     }
-    format!("picoder-{h:016x}")
+    format!("haikucode-{h:016x}")
 }
 
 /// chat/completions request fields that carry the `reasoning` setting, per

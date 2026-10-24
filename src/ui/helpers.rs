@@ -15,6 +15,15 @@ pub fn perm_name(p: u8) -> &'static str {
     }
 }
 
+/// Whether the terminal on stdin has hung up (its window closed, or the ssh
+/// session behind it dropped).
+#[cfg(target_os = "haiku")]
+pub fn tty_hung_up() -> bool {
+    let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    n > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
 /// Inset a rect by one column on each side for a small left/right margin.
 pub fn pad1(r: Rect) -> Rect {
     Rect { x: r.x + 1, width: r.width.saturating_sub(2), ..r }
@@ -337,6 +346,7 @@ fn render_one_line(
     let text = &*clean_text(text, single_width);
     let (indent, glyph) = layout(kind, g);
     let (mut base, mut glyph_style) = palette::colors(kind, p);
+    let mut art = None;
     if let Some(bc) = color {
         let rainbow = if is_16color_terminal() { palette::APPLE_RAINBOW_16 } else { palette::APPLE_RAINBOW };
         let c = match bc {
@@ -344,6 +354,9 @@ fn render_one_line(
             BannerColor::Rainbow(i) => palette::banner_row_color(p, &rainbow, i, is_16color_terminal()),
             BannerColor::Accent => p.accent,
         };
+        if matches!(bc, BannerColor::Rainbow(_)) {
+            art = Some(c);
+        }
         base = base.fg(c);
     }
     // Highlight the user's own prompts with a full-width gray band so they
@@ -383,13 +396,43 @@ fn render_one_line(
             spans.push(Span::styled(" ".repeat(prefix_w), pad_style));
         }
         let used = prefix_w + piece.chars().count();
-        spans.push(Span::styled(piece, base));
+        match art {
+            Some(c) => spans.extend(art_spans(&piece, c, p.bg, base)),
+            None => spans.push(Span::styled(piece, base)),
+        }
         // Extend the gray band to the full width.
         if bg.is_some() && used < width {
             spans.push(Span::styled(" ".repeat(width - used), pad_style));
         }
         out.push(Line::from(spans));
     }
+}
+
+/// A logo row as colored cells: `█` and its `░` shadow become spaces with a
+/// background. Fonts draw block elements at their own widths (Haiku Terminal's
+/// fallback glyph is wider than a cell, so the logo smeared across the line); a
+/// space is one cell everywhere.
+fn art_spans(piece: &str, c: Color, bg: Color, base: Style) -> Vec<Span<'static>> {
+    let shadow = palette::shadow_color(c, bg, is_16color_terminal());
+    let style_of = |ch: char| match ch {
+        '█' => Style::default().bg(c),
+        '░' => Style::default().bg(shadow),
+        _ => base,
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let (mut run, mut cur) = (String::new(), base);
+    for ch in piece.chars() {
+        let st = style_of(ch);
+        if st != cur && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), cur));
+        }
+        cur = st;
+        run.push(if matches!(ch, '█' | '░') { ' ' } else { ch });
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, cur));
+    }
+    spans
 }
 
 /// Render a full assistant message with lightweight Markdown formatting.
@@ -754,6 +797,20 @@ pub fn parse_max_tool_calls(s: &str) -> u32 {
 mod tests {
     use super::*;
 
+    /// Haiku Terminal drew `█` wider than a cell and smeared the logo; logo
+    /// rows must reach the screen as background-colored spaces instead.
+    #[test]
+    fn logo_rows_render_as_colored_cells_not_block_glyphs() {
+        let p = palette::palette_by_name("Rainbow");
+        let mut out = Vec::new();
+        render_tline(&mut out, Kind::Banner, " ██ ░░x", false, Some(BannerColor::Rainbow(0)), 80, super::super::types::GLYPHS_U, &p, false);
+        let spans = &out[0].spans;
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "      x");
+        assert!(spans.iter().any(|s| s.content == "  " && s.style.bg.is_some()), "{spans:?}");
+        assert_eq!(spans.iter().filter(|s| s.style.bg.is_some()).count(), 2, "fill and shadow: {spans:?}");
+    }
+
     // Plain (text, modifier-or-fg) view of inline parsing, ignoring the base style.
     fn parse(text: &str) -> Vec<(String, Style)> {
         let base = Style::default();
@@ -814,7 +871,7 @@ mod tests {
 
     #[test]
     fn message_splits_lines_and_hides_code_fence() {
-        let p = palette::palette_by_name("Default");
+        let p = palette::palette_by_name("Rainbow");
         let mut out = Vec::new();
         render_message(&mut out, "para one\n\n```\ncode\n```\ndone", true, 40, crate::ui::types::GLYPHS_A, &p, true);
         // "para one" + blank + "code" + "done" = 4; the ``` fences are dropped.
@@ -828,7 +885,7 @@ mod tests {
 
     #[test]
     fn wrapped_list_items_hang_indent_under_the_item() {
-        let p = palette::palette_by_name("Default");
+        let p = palette::palette_by_name("Rainbow");
         let mut out = Vec::new();
         render_message(
             &mut out,
@@ -847,7 +904,7 @@ mod tests {
 
     #[test]
     fn wrapped_prose_still_aligns_under_the_glyph() {
-        let p = palette::palette_by_name("Default");
+        let p = palette::palette_by_name("Rainbow");
         let mut out = Vec::new();
         render_message(
             &mut out,

@@ -10,11 +10,11 @@
 //!   A 401 means sign-in: `/mcp login <server>` runs the MCP authorization flow
 //!   (protected-resource metadata → authorization-server metadata → dynamic
 //!   client registration → PKCE in the browser, see auth.rs) and keeps the
-//!   token, refreshed on expiry, in picoder's config dir (0600).
+//!   token, refreshed on expiry, in haikucode's config dir (0600).
 //!
 //! Servers come from config.json's `mcp_servers` plus a project `.mcp.json`
 //! (Claude Code's `mcpServers` shape, in the working directory or at the repo
-//! root). A project file can make picoder run any command, so each of its
+//! root). A project file can make haikucode run any command, so each of its
 //! servers waits for a one-time `/mcp approve <name>`, pinned to a hash of
 //! that entry: a changed entry asks again.
 //!
@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-/// The protocol revision picoder offers; a server may answer with any of
+/// The protocol revision haikucode offers; a server may answer with any of
 /// `SUPPORTED` (everything here speaks the same tools/resources/prompts).
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -44,7 +44,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound on list pages, against a server whose cursor never runs out.
 const MAX_PAGES: usize = 50;
-/// Files in picoder's config dir: project-server decisions and OAuth tokens.
+/// Files in haikucode's config dir: project-server decisions and OAuth tokens.
 const APPROVALS_FILE: &str = "mcp-approvals.json";
 const TOKENS_FILE: &str = "mcp-oauth.json";
 
@@ -502,14 +502,14 @@ impl Server {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "picoder", "version": env!("CARGO_PKG_VERSION")}
+                "clientInfo": {"name": "haikucode", "version": env!("CARGO_PKG_VERSION")}
             }),
             INIT_TIMEOUT,
             None,
         )?;
         let version = r.get("protocolVersion").and_then(Value::as_str).unwrap_or_default();
         if !SUPPORTED.contains(&version) {
-            return Err(Fail::Transport(format!("the server speaks MCP {version:?}, which picoder doesn't support")));
+            return Err(Fail::Transport(format!("the server speaks MCP {version:?}, which haikucode doesn't support")));
         }
         if let Conn::Http(c) = &mut self.conn {
             c.version = Some(version.to_string());
@@ -876,7 +876,7 @@ fn discover(agent: &ureq::Agent, server_url: &str, challenge: Option<&str>) -> R
 /// Dynamic client registration (RFC 7591) as a public client.
 fn register_client(agent: &ureq::Agent, endpoint: &str, redirect_uri: &str) -> Result<(String, String), String> {
     let body = json!({
-        "client_name": "picoder",
+        "client_name": "haikucode",
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -926,7 +926,7 @@ pub struct Mcp {
     slots: Vec<Slot>,
     tools: Vec<McpTool>,
     status: Vec<ServerStatus>,
-    /// Where approvals and OAuth tokens are kept (picoder's config dir).
+    /// Where approvals and OAuth tokens are kept (haikucode's config dir).
     store: PathBuf,
 }
 
@@ -1279,7 +1279,7 @@ impl Mcp {
         // The server's 401 names its resource metadata (and maybe the scope).
         let probe = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
-            "clientInfo": {"name": "picoder", "version": env!("CARGO_PKG_VERSION")}}});
+            "clientInfo": {"name": "haikucode", "version": env!("CARGO_PKG_VERSION")}}});
         let headers: Vec<(String, String)> = cfg.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let challenge = match http_post(&agent, &cfg.url, &headers, &probe.to_string(), Some(0)) {
             Err(Fail::Auth(h)) => h,
@@ -1294,7 +1294,7 @@ impl Mcp {
             register_client(&agent, reg, &redirect)?
         } else {
             return Err(format!(
-                "{name}'s authorization server has no dynamic client registration; register picoder with it \
+                "{name}'s authorization server has no dynamic client registration; register haikucode with it \
                  (redirect {redirect}, or set oauth.callback_port) and put the client id in the server's \
                  \"oauth\": {{\"client_id\": …}}"
             ));
@@ -1712,7 +1712,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("picoder-mcp-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("haikucode-mcp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1743,7 +1743,7 @@ for line in sys.stdin:
     #[test]
     #[ignore] // needs python3; run with `cargo test -- --ignored`
     fn mcp_handshake_list_and_call() {
-        let path = std::env::temp_dir().join(format!("picoder_mini_mcp-{}.py", std::process::id()));
+        let path = std::env::temp_dir().join(format!("haikucode_mini_mcp-{}.py", std::process::id()));
         std::fs::write(&path, MINI_SERVER).unwrap();
         let cancel = AtomicBool::new(false);
         let cfg = stdio("python3", vec![path.to_string_lossy().into_owned()]);
@@ -1862,10 +1862,10 @@ for line in sys.stdin:
 
     #[test]
     fn env_expansion_with_defaults_and_missing_vars() {
-        std::env::set_var("PICODER_TEST_MCP_TOKEN", "s3cret");
-        assert_eq!(expand_env("Bearer ${PICODER_TEST_MCP_TOKEN}").unwrap(), "Bearer s3cret");
-        assert_eq!(expand_env("${PICODER_TEST_MCP_NOPE:-http://localhost}/mcp").unwrap(), "http://localhost/mcp");
-        assert!(expand_env("${PICODER_TEST_MCP_NOPE}").unwrap_err().contains("PICODER_TEST_MCP_NOPE"));
+        std::env::set_var("HAIKUCODE_TEST_MCP_TOKEN", "s3cret");
+        assert_eq!(expand_env("Bearer ${HAIKUCODE_TEST_MCP_TOKEN}").unwrap(), "Bearer s3cret");
+        assert_eq!(expand_env("${HAIKUCODE_TEST_MCP_NOPE:-http://localhost}/mcp").unwrap(), "http://localhost/mcp");
+        assert!(expand_env("${HAIKUCODE_TEST_MCP_NOPE}").unwrap_err().contains("HAIKUCODE_TEST_MCP_NOPE"));
         assert_eq!(expand_env("no vars, ${unterminated").unwrap(), "no vars, ${unterminated");
     }
 
@@ -2015,7 +2015,7 @@ for line in sys.stdin:
             }
         });
 
-        let cfg = McpServerConfig { url: url.clone(), headers: [("X-Team".to_string(), "picoder".to_string())].into(), ..Default::default() };
+        let cfg = McpServerConfig { url: url.clone(), headers: [("X-Team".to_string(), "haikucode".to_string())].into(), ..Default::default() };
         let mut mcp = Mcp::start(vec![("srv".into(), cfg, Origin::Global)], scratch("http"));
         assert!(mcp.status()[0].ok, "{}", mcp.status()[0].detail);
         let names: Vec<&str> = mcp.tools().iter().map(|t| t.full_name.as_str()).collect();
@@ -2032,7 +2032,7 @@ for line in sys.stdin:
         for (method, h) in log.iter().filter(|(m, _)| m != "initialize") {
             assert_eq!(h.get("mcp-protocol-version").map(String::as_str), Some("2025-06-18"), "{method}");
             assert!(h.contains_key("mcp-session-id"), "{method}");
-            assert_eq!(h.get("x-team").map(String::as_str), Some("picoder"));
+            assert_eq!(h.get("x-team").map(String::as_str), Some("haikucode"));
         }
         let accept = &log[0].1["accept"];
         assert!(accept.contains("application/json") && accept.contains("text/event-stream"));

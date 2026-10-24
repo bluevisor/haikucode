@@ -1,5 +1,5 @@
 //! Saved conversations. Each working directory gets a folder under
-//! `~/.config/picoder/sessions/<FNV-1a of its path>/` holding any number of
+//! `~/config/settings/haikucode/sessions/<FNV-1a of its path>/` holding any number of
 //! sessions: `<id>.json` is the conversation (the same message array a
 //! session file always held) and `<id>.meta.json` its id, name, title, times
 //! and size, so listing sessions never parses a conversation — cheap on a Pi.
@@ -51,7 +51,7 @@ impl Meta {
 }
 
 /// The sessions of one working directory, rooted at `root`
-/// (`~/.config/picoder/sessions` outside tests).
+/// (`~/config/settings/haikucode/sessions` outside tests).
 pub struct Store {
     pub root: PathBuf,
     pub cwd: PathBuf,
@@ -166,7 +166,7 @@ impl Store {
         let by_prefix: Vec<_> = all.iter().filter(|(m, _)| key.len() >= 4 && m.id.starts_with(key)).collect();
         match (by_prefix.as_slice(), by_name.len()) {
             ([one], 0) => Ok((*one).clone()),
-            ([], 0) => Err(format!("no session here matches '{key}' (`picoder sessions` lists them)")),
+            ([], 0) => Err(format!("no session here matches '{key}' (`haikucode sessions` lists them)")),
             _ => Err(format!("'{key}' matches more than one session; use more of the id")),
         }
     }
@@ -325,7 +325,7 @@ pub fn delete(session: &Path) {
     let _ = std::fs::remove_file(meta_path(session));
 }
 
-/// The text the user typed, when `m` is a prompt: picoder's own notes to the
+/// The text the user typed, when `m` is a prompt: haikucode's own notes to the
 /// model (`[...]`, `(...)`) aren't. Attachments and hook context follow a
 /// blank line and are left out.
 pub fn prompt_text(m: &Message) -> Option<&str> {
@@ -411,12 +411,12 @@ pub fn summary_line(meta: &Meta, now: u64, current: bool) -> String {
 }
 
 /// A readable Markdown transcript: prompts, replies, and each tool call with
-/// its arguments and (truncated) result. picoder's system/context messages
+/// its arguments and (truncated) result. haikucode's system/context messages
 /// are left out unless `all`.
 pub fn to_markdown(meta: &Meta, messages: &[Message], all: bool) -> String {
     let mut out = format!("# {}\n\n", meta.label());
     out.push_str(&format!(
-        "_picoder session `{}` · {} · started {}_\n",
+        "_haikucode session `{}` · {} · started {}_\n",
         meta.id,
         if meta.cwd.is_empty() { "?" } else { &meta.cwd },
         local_time(meta.created)
@@ -443,7 +443,7 @@ pub fn to_markdown(meta: &Meta, messages: &[Message], all: bool) -> String {
             },
             "assistant" => {
                 if !m.content.trim().is_empty() {
-                    out.push_str(&format!("\n## picoder\n\n{}\n", m.content.trim()));
+                    out.push_str(&format!("\n## haikucode\n\n{}\n", m.content.trim()));
                 }
                 for c in m.tool_calls.iter().flatten() {
                     let args = crate::api::truncate(&c.function.arguments, 800);
@@ -472,7 +472,7 @@ pub fn export_name(meta: &Meta) -> String {
     let slug: String = slug.chars().take(40).collect();
     let slug = slug.trim_end_matches('-');
     if slug.is_empty() {
-        format!("picoder-{}.md", meta.id)
+        format!("haikucode-{}.md", meta.id)
     } else {
         format!("{slug}.md")
     }
@@ -483,7 +483,7 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> Store {
-        let root = std::env::temp_dir().join(format!("picoder-sessions-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("haikucode-sessions-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Store { root, cwd: PathBuf::from(format!("/work/{name}")) }
@@ -596,7 +596,7 @@ mod tests {
         assert!(md.contains("## You\n\nmake a page"));
         assert!(md.contains("**write_file** `{\"path\":\"a.html\"}`"));
         assert!(md.contains("OK wrote a.html"));
-        assert!(md.contains("> [note]"), "picoder's notes are quoted");
+        assert!(md.contains("> [note]"), "haikucode's notes are quoted");
         assert!(!md.contains("sys"), "system prompt left out");
         assert!(to_markdown(&meta, &msgs, true).contains("## System"));
         assert_eq!(export_name(&meta), "make-a-page.md");

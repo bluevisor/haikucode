@@ -1,5 +1,6 @@
-//! Tiny system snapshot for the launch banner. Reads Linux /proc and /sys;
-//! degrades to "n/a" anywhere those aren't present (e.g. the dev Mac).
+//! Tiny system snapshot for the launch banner. On Haiku it asks the kernel
+//! (`uname`, `get_system_info`); elsewhere it reads Linux /proc and /sys and
+//! degrades to "n/a" where those aren't present (e.g. the dev Mac).
 
 /// Network status line for the banner, e.g.
 /// `● ONLINE · WiFi: HomeNet · IP: 10.0.0.216`.
@@ -7,10 +8,13 @@ pub fn network_line(ascii: bool) -> String {
     let dot = if ascii { "*" } else { "●" };
     let sep = if ascii { " - " } else { " · " };
     let mut parts = vec![format!("{dot} ONLINE")];
-    parts.push(match ssid() {
-        Some(s) => format!("WiFi: {s}"),
-        None => format!("WiFi: {}", wifi_state()),
-    });
+    // Haiku has no CLI-readable Wi-Fi state (and a VM has no Wi-Fi at all).
+    if !cfg!(target_os = "haiku") {
+        parts.push(match ssid() {
+            Some(s) => format!("WiFi: {s}"),
+            None => format!("WiFi: {}", wifi_state()),
+        });
+    }
     if let Some(ip) = local_ip() {
         parts.push(format!("IP: {ip}"));
     }
@@ -114,7 +118,7 @@ fn ssid() -> Option<String> {
 /// the real name, so this runs it with `-n` (never prompts; fails instantly
 /// unless sudo is passwordless for it). Enable with:
 ///   echo "$USER ALL=(root) NOPASSWD: /usr/bin/wdutil info" \
-///     | sudo tee /etc/sudoers.d/picoder-wifi && sudo chmod 440 /etc/sudoers.d/picoder-wifi
+///     | sudo tee /etc/sudoers.d/haikucode-wifi && sudo chmod 440 /etc/sudoers.d/haikucode-wifi
 fn macos_ssid_wdutil() -> Option<String> {
     let out = std::process::Command::new("sudo")
         .args(["-n", "/usr/bin/wdutil", "info"])
@@ -184,6 +188,9 @@ pub fn hardware_line(ascii: bool) -> String {
     let mut parts = Vec::new();
     if let Some(b) = board_model() {
         parts.push(b);
+    } else if cfg!(target_os = "haiku") {
+        // No device tree to name the machine; the OS release says more.
+        parts.push(os_name());
     }
     parts.push(std::env::consts::ARCH.to_string());
     let cores = cpu_cores();
@@ -214,6 +221,10 @@ pub fn host_descriptor() -> String {
 /// "macOS 26.7.1" on a Mac (it used to say "Linux" there, and the model then
 /// reached for GNU tools like `timeout` that macOS doesn't have).
 pub fn os_name() -> String {
+    #[cfg(target_os = "haiku")]
+    if let Some(name) = haiku_os_name() {
+        return name;
+    }
     if cfg!(target_os = "macos") {
         let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist").unwrap_or_default();
         let version = plist
@@ -241,6 +252,38 @@ pub fn os_name() -> String {
     "Linux".to_string()
 }
 
+/// "Haiku R1~beta6+development (hrev60290)" from uname: the release names the
+/// beta, the version string starts with the source revision.
+#[cfg(target_os = "haiku")]
+fn haiku_os_name() -> Option<String> {
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 {
+        return None;
+    }
+    let field = |f: &[libc::c_char]| {
+        let bytes: Vec<u8> = f.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    };
+    let (sys, release, version) = (field(&u.sysname), field(&u.release), field(&u.version));
+    let rev = version.split_whitespace().next().filter(|r| r.starts_with("hrev"));
+    Some(match rev {
+        Some(rev) => format!("{sys} {release} ({rev})"),
+        None => format!("{sys} {release}"),
+    })
+}
+
+/// Used and total RAM in MB from the kernel's page counters (Haiku has no /proc).
+#[cfg(target_os = "haiku")]
+fn mem_used_total() -> Option<(u64, u64)> {
+    let mut info: libc::system_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::get_system_info(&mut info) } != 0 || info.max_pages == 0 {
+        return None;
+    }
+    let mb = |pages: u64| pages * libc::B_PAGE_SIZE as u64 / (1024 * 1024);
+    Some((mb(info.used_pages), mb(info.max_pages)))
+}
+
+#[cfg(not(target_os = "haiku"))]
 fn mem_used_total() -> Option<(u64, u64)> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     let (mut total, mut avail) = (0u64, 0u64);
@@ -257,6 +300,7 @@ fn mem_used_total() -> Option<(u64, u64)> {
     Some((total.saturating_sub(avail) / 1024, total / 1024))
 }
 
+#[cfg(not(target_os = "haiku"))]
 fn parse_kb(s: &str) -> u64 {
     s.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0)
 }

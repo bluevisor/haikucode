@@ -1,6 +1,6 @@
 //! Lifecycle hooks — shell commands run at fixed points of the agent loop,
 //! configured the way Claude Code does it so a `.claude/settings.json` hooks
-//! block can be pasted into `.picoder/settings.json`:
+//! block can be pasted into `.haikucode/settings.json`:
 //!
 //! ```json
 //! "hooks": {
@@ -117,7 +117,7 @@ impl Hooks {
     pub fn describe(&self) -> Vec<String> {
         if self.hooks.is_empty() {
             return vec![
-                "no hooks configured (add a \"hooks\" block to .picoder/settings.json).".into(),
+                "no hooks configured (add a \"hooks\" block to .haikucode/settings.json).".into(),
             ];
         }
         self.hooks

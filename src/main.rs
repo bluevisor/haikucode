@@ -1,6 +1,7 @@
-//! picoder — a tiny full-screen agentic coding CLI for the Raspberry Pi Zero W.
+//! Haiku Code (`haikucode`) — a full-screen agentic coding CLI for Haiku, the
+//! BeOS-inspired OS. A port of picoder (the Raspberry Pi Zero W agent).
 //!
-//! Pure static binary (rustls TLS, no system deps). Talks to any
+//! Self-contained binary (rustls TLS, no system deps beyond libroot). Talks to any
 //! OpenAI-compatible chat API; defaults to DeepSeek. Codex/Claude-Code-style
 //! agent loop with a ratatui terminal UI.
 
@@ -27,14 +28,14 @@ use api::Message;
 use config::Config;
 use std::io::{IsTerminal, Read, Write};
 
-/// System prompt, built at runtime so picoder honestly describes whatever host
-/// it's on (Pi Zero W → Jetson Nano). A host is treated as build-capable when
+/// System prompt, built at runtime so haikucode honestly describes whatever host
+/// it's on (a Haiku VM, or the dev Mac it's tested on). A host is treated as build-capable when
 /// it has ≥4 cores or ≥2GB RAM (so the quad-core Jetson Nano, which can compile
 /// its own Rust, isn't told to avoid compiles); smaller hosts get a "keep it
 /// light" caution instead.
 ///
 /// It names the working directory: outside a git repo nothing else did, and a
-/// model left to guess invented `/home/<someone>/…/picoder` and spent a whole
+/// model left to guess invented `/home/<someone>/…/haikucode` and spent a whole
 /// turn `cd`-ing into a directory that never existed.
 pub fn system_prompt(auto_commit: bool) -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -52,7 +53,9 @@ tiny. Avoid heavy installs/compiles unless asked."
 RAM + swap), so builds and compiles are fine when useful."
     };
     // The model assumes GNU/Linux tools unless told otherwise.
-    let shell_rule = if cfg!(target_os = "macos") {
+    let shell_rule = if cfg!(target_os = "haiku") {
+        HAIKU_SHELL_RULE
+    } else if cfg!(target_os = "macos") {
         "\n- The shell is macOS (BSD userland): there is no GNU `timeout` (use the bash tool's \
 `timeout` argument instead), `sed -i` needs an explicit '' suffix, `echo -n` prints a literal \
 `-n` (use printf), and `readlink -f`/`date -d` differ from Linux."
@@ -70,7 +73,7 @@ state with `git revert`/`git checkout` if an edit was wrong. Don't commit manual
         ""
     };
     format!(
-        "You are picoder, a terminal coding agent running ON {host}. You help with \
+        "You are Haiku Code, a terminal coding agent running ON {host}. You help with \
 software tasks using tools.
 
 Rules:
@@ -89,34 +92,50 @@ copy (their browser, editor) may be running on this machine.
     )
 }
 
-const HELP: &str = "picoder — tiny agentic coding CLI (Rust, for the Pi Zero W)
+/// Haiku is not Linux: without this the model reaches for `sudo`, `apt`, `which`
+/// and /proc, and writes into the read-only /boot/system tree.
+const HAIKU_SHELL_RULE: &str = "
+- The OS is Haiku (BeOS lineage), not Linux. The shell is bash with GNU coreutils, but: there is \
+no `sudo` (you already have full rights) and no `which` (use `command -v`); there is no /proc or \
+/sys (use `ps`, `sysinfo`, `listdev`, `df`). HOME is /boot/home.
+- /boot/system is packagefs and read-only. Install software with `pkgman install -y <pkg>` (search \
+with `pkgman search`); put hand-built files in ~/config/non-packaged/{bin,lib,data} instead.
+- Settings live in ~/config/settings, not ~/.config. `finddir B_USER_SETTINGS_DIRECTORY` etc. print \
+the standard paths.
+- Files carry BFS attributes (MIME type, icons): inspect with `listattr`/`catattr`, set with \
+`addattr`. `open <file|url>` opens with the preferred app; GUI apps live in /boot/system/apps and \
+can be scripted with `hey`.
+- Native apps use the C++ Be API (`#include <Application.h>`, link `-lbe`); build with gcc/g++ \
+or `cargo`.";
+
+const HELP: &str = "haikucode — Haiku Code, an agentic coding CLI for Haiku (a picoder port)
 
 usage:
-  picoder                 interactive full-screen TUI
-  picoder \"do a thing\"     one-shot task, then exit
-  cmd | picoder \"task\"     one-shot with stdin attached as context (or as the task)
-  picoder --continue      resume this directory's latest session (alias: -c)
-  picoder -r [id|name]    resume a saved session; with no id, pick one in the TUI (--resume)
-  picoder --fork-session  with -c / -r: carry on in a copy, leaving the original as it was
-  picoder sessions        list this directory's saved sessions (--json; delete <id|name>)
-  picoder --auto ...      auto-approve tool calls (deny rules still apply); one-shot
+  haikucode                 interactive full-screen TUI
+  haikucode \"do a thing\"     one-shot task, then exit
+  cmd | haikucode \"task\"     one-shot with stdin attached as context (or as the task)
+  haikucode --continue      resume this directory's latest session (alias: -c)
+  haikucode -r [id|name]    resume a saved session; with no id, pick one in the TUI (--resume)
+  haikucode --fork-session  with -c / -r: carry on in a copy, leaving the original as it was
+  haikucode sessions        list this directory's saved sessions (--json; delete <id|name>)
+  haikucode --auto ...      auto-approve tool calls (deny rules still apply); one-shot
                           runs otherwise follow config \"permission\" and decline prompts
-  picoder --output FILE   one-shot: also write the final reply to FILE (alias: -o)
-  picoder --json ...      one-shot: print one JSON object {result, usage, cost, …}
-  picoder --stream-json   one-shot: print JSON-lines events as they happen
-  picoder --config        set up provider + API key
-  picoder model [id]      list models, or set the model
-  picoder --banner        print the launch banner (debug) and exit
-  picoder -h | --help     this help
-  picoder --version
+  haikucode --output FILE   one-shot: also write the final reply to FILE (alias: -o)
+  haikucode --json ...      one-shot: print one JSON object {result, usage, cost, …}
+  haikucode --stream-json   one-shot: print JSON-lines events as they happen
+  haikucode --config        set up provider + API key
+  haikucode model [id]      list models, or set the model
+  haikucode --banner        print the launch banner (debug) and exit
+  haikucode -h | --help     this help
+  haikucode --version
 
 in the TUI: @path attaches a file · !cmd runs a shell command · Tab autocompletes
 
-config: ~/.config/picoder/config.json  (key also via PICODER_API_KEY, or the
+config: ~/config/settings/haikucode/config.json  (key also via HAIKUCODE_API_KEY, or the
         configured provider's var, e.g. DEEPSEEK_API_KEY / OPENAI_API_KEY)
-project: .picoder/settings.json {permissions: {allow, deny}, hooks, auto_bump_version}
-         .picoder/commands/*.md  custom slash commands ($ARGUMENTS)
-instructions: the first of PICODER.md / AGENTS.md / CLAUDE.md / GEMINI.md in ~/.config/picoder
+project: .haikucode/settings.json {permissions: {allow, deny}, hooks, auto_bump_version}
+         .haikucode/commands/*.md  custom slash commands ($ARGUMENTS)
+instructions: the first of HAIKUCODE.md / AGENTS.md / CLAUDE.md / GEMINI.md in ~/config/settings/haikucode
               and in each directory from the repo root down to the working directory
 
 exit status: 0 ok · 1 the run reported an error · 2 bad usage";
@@ -125,7 +144,7 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     // Internal: invoked by sudo as the SUDO_ASKPASS helper. Talks to the running
-    // picoder over the given socket and prints the password; never starts the TUI.
+    // haikucode over the given socket and prints the password; never starts the TUI.
     if let Some(pos) = args.iter().position(|a| a == "--askpass") {
         let sock = args.get(pos + 1).cloned().unwrap_or_default();
         let prompt = args.get(pos + 2).cloned().unwrap_or_else(|| "[sudo] password:".into());
@@ -137,7 +156,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("picoder {}", env!("CARGO_PKG_VERSION"));
+        println!("haikucode {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.iter().any(|a| a == "--config" || a == "--setup") {
@@ -242,18 +261,18 @@ fn main() {
             }
         }
         if cfg.api_key.is_empty() {
-            eprintln!("Run: picoder --config");
+            eprintln!("Run: haikucode --config");
             std::process::exit(1);
         }
     }
 
-    // Piped stdin (`git diff | picoder "review this"`) rides along as context;
+    // Piped stdin (`git diff | haikucode "review this"`) rides along as context;
     // with no task argument it *is* the task. A terminal stdin is left alone.
     let piped = if std::io::stdin().is_terminal() {
         String::new()
     } else if !args.is_empty() && !stdin_is_pipe() && !stdin_ready(300) {
         // A non-tty stdin that nobody is writing to (a supervisor's idle pipe,
-        // a socket) must not wedge a scripted `picoder "task"`: with a task
+        // a socket) must not wedge a scripted `haikucode "task"`: with a task
         // given, only read stdin when data or EOF is already there.
         String::new()
     } else {
@@ -271,12 +290,12 @@ fn main() {
     let wants_session = cont || resume.is_some();
     if !task.trim().is_empty() {
         if resume == Some(None) {
-            eprintln!("-r needs a session id or name in one-shot mode (`picoder sessions` lists them; -c resumes the latest)");
+            eprintln!("-r needs a session id or name in one-shot mode (`haikucode sessions` lists them; -c resumes the latest)");
             std::process::exit(2);
         }
         let (messages, session, _) = start_session(&store, resumed, fork_session, &cfg);
         // Only persist a one-shot turn when explicitly continuing a session,
-        // so a stray `picoder "x"` doesn't pile up sessions.
+        // so a stray `haikucode "x"` doesn't pile up sessions.
         let session = wants_session.then_some(session);
         let perm = start_perm(&cfg, auto);
         if !run_oneshot(cfg, messages, session, task, output, out_mode, perm) {
@@ -284,15 +303,15 @@ fn main() {
         }
     } else {
         if output.is_some() {
-            eprintln!("--output only applies to one-shot mode (picoder \"task\" -o file)");
+            eprintln!("--output only applies to one-shot mode (haikucode \"task\" -o file)");
             std::process::exit(2);
         }
         if out_mode != OutputMode::Text {
-            eprintln!("--json / --stream-json only apply to one-shot mode (picoder \"task\" --json)");
+            eprintln!("--json / --stream-json only apply to one-shot mode (haikucode \"task\" --json)");
             std::process::exit(2);
         }
         if !std::io::stdin().is_terminal() {
-            eprintln!("no task given and stdin is not a terminal — pass a task: picoder \"do a thing\"");
+            eprintln!("no task given and stdin is not a terminal — pass a task: haikucode \"do a thing\"");
             std::process::exit(2);
         }
         let replay = resumed.as_ref().map(|(_, _, msgs)| sessions::replay(msgs)).unwrap_or_default();
@@ -337,13 +356,13 @@ fn start_session(
     }
 }
 
-/// `picoder sessions [--json]` lists this directory's sessions, newest first;
-/// `picoder sessions delete <id|name>` removes one. Returns the exit status.
+/// `haikucode sessions [--json]` lists this directory's sessions, newest first;
+/// `haikucode sessions delete <id|name>` removes one. Returns the exit status.
 fn sessions_subcommand(args: &[String], json: bool) -> i32 {
     let store = sessions::Store::here();
     if args.first().map(String::as_str) == Some("delete") {
         let Some(key) = args.get(1) else {
-            eprintln!("usage: picoder sessions delete <id|name>");
+            eprintln!("usage: haikucode sessions delete <id|name>");
             return 2;
         };
         return match store.find(key) {
@@ -430,7 +449,7 @@ fn status_lines(cfg: &Config, ascii: bool) -> Vec<String> {
 }
 
 /// Instruction files, in precedence order within one directory.
-const CONTEXT_FILES: [&str; 4] = ["PICODER.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md"];
+const CONTEXT_FILES: [&str; 4] = ["HAIKUCODE.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md"];
 /// Per-file and overall caps (chars) on loaded instructions; a Pi's model
 /// can't spare much context for them.
 const CONTEXT_FILE_CAP: usize = 12_000;
@@ -457,7 +476,7 @@ fn load_project_context() -> Option<(Message, Vec<String>)> {
 }
 
 /// (display name, contents) of the instruction files that apply in `cwd`,
-/// general to specific: the global one in `global` (picoder's config dir),
+/// general to specific: the global one in `global` (haikucode's config dir),
 /// then one per directory from the repo root down to `cwd` (just `cwd`
 /// outside a repo), each the first of `CONTEXT_FILES` present there. The
 /// overall cap is spent nearest-first, so a long global file can't crowd out
@@ -475,7 +494,7 @@ fn collect_context(cwd: &std::path::Path, global: &std::path::Path) -> Vec<(Stri
         }
     }
     if dirs.iter().all(|(d, _)| d != global) {
-        dirs.push((global.to_path_buf(), "~/.config/picoder/".into()));
+        dirs.push((global.to_path_buf(), config::config_dir_label()));
     }
     let mut found = Vec::new();
     let mut left = CONTEXT_TOTAL_CAP;
@@ -515,7 +534,7 @@ enum OutputMode {
     StreamJson,
 }
 
-/// True when stdin is a pipe (`cmd | picoder …`). A pipe's writer will close
+/// True when stdin is a pipe (`cmd | haikucode …`). A pipe's writer will close
 /// it, so reading to EOF is safe even when the producer is slow — unlike a
 /// supervisor's socket or an inherited tty-less device, which we only read
 /// when data is already waiting.
@@ -851,7 +870,7 @@ fn model_subcommand(cfg: &Config, arg: Option<String>) {
         return;
     }
     if cfg.api_key.is_empty() {
-        eprintln!("No API key. Run: picoder --config");
+        eprintln!("No API key. Run: haikucode --config");
         return;
     }
     match api::list_models(&http, cfg) {
@@ -886,7 +905,7 @@ fn model_subcommand(cfg: &Config, arg: Option<String>) {
 /// First line of a history file whose entries are escaped (`\\` and `\n`),
 /// so a multi-line prompt stays one line on disk. A file without it is the
 /// older one-entry-per-line format and is read as-is.
-const HISTORY_V2: &str = "#picoder-history v2";
+const HISTORY_V2: &str = "#haikucode-history v2";
 
 fn load_history() -> Vec<String> {
     std::fs::read_to_string(config::history_path())
@@ -957,7 +976,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("picoder_ctx_{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("haikucode_ctx_{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -998,15 +1017,16 @@ mod tests {
         fs::write(root.join("AGENTS.md"), "above the repo: never read").unwrap();
         fs::write(repo.join("AGENTS.md"), "repo root").unwrap();
         fs::write(repo.join("sub/CLAUDE.md"), "sub").unwrap();
-        fs::write(deep.join("PICODER.md"), "deep").unwrap();
-        fs::write(deep.join("AGENTS.md"), "shadowed by PICODER.md").unwrap();
+        fs::write(deep.join("HAIKUCODE.md"), "deep").unwrap();
+        fs::write(deep.join("AGENTS.md"), "shadowed by HAIKUCODE.md").unwrap();
         let global = root.join("global");
         fs::create_dir_all(&global).unwrap();
         fs::write(global.join("AGENTS.md"), "global").unwrap();
 
         let got = collect_context(&deep, &global);
         let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["~/.config/picoder/AGENTS.md", "../../AGENTS.md", "../CLAUDE.md", "PICODER.md"]);
+        let global_agents = format!("{}AGENTS.md", config::config_dir_label());
+        assert_eq!(names, [global_agents.as_str(), "../../AGENTS.md", "../CLAUDE.md", "HAIKUCODE.md"]);
         let bodies: Vec<&str> = got.iter().map(|(_, b)| b.as_str()).collect();
         assert_eq!(bodies, ["global", "repo root", "sub", "deep"]);
         fs::remove_dir_all(&root).ok();

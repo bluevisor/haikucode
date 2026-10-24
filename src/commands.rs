@@ -2,15 +2,15 @@
 //! `.claude/commands/*.md` and Agent Skills work:
 //!
 //! ```text
-//! .picoder/commands/<name>.md, .claude/commands/<name>.md   project command → /name
-//! ~/.config/picoder/commands/<name>.md                      user command    → /name
+//! .haikucode/commands/<name>.md, .claude/commands/<name>.md   project command → /name
+//! ~/config/settings/haikucode/commands/<name>.md                      user command    → /name
 //! <skills dir>/<name>/SKILL.md                              skill → /name, and the
 //!                                                           model's `skill` tool
 //! ```
 //!
-//! Skills dirs, project before user: `.picoder/skills`, `.claude/skills` and
+//! Skills dirs, project before user: `.haikucode/skills`, `.claude/skills` and
 //! `.agents/skills` from the working directory up to the repo root, then
-//! `~/.config/picoder/skills`, `~/.agents/skills`, `~/.claude/skills`. Only a
+//! `~/config/settings/haikucode/skills`, `~/.agents/skills`, `~/.claude/skills`. Only a
 //! skill's name and description go in the system prompt; the model loads the
 //! rest with the `skill` tool when a task calls for it.
 //!
@@ -38,7 +38,7 @@ pub fn load() -> Vec<CustomCommand> {
     let user = crate::config::config_dir();
     let (project_skills, user_skills) = skill_roots(&cwd, &user, home().as_deref());
     let mut roots: Vec<(PathBuf, bool)> = vec![
-        (cwd.join(".picoder").join("commands"), false),
+        (cwd.join(".haikucode").join("commands"), false),
         (cwd.join(".claude").join("commands"), false),
     ];
     roots.extend(project_skills.into_iter().map(|r| (r, true)));
@@ -71,11 +71,11 @@ fn home() -> Option<PathBuf> {
 }
 
 /// Skills folders, project ones then the user's, most specific first: the
-/// working directory's `.picoder/skills` and `.claude/skills`, `.agents/skills`
+/// working directory's `.haikucode/skills` and `.claude/skills`, `.agents/skills`
 /// in each directory from it up to the repo root (just the working directory
-/// outside a repo), then picoder's, the cross-agent and Claude's user folders.
+/// outside a repo), then haikucode's, the cross-agent and Claude's user folders.
 fn skill_roots(cwd: &Path, user_cfg: &Path, home: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut project = vec![cwd.join(".picoder").join("skills"), cwd.join(".claude").join("skills")];
+    let mut project = vec![cwd.join(".haikucode").join("skills"), cwd.join(".claude").join("skills")];
     let in_repo = cwd.ancestors().any(|d| d.join(".git").exists());
     for d in cwd.ancestors() {
         project.push(d.join(".agents").join("skills"));
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn load_dir_reads_commands_and_skills() {
-        let dir = std::env::temp_dir().join(format!("picoder-cmds-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-cmds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("commands")).unwrap();
         std::fs::create_dir_all(dir.join("skills/deploy")).unwrap();
@@ -483,7 +483,7 @@ mod skill_tests {
     use std::fs;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("picoder-skills-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("haikucode-skills-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -501,8 +501,8 @@ mod skill_tests {
         let cwd = repo.join("sub");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(&cwd).unwrap();
-        let (user_cfg, home) = (t.join("home/.config/picoder"), t.join("home"));
-        skill(&cwd.join(".picoder/skills"), "deploy", "project picoder");
+        let (user_cfg, home) = (t.join("home/.config/haikucode"), t.join("home"));
+        skill(&cwd.join(".haikucode/skills"), "deploy", "project haikucode");
         skill(&repo.join(".agents/skills"), "deploy", "repo agents (shadowed)");
         skill(&repo.join(".agents/skills"), "changelog", "repo agents");
         skill(&t.join(".agents/skills"), "outside", "above the repo: never read");
@@ -517,7 +517,7 @@ mod skill_tests {
         assert_eq!(
             got,
             [
-                ("deploy".into(), "project picoder".into()),
+                ("deploy".into(), "project haikucode".into()),
                 ("changelog".into(), "repo agents".into()),
                 ("review".into(), "user claude".into()),
             ]

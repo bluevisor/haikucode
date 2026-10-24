@@ -69,15 +69,15 @@ pub const GLYPHS_A: Glyphs = Glyphs {
 };
 
 /// Choose a glyph set. ASCII for dumb terminals, or when forced via
-/// PICODER_ASCII=1; Unicode otherwise (or forced via PICODER_UNICODE=1).
+/// HAIKUCODE_ASCII=1; Unicode otherwise (or forced via HAIKUCODE_UNICODE=1).
 /// TERM=linux stays Unicode: the framebuffer console renders the glyphs we
-/// use at single-cell width (set PICODER_ASCII=1 on consoles whose font
+/// use at single-cell width (set HAIKUCODE_ASCII=1 on consoles whose font
 /// doesn't cover them).
 pub fn detect_ascii() -> bool {
-    if std::env::var("PICODER_UNICODE").is_ok() {
+    if std::env::var("HAIKUCODE_UNICODE").is_ok() {
         return false;
     }
-    if std::env::var("PICODER_ASCII").is_ok() {
+    if std::env::var("HAIKUCODE_ASCII").is_ok() {
         return true;
     }
     match std::env::var("TERM").as_deref() {
@@ -106,10 +106,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "MCP servers: state, tools, prompts · /mcp approve|deny|login|logout <server>"),
     ("/memory", "show persistent memory"),
     ("/theme", "open the theme picker"),
-    ("/init", "summarize this project into PICODER.md"),
+    ("/init", "summarize this project into HAIKUCODE.md"),
     ("/diff", "show what changed since this session started"),
-    ("/undo", "revert the last picoder checkpoint commit"),
-    ("/rewind", "pick an earlier prompt: undo picoder's edits since then and resume from there"),
+    ("/undo", "revert the last haikucode checkpoint commit"),
+    ("/rewind", "pick an earlier prompt: undo haikucode's edits since then and resume from there"),
     ("/resume", "switch to another saved session in this directory"),
     ("/rename", "name this session: /rename <name>"),
     ("/fork", "carry on in a copy of this conversation (the original stays)"),
@@ -123,7 +123,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/commands", "reload and list custom slash commands"),
     ("/clear", "clear the screen transcript"),
     ("/help", "show help"),
-    ("/exit", "quit picoder"),
+    ("/exit", "quit Haiku Code"),
 ];
 
 /// Most suggestions shown under the composer for a `/` prefix.
@@ -150,7 +150,7 @@ pub const SETTING_LABELS: &[&str] = &[
 /// The `/config` rows shown, as indexes into `SETTING_LABELS` (the panel's
 /// cursor is a position in this list). Row 4, auth mode, is hidden along with
 /// `/login`: subscription tokens only work through the vendors' own apps, and
-/// picoder has no native adapter for them.
+/// haikucode has no native adapter for them.
 pub const SETTING_ROWS: &[usize] = &[0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11];
 
 #[derive(Clone, Copy)]

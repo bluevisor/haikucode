@@ -17,7 +17,7 @@
 //! rule can be pasted verbatim.
 //!
 //! Rules are merged from, lowest to highest priority: `config.json`
-//! (`permissions`), `.picoder/settings.json`, `.picoder/settings.local.json`.
+//! (`permissions`), `.haikucode/settings.json`, `.haikucode/settings.local.json`.
 //! `deny` always wins over `allow` and is enforced even in bypass mode; a
 //! matching `allow` skips the approval prompt in ask mode. Compound bash
 //! commands (`a && b | c`) are allowed only when every segment is allowed and
@@ -79,7 +79,7 @@ impl Rule {
     }
 }
 
-/// Map Claude Code / friendly names onto picoder's tool names.
+/// Map Claude Code / friendly names onto haikucode's tool names.
 pub fn canonical_tool(t: &str) -> String {
     match t.to_ascii_lowercase().as_str() {
         "bash" | "shell" | "sh" => "bash".into(),
@@ -439,12 +439,12 @@ fn has_subcommands(cmd: &str) -> bool {
 }
 
 /// Where a "don't ask again" rule is persisted: the project's
-/// `.picoder/settings.local.json` when the working directory is a git repo or
-/// already has a `.picoder/` folder, else the user's config.json.
+/// `.haikucode/settings.local.json` when the working directory is a git repo or
+/// already has a `.haikucode/` folder, else the user's config.json.
 pub fn persist_target() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    if cwd.join(".picoder").is_dir() || crate::tools::in_git_repo(&cwd) {
-        cwd.join(".picoder").join("settings.local.json")
+    if cwd.join(".haikucode").is_dir() || crate::tools::in_git_repo(&cwd) {
+        cwd.join(".haikucode").join("settings.local.json")
     } else {
         crate::config::config_path()
     }
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn persist_rule_refuses_to_clobber_a_broken_settings_file() {
-        let dir = std::env::temp_dir().join(format!("picoder-policy-broken-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-policy-broken-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.local.json");
         std::fs::write(&path, "{ not json").unwrap();
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn persist_rule_appends_without_clobbering_other_keys() {
-        let dir = std::env::temp_dir().join(format!("picoder-policy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-policy-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.local.json");
         std::fs::write(

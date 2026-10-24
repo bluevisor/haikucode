@@ -1,95 +1,100 @@
-//! Banner art: the PICODER logo rendered as block art (Unicode or ASCII),
+//! Banner art: the HAIKU CODE logo rendered as block art (Unicode or ASCII),
 //! assembled into lines with roles so the TUI and `--banner` flag can
 //! render the same layout identically.
 
 use super::palette::{self};
 use super::types::{BannerColor, Kind, TLine};
 
-pub const TAGLINE: &str = "a tiny agentic coding CLI";
+pub const TAGLINE: &str = "an agentic coding CLI for Haiku";
 
-/// 6x4 block glyphs (P I C O D E R), assembled at runtime so the heavy and
-/// ASCII logos stay aligned and adding a letter is a one-line change.
-const ART_GLYPHS: [[&str; 6]; 7] = [
-    ["####", "#  #", "####", "#   ", "#   ", "#   "], // P
-    ["####", " ## ", " ## ", " ## ", " ## ", "####"], // I
-    ["####", "#   ", "#   ", "#   ", "#   ", "####"], // C
-    ["####", "#  #", "#  #", "#  #", "#  #", "####"], // O
-    ["### ", "#  #", "#  #", "#  #", "#  #", "### "], // D
-    ["####", "#   ", "### ", "#   ", "#   ", "####"], // E
-    ["####", "#  #", "####", "# # ", "#  #", "#  #"], // R
+/// 3x5 block glyphs for "HAIKU CODE" (the blank is the word gap). Small enough
+/// that the heavy, double-width logo still fits Haiku Terminal's default 80
+/// columns; adding a letter is a one-line change.
+const ART_GLYPHS: [&[&str; 5]; 10] = [
+    &["# #", "# #", "###", "# #", "# #"], // H
+    &["###", "# #", "###", "# #", "# #"], // A
+    &["###", " # ", " # ", " # ", "###"], // I
+    &["# #", "# #", "## ", "# #", "# #"], // K
+    &["# #", "# #", "# #", "# #", "###"], // U
+    &[" ", " ", " ", " ", " "],           // word gap
+    &["###", "#  ", "#  ", "#  ", "###"], // C
+    &["###", "# #", "# #", "# #", "###"], // O
+    &["## ", "# #", "# #", "# #", "## "], // D
+    &["###", "#  ", "## ", "#  ", "###"], // E
 ];
 
-/// Heavy Unicode "PICODER" with a diagonal `░` drop-shadow, for wide terminals.
-/// Hand-tuned: the shadow can't be derived by simply doubling `ART_GLYPHS`.
-const ART_UNICODE: [&str; 6] = [
-    "██████  ██████  ██████  ██████  ████    ██████  ██████",
-    "██░░██░░  ██░░░░██░░░░░░██░░██░░██░░██  ██░░░░░░██░░██░░",
-    "██████░░  ██░░  ██░░    ██░░██░░██░░██░░████    ██████░░",
-    "██░░░░░░  ██░░  ██░░    ██░░██░░██░░██░░██░░░░  ████░░░░",
-    "██░░    ██████  ██████  ██████░░████  ░░██████  ██░░██",
-    "  ░░      ░░░░░░  ░░░░░░  ░░░░░░  ░░░░    ░░░░░░  ░░  ░░",
-];
-
-/// Render the glyph table at a row, mapping `#`→`fill`. `double` widens each
-/// cell to two columns for the heavy Unicode logo.
-fn art_glyphs(fill: char, double: bool) -> Vec<String> {
-    (0..6)
+/// The glyph table as a grid of cells, one column between glyphs.
+fn art_cells() -> Vec<Vec<bool>> {
+    (0..5)
         .map(|r| {
-            ART_GLYPHS
-                .iter()
-                .map(|g| {
-                    g[r]
-                        .chars()
-                        .map(|c| {
-                            let cell = if c == '#' { fill } else { ' ' };
-                            if double { format!("{cell}{cell}") } else { cell.to_string() }
-                        })
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join(if double { "  " } else { " " })
+            let row: Vec<&str> = ART_GLYPHS.iter().map(|g| g[r]).collect();
+            row.join(" ").chars().map(|c| c == '#').collect()
         })
         .collect()
 }
 
-/// Generate a drop-shadow row for the ASCII art, matching the bottom row
-/// shifted right by one column. Uses `.` as the shadow character.
-fn ascii_shadow_row() -> String {
-    let fill = '#';
-    let bottom: String = ART_GLYPHS
-        .iter()
-        .map(|g| {
-            g[5]
-                .chars()
-                .map(|c| if c == '#' { fill } else { ' ' })
-                .collect::<String>()
+/// Heavy Unicode logo: every cell two columns wide, with a `░` drop shadow one
+/// cell down and to the right of each filled cell.
+fn art_heavy() -> Vec<String> {
+    let cells = art_cells();
+    let (rows, cols) = (cells.len(), cells[0].len());
+    let filled = |r: usize, c: usize| r < rows && c < cols && cells[r][c];
+    (0..=rows)
+        .map(|r| {
+            let line: String = (0..=cols)
+                .map(|c| {
+                    if filled(r, c) {
+                        "██"
+                    } else if r > 0 && c > 0 && filled(r - 1, c - 1) {
+                        "░░"
+                    } else {
+                        "  "
+                    }
+                })
+                .collect();
+            line.trim_end().to_string()
         })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let chars: Vec<char> = bottom.chars().collect();
-    let mut shadow = vec![' '; chars.len()];
-    for i in 0..chars.len().saturating_sub(1) {
-        if chars[i] == '#' {
+        .collect()
+}
+
+/// Single-width logo, `#`→`fill`.
+fn art_glyphs(fill: char) -> Vec<String> {
+    art_cells()
+        .iter()
+        .map(|row| row.iter().map(|&on| if on { fill } else { ' ' }).collect::<String>().trim_end().to_string())
+        .collect()
+}
+
+/// Drop-shadow row for the ASCII art: the bottom row shifted right by one
+/// column, drawn with `.`.
+fn ascii_shadow_row() -> String {
+    let cells = art_cells();
+    let bottom = &cells[cells.len() - 1];
+    let mut shadow = vec![' '; bottom.len() + 1];
+    for (i, &on) in bottom.iter().enumerate() {
+        if on {
             shadow[i + 1] = '.';
         }
     }
-    shadow.into_iter().collect()
+    shadow.into_iter().collect::<String>().trim_end().to_string()
 }
 
-/// Pick the widest PICODER art that fits in `w` columns.
+/// Pick the widest HAIKU CODE art that fits in `w` columns.
 fn banner_art(w: usize, ascii: bool) -> Vec<String> {
-    if !ascii && w >= 56 {
-        // Unicode art already includes its shadow row (row 5).
-        return ART_UNICODE.iter().map(|s| s.to_string()).collect();
-    } else if w >= 34 {
-        let mut art = art_glyphs(if ascii { '#' } else { '█' }, false);
+    let heavy = art_heavy();
+    let heavy_w = heavy.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let narrow_w = art_cells()[0].len();
+    if !ascii && w >= heavy_w {
+        heavy
+    } else if w > narrow_w {
+        let mut art = art_glyphs(if ascii { '#' } else { '█' });
         // ASCII gets a drop-shadow row; Unicode non-heavy gets none (too narrow).
         if ascii {
             art.push(ascii_shadow_row());
         }
-        return art;
+        art
     } else {
-        vec!["P I C O D E R".to_string()]
+        vec!["H A I K U   C O D E".to_string()]
     }
 }
 
@@ -127,7 +132,7 @@ pub fn banner_lines(w: usize, ascii: bool, status: &[String]) -> Vec<BLine> {
         out.push(BLine { text: format!("{art_pad}{l}"), role: BRole::Art(i) });
     }
     out.push(BLine { text: String::new(), role: BRole::Frame });
-    out.push(BLine { text: center(&format!("picoder v{}", env!("CARGO_PKG_VERSION"))), role: BRole::Version });
+    out.push(BLine { text: center(&format!("Haiku Code v{}", env!("CARGO_PKG_VERSION"))), role: BRole::Version });
     out.push(BLine { text: center(TAGLINE), role: BRole::Tagline });
     out.push(BLine { text: String::new(), role: BRole::Frame });
 
@@ -163,6 +168,16 @@ pub fn banner_ansi(width: u16, ascii: bool, theme: &str, status: &[String]) -> S
 
     let mut out = String::new();
     for bl in banner_lines(w, ascii, status) {
+        let text = match bl.role {
+            // Same cells-not-glyphs logo as the TUI (see helpers::art_spans),
+            // drawn as reverse-video spaces.
+            BRole::Art(i) => {
+                let c = palette::banner_row_color(&p, &rainbow, i, sixteen);
+                let (fg, shadow) = (palette::ansi_fg(c), palette::ansi_fg(palette::shadow_color(c, p.bg, sixteen)));
+                bl.text.replace('█', "\x1b[7m \x1b[27m").replace('░', &format!("{shadow}\x1b[7m \x1b[27m{fg}"))
+            }
+            _ => bl.text,
+        };
         let prefix = match bl.role {
             BRole::Art(i) => palette::ansi_fg(palette::banner_row_color(&p, &rainbow, i, sixteen)),
             // Accent/notice are the theme's own colors; on a 16-color console an
@@ -172,7 +187,7 @@ pub fn banner_ansi(width: u16, ascii: bool, theme: &str, status: &[String]) -> S
             BRole::Tagline => palette::ansi_fg(snap(p.notice, sixteen)),
             BRole::Frame | BRole::Data => palette::ansi_fg(snap(p.accent, sixteen)),
         };
-        out.push_str(&format!("{prefix}{}{reset}\n", bl.text));
+        out.push_str(&format!("{prefix}{text}{reset}\n"));
     }
     out
 }
@@ -215,5 +230,28 @@ pub fn push_banner_transcript(
             lead: true,
             color,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Haiku Terminal opens at 80 columns; the TUI leaves 76 for the banner.
+    #[test]
+    fn the_heavy_logo_fits_an_80_column_terminal() {
+        let art = banner_art(76, false);
+        assert!(art[0].contains('█') && art.iter().any(|l| l.contains('░')), "{art:?}");
+        assert!(art.iter().all(|l| l.chars().count() <= 76), "{art:?}");
+        assert_eq!(art.len(), 6, "five glyph rows plus the shadow row");
+    }
+
+    #[test]
+    fn narrow_terminals_fall_back_to_smaller_art() {
+        let small = banner_art(50, false);
+        assert!(small.iter().all(|l| !l.contains('░')) && small[0].contains('█'), "{small:?}");
+        let ascii = banner_art(76, true);
+        assert!(ascii.iter().all(|l| l.is_ascii()) && ascii.last().unwrap().contains('.'), "{ascii:?}");
+        assert_eq!(banner_art(20, false), ["H A I K U   C O D E"]);
     }
 }

@@ -5,7 +5,7 @@
 //!
 //! Zero external crates — SHA-256, base64url, a CSPRNG (`/dev/urandom`) and
 //! percent-encoding are implemented here so the Pi-Zero build stays tiny, the
-//! same way the rest of picoder hand-rolls its primitives (FNV in config.rs).
+//! same way the rest of haikucode hand-rolls its primitives (FNV in config.rs).
 //!
 //! The client ids / endpoints below are the public values shipped by each
 //! vendor's own first-party CLI. They are reverse-engineered and may change;
@@ -39,8 +39,8 @@ pub struct OAuthProvider {
     pub token_extra: Vec<(String, String)>,
 }
 
-/// Built-in defaults, overridable via `PICODER_OAUTH_<PROVIDER>_<FIELD>` env vars
-/// (e.g. `PICODER_OAUTH_ANTHROPIC_CLIENT_ID`). Returns None for providers that
+/// Built-in defaults, overridable via `HAIKUCODE_OAUTH_<PROVIDER>_<FIELD>` env vars
+/// (e.g. `HAIKUCODE_OAUTH_ANTHROPIC_CLIENT_ID`). Returns None for providers that
 /// don't support subscription login (e.g. deepseek — API key only).
 pub fn provider(name: &str) -> Option<OAuthProvider> {
     let mut p = match name {
@@ -82,7 +82,7 @@ pub fn provider(name: &str) -> Option<OAuthProvider> {
             token_url: "https://oauth2.googleapis.com/token".into(),
             // Google requires a registered client id + secret; supply your own
             // (or Gemini CLI's public desktop pair) via
-            // PICODER_OAUTH_GOOGLE_CLIENT_ID / PICODER_OAUTH_GOOGLE_CLIENT_SECRET.
+            // HAIKUCODE_OAUTH_GOOGLE_CLIENT_ID / HAIKUCODE_OAUTH_GOOGLE_CLIENT_SECRET.
             client_id: String::new(),
             client_secret: String::new(),
             scope: "https://www.googleapis.com/auth/cloud-platform \
@@ -101,16 +101,16 @@ pub fn provider(name: &str) -> Option<OAuthProvider> {
     };
     // Env overrides keep reverse-engineered constants fixable without a rebuild.
     let up = name.to_uppercase();
-    if let Ok(v) = std::env::var(format!("PICODER_OAUTH_{up}_CLIENT_ID")) {
+    if let Ok(v) = std::env::var(format!("HAIKUCODE_OAUTH_{up}_CLIENT_ID")) {
         p.client_id = v;
     }
-    if let Ok(v) = std::env::var(format!("PICODER_OAUTH_{up}_CLIENT_SECRET")) {
+    if let Ok(v) = std::env::var(format!("HAIKUCODE_OAUTH_{up}_CLIENT_SECRET")) {
         p.client_secret = v;
     }
-    if let Ok(v) = std::env::var(format!("PICODER_OAUTH_{up}_AUTH_URL")) {
+    if let Ok(v) = std::env::var(format!("HAIKUCODE_OAUTH_{up}_AUTH_URL")) {
         p.auth_url = v;
     }
-    if let Ok(v) = std::env::var(format!("PICODER_OAUTH_{up}_TOKEN_URL")) {
+    if let Ok(v) = std::env::var(format!("HAIKUCODE_OAUTH_{up}_TOKEN_URL")) {
         p.token_url = v;
     }
     Some(p)
@@ -156,8 +156,8 @@ pub fn start_on(p: OAuthProvider, listener: TcpListener, redirect_uri: String) -
     if p.client_id.is_empty() {
         let up = p.key.to_uppercase();
         bail!(
-            "no OAuth client id for {}. Set PICODER_OAUTH_{up}_CLIENT_ID (and \
-             PICODER_OAUTH_{up}_CLIENT_SECRET if the provider needs one) and retry.",
+            "no OAuth client id for {}. Set HAIKUCODE_OAUTH_{up}_CLIENT_ID (and \
+             HAIKUCODE_OAUTH_{up}_CLIENT_SECRET if the provider needs one) and retry.",
             p.label
         );
     }
@@ -328,7 +328,7 @@ fn wait_for_code(listener: &TcpListener, expect_state: &str) -> Result<String> {
                     if !expect_state.is_empty() && state != expect_state {
                         ("Login failed (state mismatch).".to_string(), Err(anyhow!("OAuth state mismatch — possible CSRF, aborted")))
                     } else {
-                        ("Login complete — you can close this tab and return to picoder.".to_string(), Ok(code.clone()))
+                        ("Login complete — you can close this tab and return to haikucode.".to_string(), Ok(code.clone()))
                     }
                 } else {
                     // Not the callback (e.g. favicon.ico); ignore and keep waiting.
@@ -348,7 +348,7 @@ fn wait_for_code(listener: &TcpListener, expect_state: &str) -> Result<String> {
 
 fn write_http(stream: &mut std::net::TcpStream, body: &str) -> std::io::Result<()> {
     let html = format!(
-        "<!doctype html><html><head><meta charset=utf-8><title>picoder</title></head>\
+        "<!doctype html><html><head><meta charset=utf-8><title>haikucode</title></head>\
          <body style=\"font-family:system-ui;background:#0b0b0b;color:#eee;display:flex;\
          align-items:center;justify-content:center;height:100vh;margin:0\">\
          <p style=\"font-size:1.1rem\">{body}</p></body></html>"
@@ -365,8 +365,8 @@ fn write_http(stream: &mut std::net::TcpStream, body: &str) -> std::io::Result<(
 /// URL is also printed to the transcript).
 fn open_browser(url: &str) {
     // An override for headless boxes and tests: the command gets the URL as
-    // its last argument (e.g. PICODER_BROWSER="curl -sL -o /dev/null").
-    if let Ok(cmd) = std::env::var("PICODER_BROWSER") {
+    // its last argument (e.g. HAIKUCODE_BROWSER="curl -sL -o /dev/null").
+    if let Ok(cmd) = std::env::var("HAIKUCODE_BROWSER") {
         if !cmd.trim().is_empty() {
             let _ = std::process::Command::new("sh")
                 .arg("-c")
@@ -379,11 +379,12 @@ fn open_browser(url: &str) {
             return;
         }
     }
-    #[cfg(target_os = "macos")]
+    // Haiku's `open` hands a URL to the preferred browser, like macOS's.
+    #[cfg(any(target_os = "macos", target_os = "haiku"))]
     let prog = "open";
     #[cfg(target_os = "windows")]
     let prog = "explorer";
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "haiku", target_os = "windows")))]
     let prog = "xdg-open";
     let _ = std::process::Command::new(prog)
         .arg(url)
@@ -409,7 +410,7 @@ fn rand_b64url(len: usize) -> String {
 }
 
 fn rand_bytes(len: usize) -> Vec<u8> {
-    // Unix targets (Pi, Jetson, macOS) all expose /dev/urandom.
+    // Unix targets (Haiku, Linux, macOS) all expose /dev/urandom.
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let mut buf = vec![0u8; len];
         if f.read_exact(&mut buf).is_ok() {

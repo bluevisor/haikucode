@@ -901,7 +901,7 @@ fn run_proc(cmd: &mut Command, timeout_secs: u64) -> std::io::Result<std::proces
 
 /// Whether edit checkpoints also bump Cargo.toml's patch version. Opt-in with
 /// `"auto_bump_version": true` in config.json or the project's
-/// `.picoder/settings(.local).json` (the most specific layer wins): in someone
+/// `.haikucode/settings(.local).json` (the most specific layer wins): in someone
 /// else's crate a version bump per edit is noise, not a checkpoint.
 fn auto_bump_version() -> bool {
     crate::config::settings_layers()
@@ -1016,11 +1016,11 @@ pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
         let mut c = Command::new("git");
         c.arg("-C").arg(dir);
         if ident {
-            c.args(["-c", "user.name=picoder", "-c", "user.email=picoder@localhost"]);
+            c.args(["-c", "user.name=haikucode", "-c", "user.email=haikucode@localhost"]);
         }
         // Commit only the edited files (+ the Cargo.toml bump): with explicit
         // paths git ignores whatever else the user has staged, so a checkpoint
-        // never sweeps their half-prepared commit into a "picoder: edit" one.
+        // never sweeps their half-prepared commit into a "haikucode: edit" one.
         c.args(["commit", "--no-verify", "-m", message, "--"]);
         for p in &paths {
             c.arg(p);
@@ -1144,7 +1144,7 @@ pub fn git_run(dir: &Path, args: &[&str], timeout_secs: u64) -> std::result::Res
     }
 }
 
-/// Undo picoder's own checkpoint commits made after `base` (and `/undo`'s
+/// Undo haikucode's own checkpoint commits made after `base` (and `/undo`'s
 /// reverts of them), newest first, as one new commit. Anything else committed
 /// in between is left alone. Returns how many commits were reverted (0 when
 /// there was nothing to undo). Refuses with staged changes, since the commit
@@ -1154,7 +1154,7 @@ pub fn revert_checkpoints_since(dir: &Path, base: &str) -> std::result::Result<u
     let shas: Vec<&str> = log
         .lines()
         .filter_map(|l| l.split_once(' '))
-        .filter(|(_, subject)| subject.starts_with("picoder:") || subject.starts_with("Revert \"picoder:"))
+        .filter(|(_, subject)| subject.starts_with("haikucode:") || subject.starts_with("Revert \"haikucode:"))
         .map(|(sha, _)| sha)
         .collect();
     if shas.is_empty() {
@@ -1177,11 +1177,11 @@ pub fn revert_checkpoints_since(dir: &Path, base: &str) -> std::result::Result<u
         let _ = git_run(dir, &["revert", "--quit"], 10);
         return Ok(0);
     }
-    let msg = format!("picoder: rewind (reverted {} checkpoint(s))", shas.len());
+    let msg = format!("haikucode: rewind (reverted {} checkpoint(s))", shas.len());
     let commit = |ident: bool| {
         let mut a: Vec<&str> = Vec::new();
         if ident {
-            a.extend(["-c", "user.name=picoder", "-c", "user.email=picoder@localhost"]);
+            a.extend(["-c", "user.name=haikucode", "-c", "user.email=haikucode@localhost"]);
         }
         a.extend(["commit", "--no-verify", "-m", &msg]);
         git_run(dir, &a, 30)
@@ -1602,7 +1602,7 @@ pub fn web_search(http: &ureq::Agent, query: &str) -> String {
         Err(e) => return e,
     };
     let q = urlencode(query);
-    let get = |url: &str| http.get(url).timeout(Duration::from_secs(30)).set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) picoder/0.3");
+    let get = |url: &str| http.get(url).timeout(Duration::from_secs(30)).set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) haikucode/0.3");
     let (name, resp) = match &backend {
         SearchBackend::Searxng(base) => {
             ("SearXNG", get(&format!("{}/search?q={q}&format=json", base.trim_end_matches('/'))).call())
@@ -1837,8 +1837,8 @@ pub fn todo(items: &serde_json::Value) -> String {
 // memory.md holds one note per line: `- note` is global (a fact about the user,
 // true in every project), `- [/abs/dir] note` belongs to that directory and is
 // only shown in sessions there or below. Notes used to be global only, so a
-// demo's "picoder project: … at ./index.html" was injected everywhere and the
-// model went looking for a `picoder/` folder that never existed.
+// demo's "haikucode project: … at ./index.html" was injected everywhere and the
+// model went looking for a `haikucode/` folder that never existed.
 
 /// The line `remember` appends: tagged with `scope` unless the note is global.
 fn memory_line(note: &str, scope: Option<&Path>) -> String {
@@ -1883,7 +1883,7 @@ pub fn remember(note: &str, global: bool) -> String {
     // appends. create_new is atomic — only one process can own the lock at once.
     let lock = path.with_extension("md.lock");
     if let Err(e) = lock_acquire(&lock) {
-        return format!("ERROR: lock busy — another picoder is writing memory: {e}");
+        return format!("ERROR: lock busy — another haikucode is writing memory: {e}");
     }
     let res = std::fs::OpenOptions::new()
         .create(true)
@@ -1967,14 +1967,14 @@ mod tests {
     use super::*;
 
     /// A demo directory's note showed up in every session everywhere, and the
-    /// model went hunting for the "picoder project" it described.
+    /// model went hunting for the "haikucode project" it described.
     #[test]
     fn project_notes_stay_in_their_directory() {
         let demo = Path::new("/Users/me/Developer/test");
         let content = [
             memory_line("prefers terse answers", None),
             memory_line("WebGL demo in ./index.html", Some(demo)),
-            memory_line("Rust CLI", Some(Path::new("/Users/me/Developer/picoder"))),
+            memory_line("Rust CLI", Some(Path::new("/Users/me/Developer/haikucode"))),
         ]
         .join("\n");
 
@@ -2057,7 +2057,7 @@ mod tests {
 
     #[test]
     fn multi_edit_composes_same_file() {
-        let dir = std::env::temp_dir().join(format!("picoder_multi_edit_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_multi_edit_test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         let b = dir.join("b.txt");
@@ -2084,7 +2084,7 @@ mod tests {
 
     #[test]
     fn multi_edit_aborts_on_missing_match() {
-        let dir = std::env::temp_dir().join(format!("picoder_multi_edit_abort-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_multi_edit_abort-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.txt");
         std::fs::write(&a, "keep me\n").unwrap();
@@ -2115,7 +2115,7 @@ mod tests {
 
     #[test]
     fn multi_edit_treats_two_spellings_of_one_file_as_one_file() {
-        let dir = std::env::temp_dir().join(format!("picoder-me-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-me-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
@@ -2134,7 +2134,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn multi_edit_and_apply_write_refuse_symlinks() {
-        let dir = std::env::temp_dir().join(format!("picoder-me-ln-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-me-ln-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.txt");
@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn read_file_reports_bad_ranges_instead_of_an_empty_file() {
-        let dir = std::env::temp_dir().join(format!("picoder-rf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-rf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let f = dir.join("r.txt");
         std::fs::write(&f, "a\nb\nc\n").unwrap();
@@ -2165,7 +2165,7 @@ mod tests {
 
     #[test]
     fn git_autocommit_leaves_the_users_own_staged_changes_alone() {
-        let dir = std::env::temp_dir().join(format!("picoder-ac-staged-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-ac-staged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -2178,20 +2178,20 @@ mod tests {
         // The user has staged their own work-in-progress...
         std::fs::write(dir.join("mine.txt"), "wip").unwrap();
         git(&["add", "mine.txt"]);
-        // ...and picoder edits a different file.
+        // ...and haikucode edits a different file.
         let edited = dir.join("edited.txt");
         std::fs::write(&edited, "hello").unwrap();
-        let note = git_autocommit(&dir, &[edited.to_string_lossy().into_owned()], "picoder: edit edited.txt");
+        let note = git_autocommit(&dir, &[edited.to_string_lossy().into_owned()], "haikucode: edit edited.txt");
         assert!(note.contains("[committed"), "{note}");
         let files = git(&["show", "--name-only", "--format=", "HEAD"]);
-        assert_eq!(files.trim(), "edited.txt", "only picoder's file is in the checkpoint");
+        assert_eq!(files.trim(), "edited.txt", "only haikucode's file is in the checkpoint");
         assert_eq!(git(&["diff", "--cached", "--name-only"]), "mine.txt", "the user's staging survives");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn git_autocommit_checkpoints_edit() {
-        let dir = std::env::temp_dir().join(format!("picoder_git_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_git_test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -2205,10 +2205,10 @@ mod tests {
         assert!(in_git_repo(&dir));
         let f = dir.join("x.txt");
         std::fs::write(&f, "hi\n").unwrap();
-        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: write x.txt");
+        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt");
         assert!(note.contains("committed"), "got: {note:?}");
         // A second call with no change commits nothing.
-        let note2 = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: noop");
+        let note2 = git_autocommit(&dir, &[f.to_string_lossy().into()], "haikucode: noop");
         assert!(note2.is_empty(), "got: {note2:?}");
         let log = git(&["log", "--oneline"]);
         assert!(String::from_utf8_lossy(&log.stdout).contains("write x.txt"));
@@ -2217,7 +2217,7 @@ mod tests {
 
     #[test]
     fn bump_cargo_version_increments_patch() {
-        let dir = std::env::temp_dir().join(format!("picoder_bump_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_bump_test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let toml = dir.join("Cargo.toml");
         std::fs::write(&toml, "[package]\nname = \"t\"\nversion = \"3.14.159\"\nedition = \"2021\"\n").unwrap();
@@ -2251,7 +2251,7 @@ mod tests {
     /// the whole batch.
     #[test]
     fn multi_edit_skips_a_no_op_edit() {
-        let dir = std::env::temp_dir().join(format!("picoder_noop-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_noop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
         std::fs::write(&f, "one\ntwo\n").unwrap();
@@ -2303,7 +2303,7 @@ mod tests {
 
     #[test]
     fn search_tools_honor_gitignore_in_a_repo() {
-        let dir = std::env::temp_dir().join(format!("picoder-gi-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-gi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for d in ["src", "target/debug", "vendor"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -2381,8 +2381,8 @@ mod tests {
     }
 
     #[test]
-    fn rewind_reverts_only_picoders_checkpoints() {
-        let dir = std::env::temp_dir().join(format!("picoder-rewind-{}", std::process::id()));
+    fn rewind_reverts_only_haikucodes_checkpoints() {
+        let dir = std::env::temp_dir().join(format!("haikucode-rewind-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -2397,35 +2397,35 @@ mod tests {
         git(&["add", "."]);
         commit("init");
         let base = git(&["rev-parse", "HEAD"]);
-        // Two picoder checkpoints with the user's own commit in between.
-        std::fs::write(dir.join("a.txt"), "picoder 1\n").unwrap();
-        commit("picoder: edit a.txt");
+        // Two haikucode checkpoints with the user's own commit in between.
+        std::fs::write(dir.join("a.txt"), "haikucode 1\n").unwrap();
+        commit("haikucode: edit a.txt");
         std::fs::write(dir.join("b.txt"), "mine\n").unwrap();
         commit("user: my change");
-        std::fs::write(dir.join("a.txt"), "picoder 2\n").unwrap();
-        commit("picoder: edit a.txt");
+        std::fs::write(dir.join("a.txt"), "haikucode 2\n").unwrap();
+        commit("haikucode: edit a.txt");
 
         assert_eq!(revert_checkpoints_since(&dir, &base), Ok(2));
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
-        assert_eq!(read("a.txt"), "base\n", "picoder's edits are undone");
+        assert_eq!(read("a.txt"), "base\n", "haikucode's edits are undone");
         assert_eq!(read("b.txt"), "mine\n", "the user's commit is kept");
-        assert!(git(&["log", "-1", "--format=%s"]).starts_with("picoder: rewind"));
+        assert!(git(&["log", "-1", "--format=%s"]).starts_with("haikucode: rewind"));
         // Rewinding again to the same point has nothing left to undo.
         assert_eq!(revert_checkpoints_since(&dir, &git(&["rev-parse", "HEAD"])), Ok(0));
 
         // Staged work of the user's own blocks a rewind instead of being swept in.
-        std::fs::write(dir.join("a.txt"), "picoder 3\n").unwrap();
-        commit("picoder: edit a.txt");
+        std::fs::write(dir.join("a.txt"), "haikucode 3\n").unwrap();
+        commit("haikucode: edit a.txt");
         std::fs::write(dir.join("b.txt"), "staged\n").unwrap();
         git(&["add", "b.txt"]);
         assert!(revert_checkpoints_since(&dir, &base).is_err());
-        assert_eq!(read("a.txt"), "picoder 3\n", "nothing changed on refusal");
+        assert_eq!(read("a.txt"), "haikucode 3\n", "nothing changed on refusal");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn bump_cargo_version_only_touches_the_package_table() {
-        let dir = std::env::temp_dir().join(format!("picoder_bump_tables-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_bump_tables-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let toml = dir.join("Cargo.toml");
         // A dependency table ahead of [package] has the same `version = ` shape.
@@ -2447,7 +2447,7 @@ mod tests {
 
     #[test]
     fn bump_cargo_version_no_cargo_toml() {
-        let dir = std::env::temp_dir().join(format!("picoder_bump_nocargo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_bump_nocargo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(bump_cargo_version(&dir).is_none());
         std::fs::remove_dir_all(&dir).ok();
@@ -2455,7 +2455,7 @@ mod tests {
 
     #[test]
     fn git_autocommit_bumps_version() {
-        let dir = std::env::temp_dir().join(format!("picoder_git_bump_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_git_bump_test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
@@ -2475,7 +2475,7 @@ mod tests {
         // Now edit a file and autocommit.
         let f = dir.join("x.txt");
         std::fs::write(&f, "hi\n").unwrap();
-        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: write x.txt");
+        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt");
         assert!(note.contains("committed"), "got: {note:?}");
         assert!(note.contains("version → 0.1.1"), "got: {note:?}");
         let content = std::fs::read_to_string(&toml).unwrap();
@@ -2503,7 +2503,7 @@ mod tests {
         assert!(!is_image_path("notes.txt"));
         assert!(!is_image_path("Makefile"));
         // jpg maps to the image/jpeg mime.
-        let dir = std::env::temp_dir().join(format!("picoder_img_test-{}.jpg", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_img_test-{}.jpg", std::process::id()));
         std::fs::write(&dir, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
         let uri = image_data_uri(dir.to_str().unwrap()).unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,/9j/"), "got: {uri}");
@@ -2589,7 +2589,7 @@ mod tests {
     #[cfg(unix)]
     fn file_tools_refuse_symlinks() {
         use std::os::unix::fs::symlink;
-        let dir = std::env::temp_dir().join(format!("picoder_symlink_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_symlink_test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("real.txt");

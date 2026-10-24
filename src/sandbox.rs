@@ -1,9 +1,9 @@
-//! OS sandbox for the shell commands picoder runs (`bash`, background jobs,
+//! OS sandbox for the shell commands haikucode runs (`bash`, background jobs,
 //! `!cmd`). Off by default. Settings, from config.json or the project's
-//! `.picoder/settings(.local).json` (the most specific layer wins):
+//! `.haikucode/settings(.local).json` (the most specific layer wins):
 //!
 //! - `"sandbox"`: `"off"` | `"workspace"` (writes only under the working
-//!   directory, its repo root, the temp dirs, picoder's config dir and
+//!   directory, its repo root, the temp dirs, haikucode's config dir and
 //!   `sandbox_allow_write`) | `"readonly"` (writes only to temp dirs).
 //! - `"sandbox_network"`: `false` blocks network access (default `true`).
 //! - `"sandbox_allow_write"`: extra writable paths, e.g. `["~/.cargo"]`.
@@ -40,7 +40,7 @@ pub struct Guard {
 
 impl Sandbox {
     /// The sandbox the settings ask for in `cwd`, or None when it's off. A
-    /// repo's own `.picoder/` settings can tighten the sandbox but never loosen
+    /// repo's own `.haikucode/` settings can tighten the sandbox but never loosen
     /// it: the strictest mode and network setting across layers win, and only
     /// the user's config.json may add `sandbox_allow_write` paths (a cloned
     /// repo could otherwise make `~` writable or switch the sandbox off).
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn workspace_profile_allows_the_workspace_and_temp_only() {
-        let dir = std::env::temp_dir().join(format!("picoder-sbx-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-sbx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sb = Sandbox::new(Mode::Workspace, false, &dir, &[]);
         let canon = std::fs::canonicalize(&dir).unwrap();
@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn a_repo_can_tighten_the_sandbox_but_never_loosen_it() {
         use serde_json::json;
-        let user = PathBuf::from("/home/u/.config/picoder/config.json");
-        let repo = PathBuf::from("/repo/.picoder/settings.json");
+        let user = PathBuf::from("/home/u/.config/haikucode/config.json");
+        let repo = PathBuf::from("/repo/.haikucode/settings.json");
         let cwd = std::env::temp_dir();
         let on = |l: &[(PathBuf, serde_json::Value)]| Sandbox::from_layers(l, &user, &cwd);
         // The user's workspace sandbox survives a repo asking for "off", for
@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(on(&[(repo.clone(), json!({"sandbox": "readonly"}))]).unwrap().mode, Mode::ReadOnly);
         assert!(on(&[(user.clone(), json!({}))]).is_none(), "off by default");
         // Only the user's own config adds writable paths.
-        let tmp = std::env::temp_dir().join(format!("picoder-sbx-extra-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("haikucode-sbx-extra-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let s = on(&[(user.clone(), json!({"sandbox": "workspace", "sandbox_allow_write": [tmp.display().to_string()]}))]).unwrap();
         assert!(s.writable.contains(&std::fs::canonicalize(&tmp).unwrap()));
@@ -375,11 +375,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn landlock_confines_writes_or_degrades_with_a_warning() {
-        let base = std::env::temp_dir().join(format!("picoder-ll-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("haikucode-ll-{}", std::process::id()));
         let work = base.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap();
-        let outside = home.join(format!(".picoder-ll-probe-{}", std::process::id()));
+        let outside = home.join(format!(".haikucode-ll-probe-{}", std::process::id()));
         let sb = Sandbox::new(Mode::Workspace, true, &work, &[]);
         let (mut cmd, _g, warn) =
             sb.shell(&format!("echo in > inside.txt && echo ok; echo out > '{}'", outside.display()));
@@ -402,9 +402,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_exec_blocks_writes_outside_the_workspace() {
-        let base = std::env::temp_dir().join(format!("picoder-sbx-live-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("haikucode-sbx-live-{}", std::process::id()));
         let work = base.join("work");
-        let outside = std::env::var("HOME").map(PathBuf::from).unwrap().join(format!(".picoder-sbx-probe-{}", std::process::id()));
+        let outside = std::env::var("HOME").map(PathBuf::from).unwrap().join(format!(".haikucode-sbx-probe-{}", std::process::id()));
         std::fs::create_dir_all(&work).unwrap();
         let sb = Sandbox::new(Mode::Workspace, true, &work, &[]);
         let (mut cmd, _g, warn) =

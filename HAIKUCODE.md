@@ -1,22 +1,25 @@
-# picoder
+# Haiku Code (haikucode)
 
-A tiny full-screen agentic coding CLI written in Rust, built to run **on a
-Raspberry Pi Zero W** (ARMv6, single core, ~512MB RAM). It talks to any
-OpenAI-compatible chat API (default: DeepSeek `deepseek-v4-pro`) and drives a
-Codex/Claude-Code-style tool loop with a ratatui terminal UI.
+A full-screen agentic coding CLI written in Rust, running **on Haiku** (the
+BeOS-lineage OS; developed against Haiku R1~beta6 hrev60290 arm64 in a UTM VM).
+It talks to any OpenAI-compatible chat API (default: DeepSeek) and drives a
+Codex/Claude-Code-style tool loop with a ratatui terminal UI. It is a port of
+picoder (the Raspberry Pi Zero W agent); the `picoder` git remote is upstream.
 
-This is picoder's own source. picoder can read and edit these files, but **the Pi
-cannot compile Rust** — see "Building" below.
+This is haikucode's own source. It builds natively on Haiku with
+`cargo build --release` — see "Building" below.
 
 ## Layout
 
 ```
-Cargo.toml            deps + release + jetson profiles (static musl, size-optimized)
-.cargo/config.toml    cross-linkers for ARMv6/ARMv7/aarch64 musl + aarch64 gnu (Jetson)
-build.sh              cross-compile (+ deploy/pull to sync with Pis)
+Cargo.toml            deps + release profile; Haiku-only crossterm use-dev-tty feature
+haiku/package.sh      on Haiku: build + wrap dist/haikucode-<ver>-<rev>-<arch>.hpkg
+haiku/deploy.sh       on the Mac: sync source to $HAIKU_HOST, build + package there, activate
+haiku/launcher.sh     "apps/Haiku Code": Deskbar entry that opens haikucode in Terminal
+haiku/PackageInfo.in  .PackageInfo template (version/revision/arch filled in)
 src/
   main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
-  config.rs           ~/.config/picoder/config.json (incl. mcp_servers), setup wizard, session paths
+  config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
   api.rs              OpenAI-compatible streaming SSE, tool schema, multimodal parts, retry, list_models
   tools.rs            tool impls: bash (+ background), read/write/edit/list, grep, glob,
                       web_fetch, web_search, todo, view_image, remember, recall
@@ -24,7 +27,7 @@ src/
                       hooks + permission-rule enforcement, thrashing guard, `!cmd` shell runs
   policy.rs           permission rules: allow/deny patterns, bash segment splitting, rule persistence
   hooks.rs            lifecycle hooks (PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart)
-  commands.rs         custom slash commands from .picoder/commands/*.md and skills/*/SKILL.md
+  commands.rs         custom slash commands from .haikucode/commands/*.md and skills/*/SKILL.md
   mcp.rs              stdio MCP client: spawn servers, JSON-RPC handshake, tools/list + tools/call
   money.rs            Currency/Balance: keeps the cost and balance readouts in the
                       right units (DeepSeek bills CNY accounts in CNY, prices are USD)
@@ -76,11 +79,11 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   needs since it can't report Shift+Tab): ask / bypass / plan (read-only); colored
   diff before write/edit. Handled in every mode, and never confused with the
   composer's Tab autocomplete.
-- Instruction files: the first of `PICODER.md`/`AGENTS.md`/`CLAUDE.md`/`GEMINI.md`
-  in `~/.config/picoder/` and in each directory from the repo root down to the
+- Instruction files: the first of `HAIKUCODE.md`/`AGENTS.md`/`CLAUDE.md`/`GEMINI.md`
+  in `~/config/settings/haikucode/` and in each directory from the repo root down to the
   working directory, stacked general → specific (12k chars each, 32k total,
   budget spent nearest-first).
-- Session persistence + resume (`picoder --continue`, per working directory).
+- Session persistence + resume (`haikucode --continue`, per working directory).
 - Composer: typing `/` opens a command palette (suggestions ranked by your
   usage history; ↑/↓ select, Tab fills, Enter runs), `@file` attach, Tab
   autocomplete (commands + paths), history (↑/↓ on the composer's first/last line),
@@ -95,13 +98,16 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   end. Scrolling has a keyboard gesture rather than only the wheel because Warp
   skips mouse capture (below) and would otherwise have no way to scroll.
 - Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) so click-drag
-  text selection keeps working; `PICODER_MOUSE=1`/`0` overrides either way.
+  text selection keeps working; `HAIKUCODE_MOUSE=1`/`0` overrides either way.
 - ASCII fallback + clear-on-exit for the Pi's framebuffer console (`TERM=linux`),
   whose 16-color palette can't show a theme's RGB shades: the palette is snapped
   to the nearest ANSI color there (`palette::for_16color`), since the console
   ignores an `ESC[38;2;…m` and leaves the cell in whatever color came before.
-- Launch banner: rainbow-color PICODER logo + live status (MEM, WiFi SSID + IP).
-- Themes (`/theme`, numbered picker): `Default`, `Apple ][` (green phosphor, `] ▒`),
+- Launch banner: rainbow-color HAIKUCODE logo + live status (MEM, WiFi SSID + IP).
+- Themes (`/theme`, numbered picker): `HaikuOS` (default: tab-yellow accent and
+  logo on dark desktop blue, `~> `), `Rainbow` (picoder's original look: Apple-
+  rainbow logo, terminal background; configs saying `Default` get HaikuOS),
+  `Apple ][` (green phosphor, `] ▒`),
   `MSDOS` (gray, `C:\>`), `macOS` (dark mode system colors, `~ `),
   `SUN` (amber/gold, `sun% `), `NeXT` (platinum monochrome, `NeXT>`),
   `SGI` (indigo/teal IRIX, `irix# `); persisted in config. Theme sets colors, prompt, cursor.
@@ -110,10 +116,10 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   `/model <id|number>` still sets directly.
 - Slash commands: `/model /auto /reset /compact [focus] /config /mcp /memory /theme /init /new
   /diff /undo /rewind /review /status /cost /permissions /hooks /commands /clear /help /exit`, plus any
-  custom command from `.picoder/commands/<name>.md` (`$ARGUMENTS`). `!cmd` runs a shell
+  custom command from `.haikucode/commands/<name>.md` (`$ARGUMENTS`). `!cmd` runs a shell
   command directly and records the output in the conversation.
 - Permission rules (`policy.rs`): `permissions.allow` / `permissions.deny` arrays merged from
-  `config.json`, `.picoder/settings.json`, `.picoder/settings.local.json`. Deny is checked
+  `config.json`, `.haikucode/settings.json`, `.haikucode/settings.local.json`. Deny is checked
   before the permission mode (so it holds in bypass), allow skips the prompt in ask mode.
   The approval prompt offers **P** — persist a suggested rule (`bash(cargo test:*)`,
   `edit_file(src/**)`) to `settings.local.json` (or config.json outside a repo). **N** denies
@@ -149,45 +155,40 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   `price_currency` (and CNY prices) if they want a single unit. Nothing is ever
   converted — an exchange rate would be a guess.
 
-## Building (must be done on the Mac — the Pi can't compile this)
+## Building (natively on Haiku)
 
-Cross-compiled from macOS to **three** static musl targets: ARMv6 for the Pi
-Zero W, ARMv7 for 32-bit Pi OS on the Pi 2/3/4 (`armv7l`), and aarch64 for the
-Pi 5 (a 64-bit box — running the 32-bit ARMv6 build under compat is fragile and
-can segfault, so it gets a native binary). The ARMv7 build reuses the ARMv6
-musl gcc as linker, so no extra toolchain is needed beyond
-`rustup target add armv7-unknown-linux-musleabihf`.
+There is no macOS→Haiku cross toolchain here; the Haiku box builds itself.
 
-```
-# one-time toolchain setup:
-brew install messense/macos-cross-toolchains/arm-unknown-linux-musleabihf
-brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
-rustup target add arm-unknown-linux-musleabihf
-rustup target add armv7-unknown-linux-musleabihf
-rustup target add aarch64-unknown-linux-musl
-
-./build.sh           # build all three targets under target/<triple>/release/picoder
-./build.sh deploy    # build + install the right binary per host in PICODER_HOSTS
-PICODER_HOSTS="pi@a pi@b" ./build.sh deploy   # custom deploy targets
-PI=user@host ./build.sh deploy               # install to a single host instead
+```sh
+cargo build --release        # on Haiku
+cargo test --bins            # the suite passes on Haiku and on the Mac
+haiku/package.sh             # → dist/haikucode-<ver>-1-<arch>.hpkg
+haiku/deploy.sh              # from the Mac: sync, build + package on HAIKU_HOST, activate
 ```
 
-`deploy` queries each host's `uname -m` and installs the matching binary
-(`armv6l` → ARMv6, `armv7l` → ARMv7, `aarch64` → aarch64) to
-`~/.local/bin/picoder`. Hosts come
-from the `PICODER_HOSTS` env var (space-separated `user@host`; defaults to the
-Pi Zero + Pi 5), or `PI=user@host` for a single host.
+Copying the .hpkg into `~/config/packages` activates it a moment later
+(binary → `~/config/bin`, launcher → `~/config/apps`, Deskbar entry under
+`~/config/data/deskbar/menu`). `deploy.sh` waits for deactivation, then
+activation, and `cmp`s the installed binary with the build: swapping a
+same-version package in one go races the package daemon.
 
-`build.sh` sets the `ring` cross-compile env vars (`CC_/AR_/TARGET_CC`) per
-target and the linkers come from `.cargo/config.toml`. Each output is a ~2.5MB
-fully static binary.
+Haiku-specific code is behind `cfg(target_os = "haiku")`: `config::CONFIG_SUBDIR`,
+`sysinfo::{haiku_os_name, mem_used_total}`, the `HAIKU_SHELL_RULE` in the system
+prompt, `auth::open_browser` (`open`), and `helpers::tty_hung_up` in the UI loop.
 
-> If you edit the source on the Pi, copy it back to the Mac before rebuilding,
-> or those edits won't be in the next build. The Mac copy is canonical.
+Haiku gotchas this code works around:
+- crossterm's default mio event source stops delivering keys after the first
+  batch on Haiku → `use-dev-tty` feature (Cargo.toml).
+- Haiku sends no SIGHUP when a pty goes away; the tty polls POLLHUP and reads
+  fail → the UI loop checks `tty_hung_up()` and exits.
+- Block elements (`█ ░`) render wider than a cell in Haiku Terminal → logo cells
+  are background-colored spaces (`helpers::art_spans`).
+- A roster-launched script that `exec`s Terminal leaves Terminal windowless →
+  `launcher.sh` backgrounds it.
 
-## Config / state (on the Pi)
+## Config / state
 
-`~/.config/picoder/` — `config.json` (provider/model/key), `memory.md`,
+`~/config/settings/haikucode/` — `config.json` (provider/model/key), `memory.md`,
 `history`, `sessions/`.
 
 MCP servers are optional and configured by hand in `config.json`:
@@ -200,7 +201,7 @@ MCP servers are optional and configured by hand in `config.json`:
   "mcp_servers": {
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/pi"],
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/boot/home"],
       "env": {}
     }
   }
@@ -215,7 +216,7 @@ Each server is spawned over stdio at launch; its tools appear as
 - **Session forking / naming**; `--resume` picker over several sessions per directory.
 - **OS-native sandboxing** (Seatbelt / bubblewrap) for bash — rules + hooks are policy,
   not containment.
-- **MCP server mode** (expose picoder's tools over stdio).
+- **MCP server mode** (expose haikucode's tools over stdio).
 
 - **ui.rs split** (~3100 lines → submodules). A clean split would extract:
   `ui/banner.rs` (banner rendering, ~300 lines), `ui/panels.rs` (config picker,
@@ -225,7 +226,7 @@ Each server is spawned over stdio at launch; its tools appear as
   `ui.rs` so the rest of the crate sees no change.
 
 - **Config/environment-driven integration tests**. MCP handshake and web_search
-  tests currently `#[ignore]` because they need a live server; a `PICODER_TEST=1`
+  tests currently `#[ignore]` because they need a live server; a `HAIKUCODE_TEST=1`
   gate would run them in CI with a containerized MCP stub.
 
 ## Performance / safety notes
@@ -234,7 +235,7 @@ Each server is spawned over stdio at launch; its tools appear as
   static (non-`live`) transcript into `disp_cache` once and reuses it until the
   content (`tver`, bumped via `dirty()`/`set_palette`) or terminal width
   changes; each frame clones only the visible window. This avoids re-wrapping
-  thousands of lines per streamed token on a single-core Pi.
+  thousands of lines per streamed token on a single-core Pi (where picoder started).
 - **Atomic state writes** (`config::atomic_write`). `config.json` and session
   files are written to a per-process temp file, fsync'd, then renamed over the
   target, so a power loss on the SD card never leaves a truncated file.
@@ -251,7 +252,6 @@ Each server is spawned over stdio at launch; its tools appear as
 
 ## CI
 
-`.github/workflows/ci.yml` runs `cargo test` on the host (hard gate) plus a
-`cross build --release` for all three deploy targets (ARMv6 / ARMv7 / aarch64),
-so a broken cross-compile is caught in CI rather than at deploy time. Clippy and
-`cargo fmt --check` run advisory-only until the tree is clean.
+`.github/workflows/ci.yml` runs `cargo test` on Linux (hard gate); GitHub has
+no Haiku runners, so run `cargo test --bins` on the VM before shipping. Clippy
+and `cargo fmt --check` run advisory-only until the tree is clean.

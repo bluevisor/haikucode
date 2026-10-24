@@ -1,0 +1,23 @@
+name			haikucode
+version			@VERSION@-@REVISION@
+architecture		@ARCH@
+summary			"Agentic coding CLI for the terminal"
+description		"Haiku Code is a full-screen agentic coding assistant for the \
+Terminal. It talks to any OpenAI-compatible chat API (or Anthropic, Google and \
+OpenAI natively), reads and edits files, runs shell commands, searches the web \
+and speaks MCP. A port of picoder, the Raspberry Pi Zero W coding agent."
+packager		"John Zheng"
+vendor			"bluevisor"
+copyrights		"2026 John Zheng"
+licenses		"MIT"
+urls			"https://github.com/bluevisor/picoder"
+
+provides {
+	haikucode = @VERSION@-@REVISION@
+	cmd:haikucode = @VERSION@
+}
+
+requires {
+	haiku
+	lib:libgcc_s
+}

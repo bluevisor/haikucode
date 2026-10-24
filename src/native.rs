@@ -1,5 +1,5 @@
 //! Native protocol adapters beside chat/completions: Anthropic Messages and
-//! OpenAI Responses. picoder's history stays OpenAI-shaped (`api::Message`);
+//! OpenAI Responses. haikucode's history stays OpenAI-shaped (`api::Message`);
 //! each adapter converts it to its wire form, streams the reply back into the
 //! same (text, tool calls, usage) result, and hands back the turn in its
 //! native form for `Message::native`, so what must round-trip across tool
@@ -56,7 +56,7 @@ fn args_json(args: &str) -> Value {
     serde_json::from_str(if args.trim().is_empty() { "{}" } else { args }).unwrap_or_else(|_| json!({}))
 }
 
-/// (name, description, JSON schema) of each tool in picoder's OpenAI-shaped spec.
+/// (name, description, JSON schema) of each tool in haikucode's OpenAI-shaped spec.
 fn tool_parts(spec: &Value) -> Vec<(Value, Value, Value)> {
     spec.as_array()
         .map(|a| {
@@ -175,7 +175,7 @@ pub(crate) fn anthropic_body(cfg: &Config, messages: &[Message], tools: Option<&
             .into_iter()
             .map(|(name, description, schema)| {
                 // Big inputs (file bodies) stream as generated instead of in one
-                // burst at the end; picoder validates the JSON itself.
+                // burst at the end; haikucode validates the JSON itself.
                 json!({"name": name, "description": description, "input_schema": schema, "eager_input_streaming": true})
             })
             .collect();
@@ -361,7 +361,7 @@ fn openai_reasoning_model(model: &str) -> bool {
     ["o1", "o3", "o4", "gpt-5", "codex"].iter().any(|p| m.starts_with(p)) || m.contains("gpt-oss")
 }
 
-/// The Responses `reasoning.effort` for a picoder level. "off" is each
+/// The Responses `reasoning.effort` for a haikucode level. "off" is each
 /// family's floor: `none` on gpt-5.1 and later, `minimal` on the original
 /// gpt-5 models, `low` on the o-series.
 fn responses_effort(model: &str, level: &str) -> &'static str {
@@ -620,7 +620,7 @@ mod tests {
     /// round trip with an injected image, and the next prompt.
     fn history() -> Vec<Message> {
         vec![
-            Message::system("You are picoder."),
+            Message::system("You are haikucode."),
             Message::system("Project context."),
             Message::user_with_images("What's in a.rs?", vec!["data:image/png;base64,AAAA".into()]),
             assistant_call("toolu_1", r#"{"path":"a.rs"}"#),
@@ -633,7 +633,7 @@ mod tests {
     fn messages_body_folds_history_into_alternating_turns() {
         let c = cfg("anthropic", "claude-opus-5-5", "auto");
         let b = anthropic_body(&c, &history(), Some(&spec()));
-        assert_eq!(b["system"][0]["text"], "You are picoder.\n\nProject context.");
+        assert_eq!(b["system"][0]["text"], "You are haikucode.\n\nProject context.");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral", "caches tools + system");
         let msgs = b["messages"].as_array().unwrap();
         let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
@@ -746,11 +746,11 @@ mod tests {
         let c = cfg("openai", "gpt-5.2", "off");
         let b = responses_body(&c, &history(), Some(&spec()));
         assert_eq!(b["store"], false);
-        assert!(b["prompt_cache_key"].as_str().unwrap().starts_with("picoder-"));
+        assert!(b["prompt_cache_key"].as_str().unwrap().starts_with("haikucode-"));
         assert_eq!(b["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(b["reasoning"], json!({"effort": "none", "summary": "auto"}));
         let input = b["input"].as_array().unwrap();
-        assert_eq!(input[0], json!({"role": "system", "content": "You are picoder."}));
+        assert_eq!(input[0], json!({"role": "system", "content": "You are haikucode."}));
         assert_eq!(input[2]["content"][1], json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"}));
         assert_eq!(input[3], json!({"role": "assistant", "content": "Reading it."}));
         assert_eq!(input[4]["type"], "function_call");

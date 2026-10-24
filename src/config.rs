@@ -1,6 +1,6 @@
 //! Configuration: provider/base_url/model/api_key, loaded from
-//! ~/.config/picoder/config.json and overridable by env. Compatible with the
-//! previous Python picoder config so existing keys/memory carry over.
+//! ~/config/settings/haikucode/config.json and overridable by env. Compatible with the
+//! previous Python haikucode config so existing keys/memory carry over.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -143,7 +143,7 @@ pub struct Config {
     /// Max tool-call rounds per turn. 0 means "auto" (an internal safe limit).
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: u32,
-    /// Sampling temperature. Unset, picoder sends none and the model's own
+    /// Sampling temperature. Unset, haikucode sends none and the model's own
     /// recommended sampling applies (see `temperature()`).
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -167,7 +167,7 @@ pub struct Config {
     /// persist it then.
     #[serde(skip)]
     pub key_from_env: bool,
-    /// Settings blocks picoder doesn't model as fields (`permissions`, `hooks`)
+    /// Settings blocks haikucode doesn't model as fields (`permissions`, `hooks`)
     /// carried through verbatim so a model/theme rewrite can't drop them.
     #[serde(skip)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -202,17 +202,17 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
 /// Env vars that may supply the API key for `provider`, highest priority
 /// first — only the configured provider's key is ever picked up, so a machine
 /// with several providers' keys exported can't hand the wrong one to this
-/// one. PICODER_API_KEY is the explicit universal override and always wins.
+/// one. HAIKUCODE_API_KEY is the explicit universal override and always wins.
 fn key_env_vars(provider: &str) -> &'static [&'static str] {
     match provider {
-        "deepseek" => &["PICODER_API_KEY", "DEEPSEEK_API_KEY"],
-        "openai" => &["PICODER_API_KEY", "OPENAI_API_KEY"],
-        "anthropic" => &["PICODER_API_KEY", "ANTHROPIC_API_KEY"],
-        "groq" => &["PICODER_API_KEY", "GROQ_API_KEY"],
-        "openrouter" => &["PICODER_API_KEY", "OPENROUTER_API_KEY"],
-        "google" => &["PICODER_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
-        "zai" => &["PICODER_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"],
-        _ => &["PICODER_API_KEY"],
+        "deepseek" => &["HAIKUCODE_API_KEY", "DEEPSEEK_API_KEY"],
+        "openai" => &["HAIKUCODE_API_KEY", "OPENAI_API_KEY"],
+        "anthropic" => &["HAIKUCODE_API_KEY", "ANTHROPIC_API_KEY"],
+        "groq" => &["HAIKUCODE_API_KEY", "GROQ_API_KEY"],
+        "openrouter" => &["HAIKUCODE_API_KEY", "OPENROUTER_API_KEY"],
+        "google" => &["HAIKUCODE_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        "zai" => &["HAIKUCODE_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"],
+        _ => &["HAIKUCODE_API_KEY"],
     }
 }
 
@@ -234,7 +234,7 @@ pub enum ConfigPatch {
 }
 
 fn default_theme() -> String {
-    "Default".to_string()
+    "HaikuOS".to_string()
 }
 fn default_ctx() -> u32 {
     // Matches the default model, DeepSeek v4 Flash (1M-token context window).
@@ -347,9 +347,21 @@ impl Default for Config {
     }
 }
 
+/// Haiku keeps per-user settings in `~/config/settings` (B_USER_SETTINGS_DIRECTORY);
+/// other hosts (the dev Mac, CI) use the XDG-style `~/.config`.
+#[cfg(target_os = "haiku")]
+const CONFIG_SUBDIR: &str = "config/settings/haikucode";
+#[cfg(not(target_os = "haiku"))]
+const CONFIG_SUBDIR: &str = ".config/haikucode";
+
 pub fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join("picoder")
+    PathBuf::from(home).join(CONFIG_SUBDIR)
+}
+
+/// `config_dir()` as shown to people and the model, e.g. `~/config/settings/haikucode/`.
+pub fn config_dir_label() -> String {
+    format!("~/{CONFIG_SUBDIR}/")
 }
 
 pub fn config_path() -> PathBuf {
@@ -364,7 +376,7 @@ pub fn memory_path() -> PathBuf {
 /// rename over the target. A power loss mid-write (common on a Pi running off an
 /// SD card) then leaves either the intact old file or the complete new one —
 /// never the truncated mix a bare `fs::write` can produce. The temp name is
-/// per-process so two picoder instances don't clobber each other's temp file.
+/// per-process so two haikucode instances don't clobber each other's temp file.
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp.{}", std::process::id()));
@@ -391,15 +403,15 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Every settings document that can carry `permissions` / `hooks`, lowest
 /// priority first: the user's config.json, then the project's
-/// `.picoder/settings.json` and `.picoder/settings.local.json` (the latter is
+/// `.haikucode/settings.json` and `.haikucode/settings.local.json` (the latter is
 /// where "don't ask again" rules land, and belongs in .gitignore). Missing or
 /// malformed files are skipped. Each entry is (path, parsed JSON object).
 pub fn settings_layers() -> Vec<(PathBuf, serde_json::Value)> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let paths = [
         config_path(),
-        cwd.join(".picoder").join("settings.json"),
-        cwd.join(".picoder").join("settings.local.json"),
+        cwd.join(".haikucode").join("settings.json"),
+        cwd.join(".haikucode").join("settings.local.json"),
     ];
     paths
         .into_iter()
@@ -429,7 +441,7 @@ impl Config {
     /// Read config.json leniently: each known field is merged independently,
     /// so one malformed field (a typo in mcp_servers, say) can't reset the
     /// others. No env override — this is the on-disk truth, safe to rewrite.
-    /// Read every key picoder understands out of one config.json document.
+    /// Read every key haikucode understands out of one config.json document.
     fn absorb_disk(&mut self, v: &serde_json::Value) {
         let cfg = self;
         if let Some(s) = v.get("provider").and_then(|x| x.as_str()) {
@@ -592,7 +604,7 @@ impl Config {
 
     pub fn load() -> Config {
         let mut cfg = Self::load_disk();
-        // First match wins, so PICODER_API_KEY (listed first) overrides the
+        // First match wins, so HAIKUCODE_API_KEY (listed first) overrides the
         // provider-specific var.
         for var in key_env_vars(&cfg.provider) {
             if let Ok(k) = std::env::var(var) {
@@ -642,7 +654,7 @@ impl Config {
             "theme": on_disk.theme,
         });
         // Write per-provider keys (the canonical store). Also write the legacy
-        // api_key field with the current provider's key for older picoder readers.
+        // api_key field with the current provider's key for older haikucode readers.
         if !on_disk.api_keys.is_empty() {
             json["api_keys"] = serde_json::to_value(&on_disk.api_keys).unwrap_or_default();
             if let Some(k) = on_disk.api_keys.get(&on_disk.provider) {
@@ -705,7 +717,7 @@ impl Config {
     }
 
     /// The temperature to request, if any: the configured one, else 0.2 for
-    /// DeepSeek (whose docs want a low one for code, and what picoder always
+    /// DeepSeek (whose docs want a low one for code, and what haikucode always
     /// sent), else none at all. Forcing a low temperature on reasoning models
     /// sends them into repetition loops (Qwen wants 0.6–1.0), and OpenAI's
     /// reasoning models reject any value but 1.
@@ -879,7 +891,7 @@ mod tests {
     #[test]
     fn atomic_write_keeps_the_targets_file_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("picoder-aw-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode-aw-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
         std::fs::write(&path, "{}").unwrap();
@@ -1003,7 +1015,7 @@ mod tests {
         // can supply the key — never another provider's.
         for (name, _, _) in PROVIDERS {
             let vars = key_env_vars(name);
-            assert_eq!(vars[0], "PICODER_API_KEY", "{name}: override must win");
+            assert_eq!(vars[0], "HAIKUCODE_API_KEY", "{name}: override must win");
             for v in &vars[1..] {
                 let prov_upper = name.to_uppercase();
                 assert!(
@@ -1015,12 +1027,12 @@ mod tests {
             }
         }
         // Unknown/custom providers get only the explicit override.
-        assert_eq!(key_env_vars("my-llm-box"), &["PICODER_API_KEY"]);
+        assert_eq!(key_env_vars("my-llm-box"), &["HAIKUCODE_API_KEY"]);
     }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp() {
-        let dir = std::env::temp_dir().join(format!("picoder_atomic_test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("haikucode_atomic_test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         std::fs::write(&path, b"old contents").unwrap();
@@ -1051,7 +1063,7 @@ fn set_private(_path: &std::path::Path) {}
 /// Interactive first-run setup, executed before the TUI starts (cooked stdin).
 pub fn run_setup() -> Result<Config> {
     let mut cfg = Config::load();
-    println!("\x1b[1mpicoder setup\x1b[0m");
+    println!("\x1b[1mhaikucode setup\x1b[0m");
     println!("Provider:");
     for (i, (name, _, _)) in PROVIDERS.iter().enumerate() {
         let default = if i == 0 { " (default)" } else { "" };

@@ -118,7 +118,7 @@ pub enum WorkerCmd {
     McpPrompt { name: String, args: String },
     /// `/rewind`: list this session's prompts for the picker.
     ListTurns,
-    /// Rewind to just before turn N (0-based, oldest first): undo picoder's
+    /// Rewind to just before turn N (0-based, oldest first): undo haikucode's
     /// checkpoints since then and drop that prompt and everything after it.
     Rewind(usize),
     /// `/new`: start a new session; the current one stays saved.
@@ -1019,7 +1019,7 @@ impl Worker {
         tools::git_run(&cwd, &["rev-parse", "HEAD"], 10).ok().map(|s| s.trim().to_string())
     }
 
-    /// Go back to just before turn `n`: undo picoder's checkpoints since then
+    /// Go back to just before turn `n`: undo haikucode's checkpoints since then
     /// (files first: if git refuses, the conversation is left alone too), then
     /// drop that prompt and everything after it and hand it back to the composer.
     fn rewind(&mut self, n: usize) {
@@ -1529,7 +1529,7 @@ impl Worker {
         if self.perm.load(Ordering::Relaxed) == PERM_PLAN
             && matches!(name, "bash" | "write_file" | "edit_file" | "multi_edit" | "bash_kill")
         {
-            let r = "[plan mode] Not executed. picoder is in read-only plan mode — \
+            let r = "[plan mode] Not executed. haikucode is in read-only plan mode — \
                      describe the change you'd make; the user will switch off plan mode to apply it."
                 .to_string();
             self.result_event(&r);
@@ -1730,7 +1730,7 @@ impl Worker {
                 // it blocks them all — except the resource tools, which only read.
                 let read_only = self.mcp.is_read_only(other);
                 if self.perm.load(Ordering::Relaxed) == PERM_PLAN && !read_only {
-                    let r = "[plan mode] Not executed. picoder is in read-only plan mode — \
+                    let r = "[plan mode] Not executed. haikucode is in read-only plan mode — \
                              MCP tools may have side effects."
                         .to_string();
                     self.result_event(&r);
@@ -1762,7 +1762,7 @@ impl Worker {
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let owned: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
-        tools::git_autocommit(&cwd, &owned, &format!("picoder: {summary}"))
+        tools::git_autocommit(&cwd, &owned, &format!("haikucode: {summary}"))
     }
 
     fn result_event(&self, result: &str) {
@@ -2026,7 +2026,7 @@ fn parse_edits(args: &Value) -> Result<Vec<tools::EditReq>, String> {
 fn subagent_prompt(max: usize) -> String {
     let host = crate::sysinfo::host_descriptor();
     format!(
-        "You are a sub-agent of picoder, a terminal coding agent running ON {host}. You were \
+        "You are a sub-agent of haikucode, a terminal coding agent running ON {host}. You were \
 delegated a single focused task by the main agent.
 
 Rules:
