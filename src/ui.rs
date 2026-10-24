@@ -188,7 +188,6 @@ pub struct App {
     balance: Option<money::Balance>,
     /// True once the "balance and prices are in different currencies" notice
     /// has been shown, so the per-turn balance refresh doesn't repeat it.
-    balance_units_flagged: bool,
     settings: Config,
     /// Current working directory shown in the output box title, with $HOME
     /// collapsed to `~`. Computed once at startup (haikucode never chdirs).
@@ -315,7 +314,6 @@ impl App {
             sess_cached: 0,
             sess_written: 0,
             balance: None,
-            balance_units_flagged: false,
             settings: cfg.settings,
             cwd_label: cwd_label(),
             git_head: None,
@@ -567,21 +565,10 @@ impl App {
                 self.settings.auth_mode = m;
             }
             UiEvent::Balance(b) => {
-                // Point out a unit mismatch once (the balance is refetched every
-                // turn), with the fix, instead of silently printing two
-                // currencies on one line.
-                if b.currency != self.price_currency && !self.balance_units_flagged {
-                    self.balance_units_flagged = true;
-                    self.push(
-                        Kind::Notice,
-                        format!(
-                            "balance is in {} but prices are quoted in {} — set \"price_currency\": \"{}\" \
-                             and that currency's price list in ~/config/settings/haikucode/config.json (price_in/price_out, \
-                             or the `price currency` row in /config) to compare them",
-                            b.currency.code, self.price_currency.code, b.currency.code
-                        ),
-                    );
-                }
+                // A balance in another currency (DeepSeek bills China-region
+                // accounts in CNY) needs no nudge: the status line tags both
+                // figures with their ISO codes. The old notice told people to
+                // switch the price currency, which relabels USD prices as yuan.
                 self.balance = Some(b);
             }
             UiEvent::TurnList(items) => {
@@ -1209,10 +1196,14 @@ impl App {
             }
             9 => self.mode = edit_with(self.settings.context_window.to_string()),
             10 => self.mode = edit_with(setting_max_tool_calls(self.settings.max_tool_calls)),
-            // Prices below are quoted in this currency; set it to match the
-            // account's billing currency (see the balance readout) so the cost
-            // and balance figures line up.
-            11 => self.mode = edit_with(self.settings.price_currency.clone()),
+            // A pick-list, USD first. It names the currency price_in/price_out
+            // are quoted in: switching it relabels the cost, it doesn't convert.
+            11 => {
+                let code = money::cycle_code(&self.settings.price_currency, dir);
+                self.settings.price_currency = code.clone();
+                self.price_currency = money::Currency::parse(&code);
+                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::PriceCurrency(code)));
+            }
             _ => {}
         }
     }
@@ -1236,6 +1227,12 @@ impl App {
                 }
             }
             3 => {
+                // Enter on an empty field used to save an empty key, wiping the
+                // saved one; every later launch then fell into the setup wizard.
+                if val.is_empty() {
+                    self.push(Kind::Notice, "api key unchanged".to_string());
+                    return;
+                }
                 self.settings.api_key = val.clone();
                 let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::ApiKey(val)));
             }
@@ -1249,14 +1246,6 @@ impl App {
                 let v = helpers::parse_max_tool_calls(&val);
                 self.settings.max_tool_calls = v;
                 let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::MaxToolCalls(v)));
-            }
-            11 => {
-                let code = money::Currency::parse(&val).code;
-                self.settings.price_currency = code.clone();
-                // Take effect immediately: the status line re-reads it, so the
-                // cost figure switches units as soon as the row is committed.
-                self.price_currency = money::Currency::parse(&code);
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::PriceCurrency(code)));
             }
             _ => {}
         }
@@ -2444,7 +2433,14 @@ impl App {
             8 => self.palette.name.to_string(),
             9 => s.context_window.to_string(),
             10 => setting_max_tool_calls(s.max_tool_calls),
-            11 => s.price_currency.clone(),
+            11 => {
+                let defaults = Config::default();
+                if s.price_currency != "USD" && self.price_in == defaults.price_in && self.price_out == defaults.price_out {
+                    format!("{} (the price list is still USD: set price_in/price_out)", s.price_currency)
+                } else {
+                    s.price_currency.clone()
+                }
+            }
             _ => String::new(),
         }
     }
@@ -2678,11 +2674,16 @@ impl App {
                 }
                 f.render_widget(Paragraph::new(lines), area);
             }
-            Mode::Settings { cursor, .. } => {
+            Mode::Settings { cursor, edit } => {
                 let mut lines: Vec<Line> = Vec::new();
+                let hint = if edit.is_some() {
+                    "(type the new value, Enter to save, Esc to cancel)"
+                } else {
+                    "(up/down to browse, Enter or left/right to change, Esc to close)"
+                };
                 lines.push(Line::from(vec![
                     Span::styled("settings ", Style::default().fg(Color::Yellow)),
-                    Span::styled("(up/down to browse, Enter to change, Esc to close)", Style::default().fg(self.dim_text())),
+                    Span::styled(hint, Style::default().fg(self.dim_text())),
                 ]));
                 let marker = if self.ascii { ">" } else { "▸" };
                 for (i, &row) in SETTING_ROWS.iter().enumerate() {
@@ -2694,7 +2695,16 @@ impl App {
                     } else {
                         Style::default().fg(self.dim_text())
                     };
-                    let val = self.setting_value(row);
+                    // The row being edited shows what's typed (the key masked);
+                    // it used to keep showing the old value, so typing seemed
+                    // to do nothing and a stray Enter saved an empty field.
+                    let val = match edit {
+                        Some(buf) if sel => {
+                            let shown = if row == 3 { "•".repeat(buf.chars().count()) } else { buf.clone() };
+                            format!("{shown}{}", if self.ascii { "_" } else { "▏" })
+                        }
+                        _ => self.setting_value(row),
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(format!("{lead}{label:<16} "), label_style),
                         Span::styled(val, Style::default().fg(self.palette.accent)),
@@ -3770,72 +3780,79 @@ mod tests {
         assert!(want_mouse_capture("iTerm.app", Some("maybe")));
     }
 
-    /// The mismatch notice: fired once, only when the units actually differ,
-    /// and worded so the fix is obvious.
+    /// A balance in another currency is shown as-is (tagged on the status
+    /// line) with no notice: the old one urged switching the price currency,
+    /// which only relabels USD prices.
     #[test]
-    fn a_balance_in_another_currency_is_flagged_once_with_the_fix() {
+    fn a_balance_in_another_currency_is_shown_without_a_nudge() {
         let bal = |code: &str| crate::money::Balance {
             amount: "135.70".into(),
             currency: crate::money::Currency::parse(code),
+            converted_from: None,
         };
         let (mut app, h) = scrollable_app();
-        let notices = |app: &App| {
-            app.transcript
-                .iter()
-                .filter(|l| l.text.contains("balance is in"))
-                .count()
-        };
-
-        // Aligned (USD prices, USD account): no notice at all.
-        app.handle_event(UiEvent::Balance(bal("USD")), &h);
-        assert_eq!(notices(&app), 0);
-        assert_eq!(app.balance.as_ref().unwrap().render(), "$135.70");
-
-        // Mismatch: one notice naming both currencies and the config key, and
-        // the balance still updates on later refreshes without re-noticing.
+        let before = app.transcript.len();
         app.handle_event(UiEvent::Balance(bal("CNY")), &h);
-        assert_eq!(notices(&app), 1);
-        let text = app
-            .transcript
-            .iter()
-            .find(|l| l.text.contains("balance is in"))
-            .unwrap()
-            .text
-            .clone();
-        assert!(text.contains("CNY") && text.contains("USD"), "{text}");
-        assert!(
-            text.contains("price_currency"),
-            "it says how to fix it: {text}"
-        );
+        assert_eq!(app.transcript.len(), before, "no notice");
         assert_eq!(app.balance.as_ref().unwrap().render(), "¥135.70");
-
-        app.handle_event(UiEvent::Balance(bal("CNY")), &h);
-        assert_eq!(notices(&app), 1, "not repeated on every turn");
+        assert_eq!(app.price_currency.code, "USD", "prices stay USD");
     }
 
-    /// `/config` row 11 drives the cost unit: committing a code re-labels the
-    /// status line live and patches the worker so it also re-reads the balance
-    /// with that preference.
     #[test]
     fn the_config_panel_can_switch_the_price_currency() {
-        let (mut app, _h, cmd_rx) = select_app(&["m0"]);
+        let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
         app.mode = Mode::Idle;
         app.settings.price_currency = "USD".into();
         let (h2, cmd_rx2) = test_handles();
+        let row = super::types::SETTING_ROWS.iter().position(|&r| r == 11).unwrap();
 
-        app.commit_setting(11, "cny".into(), &h2);
-        assert_eq!(app.price_currency.code, "CNY");
-        assert_eq!(app.settings.price_currency, "CNY");
+        app.activate_setting(row, 1, &h2);
+        assert_eq!((app.price_currency.code.as_str(), app.settings.price_currency.as_str()), ("CNY", "CNY"));
         assert!(
             matches!(cmd_rx2.try_recv(), Ok(WorkerCmd::Patch(ConfigPatch::PriceCurrency(c))) if c == "CNY"),
             "the worker is told so the balance preference follows"
         );
-        // An unrecognized code keeps the user's text but prints it as-is, so the
-        // line is never silently mislabelled as dollars.
-        app.commit_setting(11, "xyz".into(), &h2);
-        assert_eq!(app.price_currency.code, "XYZ");
-        assert!(app.price_currency.symbol.is_empty());
-        assert!(cmd_rx.try_recv().is_err());
+        app.activate_setting(row, -1, &h2);
+        assert_eq!(app.settings.price_currency, "USD");
+        app.activate_setting(row, -1, &h2);
+        assert_eq!(app.settings.price_currency, "CHF", "the list wraps");
+        // A hand-edited code that isn't on the list restarts at USD.
+        app.settings.price_currency = "XYZ".into();
+        app.activate_setting(row, 1, &h2);
+        assert_eq!(app.settings.price_currency, "USD");
+    }
+
+    /// Enter on the api key row opens an empty field; saving it empty used to
+    /// wipe the stored key, and every launch after fell into the setup wizard.
+    #[test]
+    fn an_empty_api_key_edit_keeps_the_saved_key() {
+        let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
+        app.settings.api_key = "sk-keep".into();
+        let (h2, cmd_rx2) = test_handles();
+        app.commit_setting(3, "   ".into(), &h2);
+        assert_eq!(app.settings.api_key, "sk-keep");
+        assert!(cmd_rx2.try_recv().is_err(), "nothing is sent to the worker");
+        app.commit_setting(3, "sk-new".into(), &h2);
+        assert_eq!(app.settings.api_key, "sk-new");
+    }
+
+    /// The row being edited shows the typed text (an api key masked), not the
+    /// stale value.
+    #[test]
+    fn the_config_row_being_edited_shows_what_is_typed() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let model_row = super::types::SETTING_ROWS.iter().position(|&r| r == 2).unwrap();
+        app.mode = Mode::Settings { cursor: model_row, edit: Some("deepseek-v4-pro".into()) };
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("deepseek-v4-pro"), "{screen}");
+        assert!(screen.contains("Enter to save"), "{screen}");
+        let key_row = super::types::SETTING_ROWS.iter().position(|&r| r == 3).unwrap();
+        app.mode = Mode::Settings { cursor: key_row, edit: Some("sk-secret".into()) };
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("sk-secret") && screen.contains("•••••••••"), "{screen}");
     }
 
     /// The status line's two money readouts, as drawn. This is the bug being
@@ -3849,6 +3866,7 @@ mod tests {
         let bal = |code: &str, amount: &str| crate::money::Balance {
             amount: amount.into(),
             currency: crate::money::Currency::parse(code),
+            converted_from: None,
         };
 
         // A CNY-billed account (balance ¥135.70) with the default USD price
@@ -3893,6 +3911,13 @@ mod tests {
         let screen = draw(&mut app, &mut term);
         assert!(screen.contains("$0.03 · 150.0k tok"), "cost:\n{screen}");
         assert!(screen.contains("bal $12.34"), "balance:\n{screen}");
+
+        // A CNY balance converted into the USD status line reads as one
+        // currency, marked approximate, with no tags.
+        app.balance = bal("CNY", "135.70").convert(&crate::money::Currency::default(), 0.15);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("bal ≈$20.35"), "converted balance:\n{screen}");
+        assert!(!screen.contains("CNY"), "no CNY left on the line:\n{screen}");
         assert!(
             !screen.contains("CNY") && !screen.contains("USD"),
             "untagged when aligned:\n{screen}"

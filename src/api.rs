@@ -796,6 +796,37 @@ pub fn fetch_balance(http: &ureq::Agent, cfg: &Config) -> Option<Balance> {
     pick_balance(&v, &Currency::parse(&cfg.price_currency))
 }
 
+/// Units of `to` per one `from`, from the ECB reference rates (Frankfurter:
+/// free, no key), cached for the session: the balance refreshes every turn, the
+/// rate needn't. Lets a balance billed in CNY show in the USD status line.
+pub fn exchange_rate(http: &ureq::Agent, from: &str, to: &str) -> Option<f64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static RATES: OnceLock<Mutex<HashMap<(String, String), (f64, Instant)>>> = OnceLock::new();
+    let iso = |c: &str| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase());
+    if !iso(from) || !iso(to) {
+        return None;
+    }
+    let key = (from.to_string(), to.to_string());
+    let cache = RATES.get_or_init(Default::default);
+    if let Some(&(rate, at)) = cache.lock().ok()?.get(&key) {
+        if at.elapsed() < Duration::from_secs(12 * 3600) {
+            return Some(rate);
+        }
+    }
+    let url = format!("https://api.frankfurter.dev/v1/latest?base={from}&symbols={to}");
+    let text = http.get(&url).timeout(Duration::from_secs(10)).call().ok()?.into_string().ok()?;
+    let rate = parse_rate(&serde_json::from_str(&text).ok()?, to)?;
+    cache.lock().ok()?.insert(key, (rate, Instant::now()));
+    Some(rate)
+}
+
+/// `{"base":"CNY","rates":{"USD":0.14992}}` → 0.14992.
+fn parse_rate(v: &serde_json::Value, to: &str) -> Option<f64> {
+    v.get("rates")?.get(to)?.as_f64().filter(|r| r.is_finite() && *r > 0.0)
+}
+
 /// Pick the balance bucket to show from a `/user/balance` payload: the largest
 /// funded one, since an account can hold an empty `$0.00 USD` bucket next to a
 /// `¥135.70 CNY` one. `prefer` (the currency the cost readout is quoted in)
@@ -811,6 +842,7 @@ fn pick_balance(v: &serde_json::Value, prefer: &Currency) -> Option<Balance> {
             Balance {
                 amount,
                 currency: Currency::parse(code),
+                converted_from: None,
             },
         ))
     };
@@ -1049,6 +1081,9 @@ mod balance_tests {
     #[test]
     fn a_payload_without_buckets_is_not_an_error() {
         assert!(pick_balance(&json!({}), &Currency::default()).is_none());
+        assert_eq!(parse_rate(&json!({"base":"CNY","rates":{"USD":0.14992}}), "USD"), Some(0.14992));
+        assert_eq!(parse_rate(&json!({"rates":{"USD":0}}), "USD"), None);
+        assert_eq!(parse_rate(&json!({"message":"not found"}), "USD"), None);
         assert!(pick_balance(&json!({"balance_infos": []}), &Currency::default()).is_none());
         // A currency we have no symbol for still renders with its code.
         let v = json!({"balance_infos": [{"currency": "GBP", "total_balance": "3.50"}]});

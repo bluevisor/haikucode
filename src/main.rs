@@ -790,6 +790,42 @@ fn run_oneshot(
     ok
 }
 
+/// Chains onto the hook `ratatui::init` installed (it restores the terminal).
+/// Every panic is appended to crash.log: under the Deskbar launcher the window
+/// closed with the message before anyone could read it. Only a panic on the UI
+/// thread tears the screen down — the worker catches its own (agent.rs) and
+/// carries on, and restoring the terminal for one used to drop the live UI out
+/// of the alternate screen.
+fn install_panic_hook(console: bool) {
+    let tui_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        let log = config::config_dir().join("crash.log");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let entry = format!(
+            "[unix {secs}] haikucode {} panicked on thread '{thread}': {info}\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let logged = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| f.write_all(entry.as_bytes()))
+            .is_ok();
+        if std::thread::current().id() == ui_thread {
+            ui::restore_terminal(console);
+            tui_hook(info);
+            if logged {
+                eprintln!("(logged to {})", log.display());
+            }
+        }
+    }));
+}
+
 fn run_tui(
     cfg: Config,
     messages: Vec<Message>,
@@ -824,6 +860,7 @@ fn run_tui(
             return;
         }
     };
+    install_panic_hook(console);
     let mut app = ui::App::new(
         ui::UiConfig {
             model: ui_cfg_model,

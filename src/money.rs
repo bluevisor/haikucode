@@ -41,6 +41,18 @@ const SYMBOLS: &[(&str, &str)] = &[
     ("CHF", "CHF"),
 ];
 
+/// The `/config` price-currency pick-list: the next known code after `code`
+/// (`dir` > 0) or before it, wrapping. An unlisted code starts from USD.
+pub fn cycle_code(code: &str, dir: i32) -> String {
+    let code = code.trim().to_ascii_uppercase();
+    let n = SYMBOLS.len() as i32;
+    let next = match SYMBOLS.iter().position(|(c, _)| *c == code) {
+        Some(i) => (i as i32 + dir.signum()).rem_euclid(n),
+        None => 0,
+    };
+    SYMBOLS[next as usize].0.to_string()
+}
+
 /// USD, the unit of the built-in price list.
 impl Default for Currency {
     fn default() -> Self {
@@ -83,24 +95,42 @@ impl Currency {
     }
 }
 
-/// An account balance exactly as the provider reports it: the provider's own
-/// decimal string (kept so `135.70` doesn't become `135.7`) plus the currency
-/// the account is billed in.
+/// An account balance as the provider reports it: the provider's own decimal
+/// string (kept so `135.70` doesn't become `135.7`) plus the currency the
+/// account is billed in — or that figure converted into the status line's
+/// currency, with the original kept in `converted_from`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Balance {
     pub amount: String,
     pub currency: Currency,
+    pub converted_from: Option<Box<Balance>>,
 }
 
 impl Balance {
-    /// `¥135.70`.
+    /// `¥135.70`, or `≈$20.34` once converted at a market rate.
     pub fn render(&self) -> String {
-        self.amount_with(&self.currency)
+        let approx = if self.converted_from.is_some() { "≈" } else { "" };
+        format!("{approx}{}", self.amount_with(&self.currency))
     }
 
-    /// `¥135.70 CNY`.
+    /// `¥135.70 CNY`, or `≈$20.34 USD (¥135.70 CNY)` once converted.
     pub fn render_tagged(&self) -> String {
-        format!("{} {}", self.render(), self.currency.code)
+        let own = format!("{} {}", self.render(), self.currency.code);
+        match &self.converted_from {
+            Some(orig) => format!("{own} ({})", orig.render_tagged()),
+            None => own,
+        }
+    }
+
+    /// This balance in `to`, at `rate` units of `to` per unit of its own
+    /// currency. None when the provider's figure isn't a number.
+    pub fn convert(&self, to: &Currency, rate: f64) -> Option<Balance> {
+        let value: f64 = self.amount.trim().parse().ok()?;
+        Some(Balance {
+            amount: format!("{:.2}", value * rate),
+            currency: to.clone(),
+            converted_from: Some(Box::new(self.clone())),
+        })
     }
 
     fn amount_with(&self, cur: &Currency) -> String {
@@ -207,6 +237,7 @@ mod tests {
         let cny = Balance {
             amount: "135.70".into(),
             currency: Currency::parse("CNY"),
+            converted_from: None,
         };
         assert_eq!(cny.render(), "¥135.70");
         assert_eq!(cny.render_tagged(), "¥135.70 CNY");
@@ -214,7 +245,21 @@ mod tests {
         let od = Balance {
             amount: "0.00".into(),
             currency: Currency::default(),
+            converted_from: None,
         };
         assert_eq!(od.render(), "$0.00");
     }
+
+    /// A converted balance is marked approximate and keeps the provider's own
+    /// figure for /status.
+    #[test]
+    fn a_converted_balance_reads_approximate_and_keeps_the_original() {
+        let cny = Balance { amount: "132.10".into(), currency: Currency::parse("CNY"), converted_from: None };
+        let usd = cny.convert(&Currency::default(), 0.14992).unwrap();
+        assert_eq!(usd.render(), "≈$19.80");
+        assert_eq!(usd.render_tagged(), "≈$19.80 USD (¥132.10 CNY)");
+        let junk = Balance { amount: "n/a".into(), ..cny };
+        assert!(junk.convert(&Currency::default(), 0.15).is_none());
+    }
+
 }

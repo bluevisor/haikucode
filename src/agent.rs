@@ -479,10 +479,21 @@ pub fn spawn(
                             w.messages[0] = Message::system(system_prompt(w.cfg.auto_commit));
                         }
                     }
+                    // The balance is shown in this currency: re-fetch it.
+                    if matches!(&p, ConfigPatch::PriceCurrency(_)) {
+                        w.refresh_balance();
+                    }
                     // Provider presets also switch the model; reflect it.
                     if let ConfigPatch::Provider { model, provider, .. } = &p {
                         let _ = w.ui.send(UiEvent::ModelChanged(model.clone()));
-                        let _ = w.ui.send(UiEvent::Notice(format!("provider set to {provider}")));
+                        // Cycling the provider row lands on providers with no
+                        // key; say so now, not as a setup wizard next launch.
+                        let note = if w.cfg.api_key.is_empty() {
+                            format!("provider set to {provider} (no API key saved for it: set one in the api key row)")
+                        } else {
+                            format!("provider set to {provider}")
+                        };
+                        let _ = w.ui.send(UiEvent::Notice(note));
                         w.refresh_balance();
                         w.refresh_context_window(); // new provider/model window
                     }
@@ -592,6 +603,17 @@ impl Worker {
         std::thread::spawn(move || {
             let http = api::agent_http();
             if let Some(b) = api::fetch_balance(&http, &cfg) {
+                // An account billed in another currency (DeepSeek's China
+                // region is CNY) shows in the status line's currency at the
+                // day's rate; unconverted (and tagged) if the rate is missing.
+                let want = crate::money::Currency::parse(&cfg.price_currency);
+                let b = if b.currency == want {
+                    b
+                } else {
+                    api::exchange_rate(&http, &b.currency.code, &want.code)
+                        .and_then(|rate| b.convert(&want, rate))
+                        .unwrap_or(b)
+                };
                 let _ = ui.send(UiEvent::Balance(b));
             }
         });
