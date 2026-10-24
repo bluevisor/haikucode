@@ -1,0 +1,6 @@
+/target
+**/.DS_Store
+._*
+build.sh.pi
+/install-orin.sh
+/.picoder/settings.local.json

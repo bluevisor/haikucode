@@ -1,0 +1,1058 @@
+//! OpenAI-compatible chat API: streaming completions with tool calls, plus
+//! model listing. Uses ureq (blocking) + rustls so it cross-compiles to ARMv6
+//! as a single static binary with no system TLS dependency.
+
+use crate::config::{ApiKind, Config};
+use crate::money::{Balance, Currency};
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+pub const MAX_TOOL_OUTPUT: usize = 16000;
+
+/// An HTTP error status from the provider, kept typed (not just a message)
+/// so the retry loop can tell a rate limit from a request that can't succeed.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub code: u16,
+    /// Seconds from a `Retry-After` header, when the server sent one.
+    pub retry_after: Option<u64>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// The model's stream turned into the same block of text over and over (a
+/// sampling loop): it would never end by itself, so the response is cut off.
+#[derive(Debug)]
+pub struct OutputLoop;
+
+impl std::fmt::Display for OutputLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model got stuck repeating itself, so picoder stopped the response. Try again or \
+             rephrase; a local reasoning model may need its reasoning switched off."
+        )
+    }
+}
+
+impl std::error::Error for OutputLoop {}
+
+/// Whether `text` ends in one block repeated back to back: 8+ times, the block
+/// 40+ bytes with 10+ distinct bytes (so a long `=====` rule or a run of
+/// spaces isn't a loop).
+fn is_looping(text: &[u8]) -> bool {
+    const MIN_BLOCK: usize = 40;
+    const MAX_BLOCK: usize = 1200;
+    const REPEATS: usize = 8;
+    let n = text.len();
+    (MIN_BLOCK..=MAX_BLOCK.min(n / REPEATS)).any(|p| {
+        let span = &text[n - p * REPEATS..];
+        span[..span.len() - p] == span[p..] && {
+            let mut seen = [false; 256];
+            span[..p].iter().for_each(|&b| seen[b as usize] = true);
+            seen.iter().filter(|&&s| s).count() >= 10
+        }
+    })
+}
+
+/// How long to wait before retrying after `err` on attempt `attempt` (1-based),
+/// or None when a retry can't help: any 4xx but timeout/conflict/rate-limit
+/// would fail the same way again. Exponential backoff (1s, 2s, 4s…) plus
+/// jitter; a server's `Retry-After` wins, capped at a minute.
+fn retry_delay(err: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    if err.downcast_ref::<OutputLoop>().is_some() {
+        return None;
+    }
+    if let Some(s) = err.downcast_ref::<HttpStatus>() {
+        if !matches!(s.code, 408 | 409 | 425 | 429 | 500..=599) {
+            return None;
+        }
+        if let Some(secs) = s.retry_after {
+            return Some(Duration::from_secs(secs.min(60)));
+        }
+    }
+    let base = Duration::from_millis(1000u64 << attempt.saturating_sub(1).min(5));
+    // No RNG crate on purpose (binary size): the clock's sub-second nanos are
+    // plenty to keep several clients from retrying in lockstep.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Some(base + Duration::from_millis(nanos % (base.as_millis() as u64 / 2 + 1)))
+}
+
+/// Sleep for `d`, waking early on cancel. Returns false when cancelled.
+fn sleep_unless_cancelled(d: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + d;
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !cancel.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Message {
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    /// Attached images as `data:image/...;base64,...` URIs. Sent to the API as
+    /// OpenAI content parts (see `messages_payload`). Stripped when sessions
+    /// are saved — the payloads would balloon the session file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// An assistant turn in its provider's own wire form (Anthropic content
+    /// blocks with signed thinking, Responses output items with encrypted
+    /// reasoning), replayed verbatim to that same api/model within this run so
+    /// reasoning carries across tool turns. Never sent on chat/completions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<serde_json::Value>,
+}
+
+impl Message {
+    pub fn system(content: impl Into<String>) -> Message {
+        Message { role: "system".into(), content: content.into(), images: Vec::new(), tool_calls: None, tool_call_id: None, native: None }
+    }
+    pub fn user(content: impl Into<String>) -> Message {
+        Message { role: "user".into(), content: content.into(), images: Vec::new(), tool_calls: None, tool_call_id: None, native: None }
+    }
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Message {
+        Message { role: "user".into(), content: content.into(), images, tool_calls: None, tool_call_id: None, native: None }
+    }
+    pub fn tool(id: String, content: String) -> Message {
+        Message { role: "tool".into(), content, images: Vec::new(), tool_calls: None, tool_call_id: Some(id), native: None }
+    }
+}
+
+/// Serialize messages for the API request. When `supports_images` is true, a
+/// message with images becomes the OpenAI multimodal form (`content` as an array
+/// of text + image_url parts); otherwise images are silently dropped and the
+/// message serializes as plain text (DeepSeek and Zhipu reject `image_url`).
+fn messages_payload(messages: &[Message], supports_images: bool) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let plain = |m: &Message| {
+                let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("native"); // picoder's own bookkeeping, not the wire format
+                }
+                v
+            };
+            if m.images.is_empty() {
+                return plain(m);
+            }
+            if !supports_images {
+                // Drop the payload, not just the multimodal form: serializing
+                // `m` as-is would ship the base64 blobs in an `images` field.
+                let mut stripped = m.clone();
+                stripped.images.clear();
+                return plain(&stripped);
+            }
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            if !m.content.is_empty() {
+                parts.push(serde_json::json!({"type":"text","text":m.content}));
+            }
+            for uri in &m.images {
+                parts.push(serde_json::json!({
+                    "type":"image_url",
+                    "image_url":{"url":uri}
+                }));
+            }
+            serde_json::json!({"role": m.role, "content": parts})
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A tool call accumulated from streamed deltas.
+#[derive(Clone, Debug, Default)]
+pub struct AccumCall {
+    pub id: String,
+    pub name: String,
+    pub args: String,
+}
+
+impl AccumCall {
+    pub fn args_ok(&self) -> bool {
+        let a = if self.args.trim().is_empty() { "{}" } else { &self.args };
+        serde_json::from_str::<serde_json::Value>(a).is_ok()
+    }
+    pub fn into_tool_call(self, fallback_idx: usize) -> ToolCall {
+        let id = if self.id.is_empty() { format!("call_{fallback_idx}") } else { self.id };
+        let args = if self.args.trim().is_empty() { "{}".into() } else { self.args };
+        ToolCall { id, kind: "function".into(), function: FunctionCall { name: self.name, arguments: args } }
+    }
+}
+
+pub fn agent_http() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .user_agent("picoder/0.1")
+        .build()
+}
+
+/// The tool schema advertised to the model.
+pub fn tools_spec() -> serde_json::Value {
+    serde_json::json!([
+        tool("bash", "Run a shell command in the working directory and return stdout, stderr and exit code. Use for git, builds, tests, searching, installing, etc. Set background=true for long-running commands (servers, builds): it returns a job id immediately; poll with bash_output.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "command":{"type":"string","description":"Shell command to run."},
+                "timeout":{"type":"integer","description":"Seconds (default 120). Ignored for background jobs."},
+                "background":{"type":"boolean","description":"Run detached; returns a job id."}
+            },
+            "required":["command"]
+        })),
+        tool("bash_output","Read output a background bash job has produced since the last bash_output call, plus its run status.", serde_json::json!({
+            "type":"object",
+            "properties":{"id":{"type":"integer","description":"Job id from bash."}},
+            "required":["id"]
+        })),
+        tool("bash_kill","Kill a background bash job (its whole process group).", serde_json::json!({
+            "type":"object",
+            "properties":{"id":{"type":"integer","description":"Job id from bash."}},
+            "required":["id"]
+        })),
+        tool("read_file","Read a UTF-8 text file, optionally a 1-based inclusive line range. Each line comes back as `<line number><TAB><content>`: everything after the tab is the file's exact text, indentation included. Never copy the number or the tab into edit_file's old_text.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "start_line":{"type":"integer"},
+                "end_line":{"type":"integer"}
+            },
+            "required":["path"]
+        })),
+        tool("write_file","Create or overwrite a file with the given content. Creates parent dirs.", serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+            "required":["path","content"]
+        })),
+        tool("edit_file","Replace an exact substring in a file. old_text must appear exactly once; copy it from read_file's output after the tab, with the file's exact indentation. Use for surgical edits.", serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},
+            "required":["path","old_text","new_text"]
+        })),
+        tool("multi_edit","Apply a batch of edits across one or more files in a single approval and commit. Edits apply in order (so several edits to the same file compose); each old_text must be unique in its file at the time it runs. All-or-nothing: if any edit can't be located, none are applied.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string","description":"Default file for edits that don't name their own path."},
+                "edits":{"type":"array","items":{
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string","description":"File to edit; defaults to the previous edit's path."},
+                        "old_text":{"type":"string"},
+                        "new_text":{"type":"string"}
+                    },
+                    "required":["old_text","new_text"]
+                }}
+            },
+            "required":["edits"]
+        })),
+        tool("list_files","List entries in a directory (non-recursive).", serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string","description":"default '.'"}}
+        })),
+        tool("grep","Search file contents for a regex pattern under a path. Returns matching path:line: text. Skips .git/target/node_modules and binaries.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "pattern":{"type":"string","description":"Rust regex."},
+                "path":{"type":"string","description":"file or dir, default '.'"},
+                "ignore_case":{"type":"boolean"}
+            },
+            "required":["pattern"]
+        })),
+        tool("glob","Find files matching a glob pattern (e.g. src/**/*.rs). Returns relative paths.", serde_json::json!({
+            "type":"object",
+            "properties":{"pattern":{"type":"string"}},
+            "required":["pattern"]
+        })),
+        tool("remember","Persist a one-line note into long-term memory (~/.config/picoder/memory.md) for future sessions. The note belongs to the current working directory and is shown only in sessions there, unless global is true. Write it so it stands alone: say what the project is, not which tool built it.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "note":{"type":"string"},
+                "global":{"type":"boolean","description":"true only for facts about the user that hold in every project (default false)"}
+            },
+            "required":["note"]
+        })),
+        tool("recall","Retrieve memories; with 'query' returns only matching lines, else all.", serde_json::json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}}
+        })),
+        tool("web_fetch","Fetch a URL over HTTP(S) and return its content as readable text (HTML is stripped to text). Use for documentation, APIs, and reference pages.", serde_json::json!({
+            "type":"object",
+            "properties":{"url":{"type":"string","description":"http:// or https:// URL"}},
+            "required":["url"]
+        })),
+        tool("web_search","Search the web (DuckDuckGo) and return the top results as title, URL and snippet. Follow up with web_fetch to read a promising result.", serde_json::json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        })),
+        tool("view_image","Load an image file (png/jpg/gif/webp) from disk into the conversation so you can see it. Use for screenshots, diagrams, and mockups.", serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string"}},
+            "required":["path"]
+        })),
+        tool("todo","Maintain a visible plan for multi-step tasks. Pass the FULL list every time (it replaces the previous plan; it is shown to the user). Keep items short; mark exactly one item in_progress while working on it.", serde_json::json!({
+            "type":"object",
+            "properties":{"items":{"type":"array","items":{
+                "type":"object",
+                "properties":{
+                    "text":{"type":"string"},
+                    "status":{"type":"string","enum":["pending","in_progress","completed"]}
+                },
+                "required":["text"]
+            }}},
+            "required":["items"]
+        })),
+        tool("ask_user","Ask the user ONE question and wait for their typed answer. Use only when blocked on a decision or missing information you cannot determine yourself.", serde_json::json!({
+            "type":"object",
+            "properties":{"question":{"type":"string"}},
+            "required":["question"]
+        })),
+        tool("task","Delegate a self-contained sub-task to a fresh sub-agent that has its own context and the same tools. Sub-agents run one at a time, not in parallel; use one to keep a big sub-task's intermediate steps out of your context. Give complete instructions; you only get back the sub-agent's final report.", serde_json::json!({
+            "type":"object",
+            "properties":{
+                "description":{"type":"string","description":"Short label for the sub-task (a few words)."},
+                "prompt":{"type":"string","description":"Full instructions for the sub-agent, including everything it needs to know."}
+            },
+            "required":["prompt"]
+        })),
+    ])
+}
+
+fn tool(name: &str, desc: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type":"function",
+        "function":{"name":name,"description":desc,"parameters":params}
+    })
+}
+
+/// The built-in tool schema plus any MCP tools, as one array for the request.
+/// The `skill` tool is only offered when skills are installed, so it costs no
+/// tokens otherwise.
+pub fn tools_spec_with(mcp: &[crate::mcp::McpTool]) -> serde_json::Value {
+    let mut spec = tools_spec();
+    if let Some(arr) = spec.as_array_mut() {
+        if !crate::commands::discover_skills().is_empty() {
+            arr.push(tool(
+                "skill",
+                "Load an installed skill by name (see the Skills list in your instructions): returns \
+                 its full instructions and the paths of its files. Call it before starting a task \
+                 that matches a skill's description, then follow it.",
+                serde_json::json!({
+                    "type":"object",
+                    "properties":{"name":{"type":"string","description":"The skill's name, as listed."}},
+                    "required":["name"]
+                }),
+            ));
+        }
+        for t in mcp {
+            arr.push(tool(&t.full_name, &t.description, t.schema.clone()));
+        }
+    }
+    spec
+}
+
+/// Tool schema for a sub-agent: same as the parent's but without `task` (no
+/// recursive sub-agents) and without `ask_user` (sub-agents must work
+/// autonomously; the parent handles user interaction).
+pub fn tools_spec_subagent(mcp: &[crate::mcp::McpTool]) -> serde_json::Value {
+    let mut spec = tools_spec_with(mcp);
+    if let Some(arr) = spec.as_array_mut() {
+        arr.retain(|t| {
+            let name = t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str());
+            !matches!(name, Some("task") | Some("ask_user"))
+        });
+    }
+    spec
+}
+
+/// Token usage of one completion, normalized across protocols.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub struct Usage {
+    /// Every input token, cached ones included.
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Input tokens served from the provider's prompt cache.
+    pub cached_tokens: u32,
+    /// Input tokens written to the cache (Anthropic's cache_creation).
+    pub cache_write_tokens: u32,
+}
+
+impl Usage {
+    pub fn spent(&self) -> crate::money::Spent {
+        crate::money::Spent {
+            prompt: self.prompt_tokens as u64,
+            completion: self.completion_tokens as u64,
+            cached: self.cached_tokens as u64,
+            written: self.cache_write_tokens as u64,
+        }
+    }
+}
+
+/// chat/completions usage: OpenAI reports cache hits in
+/// `prompt_tokens_details.cached_tokens`, DeepSeek in `prompt_cache_hit_tokens`.
+#[derive(Default, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<serde_json::Value>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+}
+
+impl ChatUsage {
+    fn normalize(&self) -> Usage {
+        let cached = self.prompt_cache_hit_tokens.unwrap_or_else(|| {
+            self.prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u32
+        });
+        Usage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self
+                .completion_tokens
+                .unwrap_or(self.total_tokens.saturating_sub(self.prompt_tokens)),
+            cached_tokens: cached.min(self.prompt_tokens),
+            cache_write_tokens: 0,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: Delta,
+}
+#[derive(Default, Deserialize)]
+struct Delta {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
+#[derive(Deserialize)]
+struct DeltaToolCall {
+    #[serde(default)]
+    index: usize,
+    id: Option<String>,
+    function: Option<DeltaFn>,
+}
+#[derive(Deserialize)]
+struct DeltaFn {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// What one streamed completion produced: the reply text, its tool calls,
+/// token usage, and the turn in its provider's native form (see
+/// `Message::native`).
+pub type Streamed = (String, Vec<AccumCall>, Option<Usage>, Option<serde_json::Value>);
+
+/// Sampling-loop detection over the last stretch of streamed text (reasoning
+/// and reply), checked every 512 bytes.
+#[derive(Default)]
+pub(crate) struct LoopGuard {
+    recent: Vec<u8>,
+    unchecked: usize,
+}
+
+impl LoopGuard {
+    /// Add streamed text; Err once the stream has turned into a loop.
+    pub(crate) fn feed(&mut self, t: &str) -> Result<()> {
+        self.recent.extend_from_slice(t.as_bytes());
+        if self.recent.len() > 16_384 {
+            self.recent.drain(..self.recent.len() - 12_288);
+        }
+        self.unchecked += t.len();
+        if self.unchecked >= 512 {
+            self.unchecked = 0;
+            if is_looping(&self.recent) {
+                return Err(OutputLoop.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `req` with the provider's credentials: Anthropic takes `x-api-key` plus a
+/// version header, everyone else a Bearer token.
+pub(crate) fn authed(req: ureq::Request, cfg: &Config) -> ureq::Request {
+    match cfg.api_kind() {
+        ApiKind::Messages => req.set("x-api-key", cfg.bearer()).set("anthropic-version", "2023-06-01"),
+        _ => req.set("Authorization", &format!("Bearer {}", cfg.bearer())),
+    }
+}
+
+/// POST a JSON body; an error status becomes a typed `HttpStatus` (so the
+/// retry loop can tell a rate limit from a bad request).
+pub(crate) fn post_json(http: &ureq::Agent, cfg: &Config, url: &str, body: &serde_json::Value) -> Result<ureq::Response> {
+    match authed(http.post(url), cfg).set("Content-Type", "application/json").send_string(&body.to_string()) {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(code, r)) => {
+            let retry_after = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+            let detail = truncate(&r.into_string().unwrap_or_default(), 800);
+            Err(HttpStatus { code, retry_after, detail }.into())
+        }
+        Err(e) => Err(anyhow!("network error: {e}")),
+    }
+}
+
+/// Feed each SSE `data:` payload of `resp` to `f` until it returns true, the
+/// stream ends, or the turn is cancelled.
+pub(crate) fn for_each_sse(
+    resp: ureq::Response,
+    cancel: &AtomicBool,
+    mut f: impl FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    for line in BufReader::new(resp.into_reader()).lines() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let line = line.map_err(|e| anyhow!("stream read error: {e}"))?;
+        let Some(data) = line.trim().strip_prefix("data:") else { continue };
+        if f(data.trim())? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// A stable prompt-cache key for this conversation (OpenAI routes requests
+/// sharing a key to the same cache): a hash of the system prompt.
+pub(crate) fn cache_key(messages: &[Message]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in messages.first().map(|m| m.content.as_bytes()).unwrap_or_default() {
+        h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("picoder-{h:016x}")
+}
+
+/// chat/completions request fields that carry the `reasoning` setting, per
+/// provider — only fields that provider accepts (OpenAI 400s on unknown
+/// ones). "auto" sends nothing, leaving the model's own default.
+pub(crate) fn reasoning_fields(cfg: &Config) -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::json;
+    let level = cfg.reasoning.as_str();
+    if level == "auto" {
+        return Vec::new();
+    }
+    let off = level == "off";
+    let effort = if off { "none" } else { level };
+    match cfg.provider.as_str() {
+        // DeepSeek and Zhipu switch thinking on or off; there's no effort dial.
+        "deepseek" | "zai" => vec![("thinking", json!({"type": if off { "disabled" } else { "enabled" }}))],
+        "openai" | "google" | "groq" => vec![("reasoning_effort", json!(effort))],
+        "openrouter" => vec![("reasoning", if off { json!({"enabled": false}) } else { json!({"effort": level}) })],
+        // Its own Messages API carries effort; the compat endpoint isn't mapped.
+        "anthropic" => Vec::new(),
+        // Self-hosted servers (Splash, vLLM, SGLang, llama.cpp): the chat
+        // template's thinking switch, plus effort for those that read it.
+        _ => vec![
+            ("chat_template_kwargs", json!({"enable_thinking": !off})),
+            ("reasoning_effort", json!(effort)),
+        ],
+    }
+}
+
+/// One streaming completion over the configured protocol. Calls
+/// `on_content`/`on_reasoning` as deltas arrive. `tools` None omits the tool
+/// schema (internal calls like context compaction).
+fn chat_stream(
+    http: &ureq::Agent,
+    cfg: &Config,
+    messages: &[Message],
+    tools: Option<&serde_json::Value>,
+    cancel: &AtomicBool,
+    on_content: impl FnMut(&str),
+    on_reasoning: impl FnMut(&str),
+) -> Result<Streamed> {
+    match cfg.api_kind() {
+        ApiKind::Chat => chat_completions(http, cfg, messages, tools, cancel, on_content, on_reasoning),
+        ApiKind::Messages => crate::native::anthropic_stream(http, cfg, messages, tools, cancel, on_content, on_reasoning),
+        ApiKind::Responses => crate::native::responses_stream(http, cfg, messages, tools, cancel, on_content, on_reasoning),
+    }
+}
+
+/// OpenAI chat/completions, streamed.
+fn chat_completions(
+    http: &ureq::Agent,
+    cfg: &Config,
+    messages: &[Message],
+    tools: Option<&serde_json::Value>,
+    cancel: &AtomicBool,
+    mut on_content: impl FnMut(&str),
+    mut on_reasoning: impl FnMut(&str),
+) -> Result<Streamed> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let mut body = serde_json::json!({
+        "model": cfg.model,
+        "messages": messages_payload(messages, cfg.supports_images()),
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if let Some(t) = cfg.temperature() {
+        body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(t) = tools {
+        body["tools"] = t.clone();
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+    for (k, v) in reasoning_fields(cfg) {
+        body[k] = v;
+    }
+    if cfg.provider == "openai" {
+        body["prompt_cache_key"] = serde_json::json!(cache_key(messages));
+    }
+    let resp = post_json(http, cfg, &url, &body)?;
+
+    let mut content = String::new();
+    let mut calls: Vec<AccumCall> = Vec::new();
+    let mut usage: Option<Usage> = None;
+    let mut guard = LoopGuard::default();
+    for_each_sse(resp, cancel, |data| {
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else { return Ok(false) };
+        if let Some(u) = chunk.usage {
+            usage = Some(u.normalize());
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else { return Ok(false) };
+        let delta = choice.delta;
+        if let Some(r) = delta.reasoning_content.filter(|r| !r.is_empty()) {
+            on_reasoning(&r);
+            guard.feed(&r)?;
+        }
+        if let Some(c) = delta.content.filter(|c| !c.is_empty()) {
+            on_content(&c);
+            content.push_str(&c);
+            guard.feed(&c)?;
+        }
+        for tc in delta.tool_calls.unwrap_or_default() {
+            if calls.len() <= tc.index {
+                calls.resize(tc.index + 1, AccumCall::default());
+            }
+            let slot = &mut calls[tc.index];
+            if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
+                slot.id = id;
+            }
+            if let Some(f) = tc.function {
+                if let Some(n) = f.name.filter(|n| !n.is_empty()) {
+                    slot.name = n;
+                }
+                if let Some(a) = f.arguments {
+                    slot.args.push_str(&a);
+                }
+            }
+        }
+        Ok(false)
+    })?;
+    calls.retain(|c| !c.name.is_empty());
+    Ok((content, calls, usage, None))
+}
+
+/// chat_stream with retry: a dropped SSE chunk can corrupt streamed tool-call
+/// JSON, so we re-request a clean response. Transient failures (network,
+/// rate limits, 5xx) are retried with backoff; other 4xx fail at once.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_resilient(
+    http: &ureq::Agent,
+    cfg: &Config,
+    messages: &[Message],
+    tools: &serde_json::Value,
+    cancel: &AtomicBool,
+    mut on_content: impl FnMut(&str),
+    mut on_reasoning: impl FnMut(&str),
+    mut on_retry: impl FnMut(&str),
+) -> Result<Streamed> {
+    let tries = 4;
+    let mut last: Option<Streamed> = None;
+    for attempt in 1..=tries {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match chat_stream(http, cfg, messages, Some(tools), cancel, &mut on_content, &mut on_reasoning) {
+            Err(e) => {
+                let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries) else {
+                    return Err(e);
+                };
+                on_retry(&format!(
+                    "{e} — retry {attempt}/{} in {:.1}s",
+                    tries - 1,
+                    wait.as_secs_f32()
+                ));
+                if !sleep_unless_cancelled(wait, cancel) {
+                    break;
+                }
+                continue;
+            }
+            Ok((content, calls, usage, native)) => {
+                let ok = calls.iter().all(|c| c.args_ok());
+                if calls.is_empty() || ok {
+                    return Ok((content, calls, usage, native));
+                }
+                last = Some((content, calls, usage, native));
+                if attempt < tries {
+                    on_retry(&format!("malformed tool args — retry {attempt}/{}", tries - 1));
+                }
+            }
+        }
+    }
+    last.ok_or_else(|| anyhow!("no response"))
+}
+
+/// A plain (no tools) completion, with one retry on transient errors. Used for
+/// internal calls like summarizing the conversation during compaction. Returns
+/// the token usage too, so these background calls still count toward cost.
+pub fn chat_plain(
+    http: &ureq::Agent,
+    cfg: &Config,
+    messages: &[Message],
+    cancel: &AtomicBool,
+) -> Result<(String, Option<Usage>)> {
+    let tries = 2;
+    for attempt in 1..=tries {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("cancelled"));
+        }
+        match chat_stream(http, cfg, messages, None, cancel, |_| {}, |_| {}) {
+            Ok((content, _, usage, _)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(anyhow!("cancelled"));
+                }
+                return Ok((content, usage));
+            }
+            Err(e) => {
+                let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries) else {
+                    return Err(e);
+                };
+                if !sleep_unless_cancelled(wait, cancel) {
+                    return Err(anyhow!("cancelled"));
+                }
+            }
+        }
+    }
+    Err(anyhow!("no response"))
+}
+
+/// DeepSeek account balance (best-effort; returns None for other providers).
+pub fn fetch_balance(http: &ureq::Agent, cfg: &Config) -> Option<Balance> {
+    let url = format!("{}/user/balance", cfg.base_url.trim_end_matches('/'));
+    let text = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .set("Authorization", &format!("Bearer {}", cfg.bearer()))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    pick_balance(&v, &Currency::parse(&cfg.price_currency))
+}
+
+/// Pick the balance bucket to show from a `/user/balance` payload: the largest
+/// funded one, since an account can hold an empty `$0.00 USD` bucket next to a
+/// `¥135.70 CNY` one. `prefer` (the currency the cost readout is quoted in)
+/// breaks ties, so a fully-empty account still reports a figure in the currency
+/// the rest of the line uses.
+fn pick_balance(v: &serde_json::Value, prefer: &Currency) -> Option<Balance> {
+    let parse = |info: &serde_json::Value| -> Option<(f64, Balance)> {
+        let amount = info.get("total_balance")?.as_str()?.trim().to_string();
+        let value = amount.parse::<f64>().ok()?;
+        let code = info.get("currency")?.as_str()?;
+        Some((
+            value,
+            Balance {
+                amount,
+                currency: Currency::parse(code),
+            },
+        ))
+    };
+    v.get("balance_infos")?
+        .as_array()?
+        .iter()
+        .filter_map(parse)
+        .max_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Tie (e.g. every bucket at 0.00): prefer the price currency.
+                .then_with(|| (a.1.currency == *prefer).cmp(&(b.1.currency == *prefer)))
+        })
+        .map(|(_, bal)| bal)
+}
+
+/// The provider's model list URL. Anthropic pages it (20 by default).
+fn models_url(cfg: &Config) -> String {
+    let base = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    if cfg.api_kind() == ApiKind::Messages {
+        base + "?limit=1000"
+    } else {
+        base
+    }
+}
+
+/// Best-effort context window (tokens) for `model` from the provider's
+/// `/models` metadata. OpenAI-compatible endpoints usually omit it (DeepSeek
+/// returns only id/object/owned_by), but OpenRouter and some others advertise
+/// `context_length`. Returns None when the provider doesn't expose it, so the
+/// caller can fall back to the built-in table.
+pub fn context_window(http: &ureq::Agent, cfg: &Config, model: &str) -> Option<u32> {
+    let text = authed(http.get(&models_url(cfg)).timeout(std::time::Duration::from_secs(10)), cfg)
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let items = v.get("data").cloned().unwrap_or(v);
+    let entry = items
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(|x| x.as_str()) == Some(model))?;
+    // Field name varies across providers; accept the common spellings, plus
+    // OpenRouter's nested `top_provider.context_length`.
+    let n = ["context_length", "context_window", "max_context_length", "max_context_window", "max_input_tokens"]
+        .iter()
+        .find_map(|k| entry.get(*k).and_then(|x| x.as_u64()))
+        .or_else(|| entry.pointer("/top_provider/context_length").and_then(|x| x.as_u64()))?;
+    (n > 0).then_some(n as u32)
+}
+
+/// Fetch the provider's available model ids.
+pub fn list_models(http: &ureq::Agent, cfg: &Config) -> Result<Vec<String>> {
+    let resp = authed(http.get(&models_url(cfg)).timeout(std::time::Duration::from_secs(30)), cfg).call();
+    let text = match resp {
+        Ok(r) => r.into_string()?,
+        Err(ureq::Error::Status(code, r)) => {
+            return Err(anyhow!("HTTP {code}: {}", truncate(&r.into_string().unwrap_or_default(), 400)));
+        }
+        Err(e) => return Err(anyhow!("network error: {e}")),
+    };
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let items = v.get("data").cloned().unwrap_or(v);
+    let mut ids: Vec<String> = items
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+pub fn truncate(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(limit.saturating_sub(40)).collect();
+    let dropped = s.chars().count() - limit + 40;
+    format!("{head}\n... [truncated {dropped} chars] ...")
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_maps_to_fields_each_provider_accepts() {
+        let fields = |provider: &str, level: &str| {
+            let mut c = Config::default();
+            c.provider = provider.into();
+            c.reasoning = level.into();
+            serde_json::to_value(reasoning_fields(&c).into_iter().collect::<std::collections::BTreeMap<_, _>>()).unwrap()
+        };
+        use serde_json::json as j;
+        assert_eq!(fields("openai", "auto"), j!({}), "auto sends nothing anywhere");
+        assert_eq!(fields("deepseek", "high"), j!({"thinking": {"type": "enabled"}}));
+        assert_eq!(fields("zai", "off"), j!({"thinking": {"type": "disabled"}}));
+        assert_eq!(fields("openai", "low"), j!({"reasoning_effort": "low"}));
+        assert_eq!(fields("google", "off"), j!({"reasoning_effort": "none"}));
+        assert_eq!(fields("openrouter", "medium"), j!({"reasoning": {"effort": "medium"}}));
+        assert_eq!(fields("openrouter", "off"), j!({"reasoning": {"enabled": false}}));
+        assert_eq!(fields("anthropic", "high"), j!({}));
+        assert_eq!(
+            fields("splash", "off"),
+            j!({"chat_template_kwargs": {"enable_thinking": false}, "reasoning_effort": "none"}),
+            "self-hosted servers get the template switch"
+        );
+    }
+
+    #[test]
+    fn chat_usage_reads_cache_hits_from_openai_and_deepseek() {
+        let u = |v: serde_json::Value| serde_json::from_value::<ChatUsage>(v).unwrap().normalize();
+        let openai = u(serde_json::json!({"prompt_tokens": 1000, "completion_tokens": 20, "total_tokens": 1020, "prompt_tokens_details": {"cached_tokens": 768}}));
+        assert_eq!(openai, Usage { prompt_tokens: 1000, completion_tokens: 20, cached_tokens: 768, cache_write_tokens: 0 });
+        let deepseek = u(serde_json::json!({"prompt_tokens": 500, "total_tokens": 530, "prompt_cache_hit_tokens": 448, "prompt_cache_miss_tokens": 52}));
+        assert_eq!(deepseek, Usage { prompt_tokens: 500, completion_tokens: 30, cached_tokens: 448, cache_write_tokens: 0 });
+    }
+
+    #[test]
+    fn native_turns_never_reach_chat_completions() {
+        let mut m = Message::user("hi");
+        m.native = Some(serde_json::json!({"api": "messages", "parts": []}));
+        let v = &messages_payload(&[m], true)[0];
+        assert!(v.get("native").is_none(), "{v}");
+        assert_eq!(v["content"], "hi");
+    }
+
+    #[test]
+    fn a_paragraph_repeated_back_to_back_is_a_loop() {
+        // The paragraph a local Qwen got stuck on (2026-10-06).
+        let para = "The 3D Mandelbrot set is usually rendered by evaluating the DE in c-space: \
+                    z = c; iterate z = z^2 + c. The classic 3D Mandelbrot shape (the \"Mandelbrot\" \
+                    with the antenna) is obtained with c = (0,0,0.7885)? No, that's not right either.\n\n";
+        let mut text = String::from("Let me think about the shader first.\n\n");
+        for _ in 0..7 {
+            text.push_str(para);
+        }
+        assert!(!is_looping(text.as_bytes()), "7 repeats is still under the bar");
+        text.push_str(para);
+        assert!(is_looping(text.as_bytes()), "8 repeats is a loop");
+        // Mid-block: the tail still repeats, just phase-shifted.
+        text.push_str(&para[..90]);
+        assert!(is_looping(text.as_bytes()));
+    }
+
+    #[test]
+    fn ordinary_output_is_not_a_loop() {
+        let rule = "=".repeat(2000);
+        assert!(!is_looping(rule.as_bytes()), "a long rule has too few distinct bytes");
+        assert!(!is_looping(" ".repeat(5000).as_bytes()));
+        let prose: String = (0..300).map(|i| format!("Step {i}: update the uniform and redraw. ")).collect();
+        assert!(!is_looping(prose.as_bytes()), "similar lines that differ aren't a loop");
+        assert!(!is_looping(b"short"));
+    }
+
+    #[test]
+    fn retries_only_what_a_retry_can_fix() {
+        let status = |code, retry_after| anyhow::Error::from(HttpStatus { code, retry_after, detail: String::new() });
+        // A bad request, bad key or missing model fails the same way again.
+        for code in [400, 401, 403, 404, 413, 422] {
+            assert!(retry_delay(&status(code, None), 1).is_none(), "HTTP {code} must not retry");
+        }
+        // Rate limits and server trouble back off, growing per attempt.
+        let first = retry_delay(&status(429, None), 1).unwrap();
+        let third = retry_delay(&status(503, None), 3).unwrap();
+        assert!(first >= Duration::from_secs(1) && first < Duration::from_secs(2));
+        assert!(third >= Duration::from_secs(4) && third < Duration::from_secs(6));
+        // The server's Retry-After wins, capped at a minute.
+        assert_eq!(retry_delay(&status(429, Some(7)), 1), Some(Duration::from_secs(7)));
+        assert_eq!(retry_delay(&status(503, Some(3600)), 1), Some(Duration::from_secs(60)));
+        // Network failures are transient.
+        assert!(retry_delay(&anyhow!("network error: connection reset"), 1).is_some());
+    }
+
+    #[test]
+    fn images_are_dropped_entirely_for_providers_without_vision() {
+        let m = Message::user_with_images("look", vec!["data:image/png;base64,AAAA".into()]);
+        let v = &messages_payload(&[m.clone()], false)[0];
+        assert!(v.get("images").is_none(), "{v}");
+        assert_eq!(v["content"], "look");
+        let v = &messages_payload(&[m], true)[0];
+        assert!(v["content"].is_array());
+    }
+
+    use serde_json::json;
+
+    /// The shape DeepSeek actually returns for a China-region account: a funded
+    /// CNY bucket next to an empty USD one.
+    fn payload() -> serde_json::Value {
+        json!({
+            "is_available": true,
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": "135.70", "granted_balance": "0.00", "topped_up_balance": "135.70"},
+                {"currency": "USD", "total_balance": "0.00", "granted_balance": "0.00", "topped_up_balance": "0.00"}
+            ]
+        })
+    }
+
+    #[test]
+    fn picks_the_funded_bucket_and_keeps_its_currency() {
+        let bal = pick_balance(&payload(), &Currency::default()).unwrap();
+        assert_eq!(bal.currency.code, "CNY");
+        assert_eq!(bal.render(), "¥135.70");
+        // The digits are the provider's, not a re-formatted float.
+        assert_eq!(bal.amount, "135.70");
+    }
+
+    #[test]
+    fn a_usd_account_still_reports_usd() {
+        let v = json!({"balance_infos": [
+            {"currency": "USD", "total_balance": "12.34"},
+            {"currency": "CNY", "total_balance": "0.00"}
+        ]});
+        let bal = pick_balance(&v, &Currency::default()).unwrap();
+        assert_eq!(bal.render(), "$12.34");
+    }
+
+    #[test]
+    fn ties_prefer_the_currency_the_price_list_is_quoted_in() {
+        let v = json!({"balance_infos": [
+            {"currency": "CNY", "total_balance": "0.00"},
+            {"currency": "USD", "total_balance": "0.00"}
+        ]});
+        // All buckets empty: report one in the currency the cost readout uses,
+        // so the status line at least stays in one unit.
+        let code = |c: &Currency| pick_balance(&v, c).unwrap().currency.code;
+        assert_eq!(code(&Currency::default()), "USD");
+        assert_eq!(code(&Currency::parse("cny")), "CNY");
+    }
+
+    #[test]
+    fn a_payload_without_buckets_is_not_an_error() {
+        assert!(pick_balance(&json!({}), &Currency::default()).is_none());
+        assert!(pick_balance(&json!({"balance_infos": []}), &Currency::default()).is_none());
+        // A currency we have no symbol for still renders with its code.
+        let v = json!({"balance_infos": [{"currency": "GBP", "total_balance": "3.50"}]});
+        let bal = pick_balance(&v, &Currency::default()).unwrap();
+        assert_eq!(bal.render(), "£3.50");
+    }
+}

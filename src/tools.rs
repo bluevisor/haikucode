@@ -1,0 +1,2629 @@
+//! Tool implementations. Pure-ish: each returns a String result for the model.
+//! Approval and event emission live in the agent; preview/diff helpers here let
+//! the agent show a change before it is applied.
+
+use crate::api::{truncate, MAX_TOOL_OUTPUT};
+use crate::config::{config_dir, memory_path};
+use anyhow::Result;
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+pub(crate) fn expand(path: &str) -> PathBuf {
+    let raw = if let Some(rest) = path.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(rest),
+            Err(_) => PathBuf::from(path),
+        }
+    } else if path == "~" {
+        match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => PathBuf::from(path),
+        }
+    } else {
+        PathBuf::from(path)
+    };
+    normalize(&raw)
+}
+
+/// Collapse `.` and `..` lexically (without touching the filesystem, so it works
+/// for paths that don't exist yet). This doesn't sandbox — a coding agent
+/// legitimately reads files all over the box — but it turns a sneaky
+/// `~/../../etc/x` into the plain `/etc/x` it really means, so the path the user
+/// approves is the path that's used.
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => match out.components().next_back() {
+                // Pop a real directory name…
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // …but never climb above the filesystem root.
+                Some(Component::RootDir) => {}
+                // At a relative start, keep the `..` (can't resolve it lexically).
+                _ => out.push(".."),
+            },
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Refuse to operate through a symlink: a symlinked path could point outside the
+/// intended target. Reads and writes both go through this so the guard is
+/// symmetric. Returns `Some(error)` to short-circuit, `None` to proceed.
+fn deny_symlink(p: &Path, path: &str, verb: &str) -> Option<String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Some(format!("DENIED: {path} is a symlink; {verb} the real path instead."))
+        }
+        _ => None,
+    }
+}
+
+// ----------------------------------------------------------------- bash -----
+
+/// `sh -c command`, inside the OS sandbox when one is configured (see
+/// `sandbox`). Returns the command, what must outlive its spawn, the active
+/// sandbox (to explain failures), and a one-time "unavailable" warning.
+fn shell(command: &str, cwd: &Path) -> (Command, Option<crate::sandbox::Guard>, Option<crate::sandbox::Sandbox>, Option<String>) {
+    match crate::sandbox::Sandbox::current(cwd) {
+        Some(sb) => {
+            let (cmd, guard, warn) = sb.shell(command);
+            (cmd, Some(guard), warn.is_none().then_some(sb), warn)
+        }
+        None => {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(command);
+            (cmd, None, None, None)
+        }
+    }
+}
+
+pub fn bash(command: &str, timeout: u64, cwd: &Path, cancel: &AtomicBool) -> String {
+    // `_guard` keeps the Linux sandbox ruleset open until the child is spawned.
+    let (mut cmd, _guard, sandbox, warning) = shell(command, cwd);
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group so we can kill the whole tree on timeout or interrupt.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("ERROR: failed to spawn shell: {e}"),
+    };
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    // Poll on a short interval so an Esc (cancel) interrupts a long-running
+    // command instead of blocking the worker until the timeout elapses.
+    let deadline = Instant::now() + Duration::from_secs(timeout.max(1));
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(output)) => {
+                let mut out = String::new();
+                out.push_str(&String::from_utf8_lossy(&output.stdout));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.trim().is_empty() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str("[stderr]\n");
+                    out.push_str(&stderr);
+                }
+                let code = output.status.code().unwrap_or(-1);
+                out = out.trim_end().to_string();
+                out.push_str(&format!("\n[exit {code}]"));
+                if let Some(note) = sandbox.as_ref().and_then(|sb| sb.explain(&out, code)) {
+                    out.push('\n');
+                    out.push_str(&note);
+                }
+                if let Some(w) = &warning {
+                    out = format!("{w}\n{out}");
+                }
+                return truncate(out.trim(), MAX_TOOL_OUTPUT);
+            }
+            Ok(Err(e)) => return format!("ERROR: {e}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Negative pid = kill whole process group (sh + grandchildren).
+                // Routed through `sh -c` to match bash_kill (a bare
+                // `Command::new("kill")` mis-targets the group in some sandboxes).
+                let kill = |pid: u32| {
+                    let _ = Command::new("sh").arg("-c").arg(format!("kill -KILL -{pid}")).status();
+                };
+                if cancel.load(Ordering::Relaxed) {
+                    kill(pid);
+                    let _ = rx.recv_timeout(Duration::from_millis(500));
+                    return "ERROR: interrupted by user".to_string();
+                }
+                if Instant::now() >= deadline {
+                    kill(pid);
+                    // Give the waiter thread a moment to reap the killed child.
+                    let _ = rx.recv_timeout(Duration::from_millis(500));
+                    return format!("ERROR: command timed out after {timeout}s");
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return "ERROR: shell waiter disconnected".to_string();
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------- background jobs ---
+
+/// A shell command running detached from the agent loop. Output accumulates
+/// in `buf`; `read_to` tracks how much bash_output has already returned.
+struct Job {
+    pid: u32,
+    command: String,
+    buf: Arc<Mutex<String>>,
+    exit: Arc<Mutex<Option<i32>>>,
+    read_to: usize,
+}
+
+const JOB_BUF_MAX: usize = 1_000_000;
+
+fn jobs() -> &'static Mutex<HashMap<u32, Job>> {
+    static JOBS: OnceLock<Mutex<HashMap<u32, Job>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const MAX_BG_JOBS: usize = 64;
+
+pub fn bash_background(command: &str, cwd: &Path) -> String {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+    // `_guard` keeps the Linux sandbox ruleset open until the child is spawned.
+    let (mut cmd, _guard, sandbox, warning) = shell(command, cwd);
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group, so bash_kill can take out the whole pipeline.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("ERROR: failed to spawn shell: {e}"),
+    };
+    let pid = child.id();
+    let buf = Arc::new(Mutex::new(String::new()));
+    let exit = Arc::new(Mutex::new(None));
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|p| Box::new(p) as _),
+        child.stderr.take().map(|p| Box::new(p) as _),
+    ];
+    for pipe in pipes.into_iter().flatten() {
+        let buf = buf.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut line = String::new();
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                let mut b = buf.lock().unwrap();
+                if b.len() < JOB_BUF_MAX {
+                    b.push_str(&line);
+                }
+                line.clear();
+            }
+        });
+    }
+    {
+        let exit = exit.clone();
+        std::thread::spawn(move || {
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+            *exit.lock().unwrap() = Some(code);
+        });
+    }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut map = jobs().lock().unwrap();
+    // Evict finished jobs when the table gets large, to avoid unbounded memory.
+    if map.len() >= MAX_BG_JOBS {
+        map.retain(|_, j| j.exit.lock().unwrap().is_none());
+    }
+    map.insert(
+        id,
+        Job { pid, command: command.to_string(), buf, exit, read_to: 0 },
+    );
+    drop(map);
+    let mut msg = format!("Started background job {id} (pid {pid}). Poll with bash_output, stop with bash_kill.");
+    if let Some(sb) = &sandbox {
+        msg.push_str(&format!(" It runs in the {}.", sb.describe()));
+    }
+    if let Some(w) = warning {
+        msg = format!("{w}\n{msg}");
+    }
+    msg
+}
+
+/// Output produced since the last bash_output call, plus run status.
+pub fn bash_output(id: u64) -> String {
+    if id > u32::MAX as u64 {
+        return format!("ERROR: invalid job id {id} (max {})", u32::MAX);
+    }
+    let mut map = jobs().lock().unwrap();
+    let Some(job) = map.get_mut(&(id as u32)) else {
+        return format!("ERROR: no background job {id}");
+    };
+    let buf = job.buf.lock().unwrap();
+    let new = buf[job.read_to..].to_string();
+    job.read_to = buf.len();
+    drop(buf);
+    let status = match *job.exit.lock().unwrap() {
+        Some(code) => format!("[exited {code}]"),
+        None => "[running]".to_string(),
+    };
+    let header = format!("job {id}: {}", truncate(&job.command, 100));
+    let body = if new.is_empty() { "(no new output)".to_string() } else { truncate(&new, MAX_TOOL_OUTPUT) };
+    format!("{header}\n{body}\n{status}")
+}
+
+pub fn bash_kill(id: u64) -> String {
+    if id > u32::MAX as u64 {
+        return format!("ERROR: invalid job id {id} (max {})", u32::MAX);
+    }
+    let map = jobs().lock().unwrap();
+    let Some(job) = map.get(&(id as u32)) else {
+        return format!("ERROR: no background job {id}");
+    };
+    if job.exit.lock().unwrap().is_some() {
+        return format!("job {id} has already exited");
+    }
+    let pid = job.pid;
+    drop(map);
+    // Negative pid = the whole process group (sh + its children).
+    let _ = Command::new("sh").arg("-c").arg(format!("kill -KILL -{pid}")).status();
+    format!("killed job {id} (process group {pid})")
+}
+
+// ------------------------------------------------------------ read/list -----
+
+pub fn read_file(path: &str, start: Option<u64>, end: Option<u64>) -> String {
+    let p = expand(path);
+    // Open with O_NOFOLLOW so symlinks are refused atomically — no TOCTOU
+    // window between the check and the open.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&p) {
+            Ok(f) => f,
+            Err(e) => {
+                if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                    if meta.file_type().is_symlink() {
+                        return format!("DENIED: {path} is a symlink; read the real path instead.");
+                    }
+                }
+                return format!("ERROR: {e}");
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        if let Some(err) = deny_symlink(&p, path, "read") {
+            return err;
+        }
+        match std::fs::File::open(&p) {
+            Ok(f) => f,
+            Err(e) => return format!("ERROR: {e}"),
+        }
+    };
+    // Open and read only up to READ_FILE_LIMIT bytes to avoid OOM on huge files.
+    const READ_FILE_LIMIT: usize = 1_000_000; // 1 MB
+    // Read a small probe first: if the file is binary, hex-dump it without
+    // allocating the full 1 MB.
+    let mut probe = [0u8; 4096];
+    let probe_n = match std::io::Read::read(&mut file, &mut probe) {
+        Ok(0) => return "(empty file)".into(),
+        Ok(n) => n,
+        Err(e) => return format!("ERROR: read failed: {e}"),
+    };
+    let is_binary = probe[..probe_n].contains(&0);
+    let mut raw = probe[..probe_n].to_vec();
+    if !is_binary {
+        if let Err(e) = std::io::Read::by_ref(&mut file)
+            .take((READ_FILE_LIMIT - probe_n) as u64)
+            .read_to_end(&mut raw)
+        {
+            return format!("ERROR: read failed: {e}");
+        }
+    }
+    let content = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => {
+            // A file read right up to READ_FILE_LIMIT can be cut mid-codepoint;
+            // that lone trailing partial char isn't "binary". If the only invalid
+            // bytes are at the very end of a limit-sized read, keep the valid
+            // prefix as text instead of hex-dumping a legit UTF-8 file.
+            let valid_up_to = e.utf8_error().valid_up_to();
+            let raw = e.into_bytes();
+            if raw.len() >= READ_FILE_LIMIT && valid_up_to >= raw.len().saturating_sub(3) {
+                // Safe: valid_up_to is by definition a char boundary.
+                String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
+            } else {
+            // Binary: return a hex dump of the first 512 bytes.
+            let preview = &raw[..raw.len().min(512)];
+            let hex: String = preview
+                .chunks(16)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let off = format!("{:08x}", i * 16);
+                    let bytes: String = chunk.iter().map(|b| format!(" {b:02x}")).collect();
+                    let ascii: String = chunk
+                        .iter()
+                        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                        .collect();
+                    format!("{off} {bytes: <49} |{ascii}|\n")
+                })
+                .collect();
+            return format!(
+                "Binary file ({} bytes total, hex dump of first {} bytes):\n{hex}",
+                raw.len(),
+                preview.len()
+            );
+            }
+        }
+    };
+    let truncated_read = content.len() >= READ_FILE_LIMIT;
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let (slice, off) = match (start, end) {
+        (None, None) => (&lines[..], 1usize),
+        (s, e) => {
+            let s = s.unwrap_or(1).max(1) as usize;
+            let e = e.map(|x| x as usize).unwrap_or(lines.len());
+            // An out-of-range or inverted range is an error, not "(empty file)"
+            // — the model must not conclude the file is blank and overwrite it.
+            if s > lines.len() && !lines.is_empty() {
+                return format!("ERROR: start_line {s} is beyond the end of the file ({} lines).", lines.len());
+            }
+            if e < s {
+                return format!("ERROR: end_line {e} is before start_line {s}.");
+            }
+            let lo = (s - 1).min(lines.len());
+            let hi = e.min(lines.len()).max(lo);
+            (&lines[lo..hi], s)
+        }
+    };
+    if slice.is_empty() {
+        return "(empty file)".into();
+    }
+    let mut out = String::new();
+    for (i, ln) in slice.iter().enumerate() {
+        // A tab, like `cat -n`: with spaces the model mistook the separator
+        // for indentation and sent edit_file old_text indented 2 too deep.
+        out.push_str(&format!("{:>5}\t{}", off + i, ln));
+        if !ln.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if truncated_read {
+        out.push_str("... (file truncated at 1 MB)\n");
+    }
+    truncate(&out, MAX_TOOL_OUTPUT)
+}
+
+pub fn list_files(path: &str) -> String {
+    let p = expand(if path.is_empty() { "." } else { path });
+    if let Some(err) = deny_symlink(&p, path, "list") {
+        return err;
+    }
+    let entries = match std::fs::read_dir(&p) {
+        Ok(e) => e,
+        Err(e) => return format!("ERROR: {e}"),
+    };
+    const MAX_ENTRIES: usize = 10_000;
+    let mut names: Vec<String> = Vec::new();
+    let mut unreadable = 0u32;
+    for entry in entries {
+        match entry {
+            Ok(e) => {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                names.push(if is_dir { format!("{name}/") } else { name });
+                if names.len() >= MAX_ENTRIES {
+                    names.push("... (directory listing truncated at 10 000 entries)".into());
+                    break;
+                }
+            }
+            Err(_) => {
+                unreadable += 1;
+            }
+        }
+    }
+    names.sort();
+    // Leave out what .gitignore excludes, but say what was left out, so the
+    // model doesn't conclude a build dir is missing.
+    if let Some(ignored) = git_ignored_children(&p) {
+        let hidden: Vec<String> = names.iter().filter(|n| ignored.contains(*n)).cloned().collect();
+        if !hidden.is_empty() {
+            names.retain(|n| !ignored.contains(n));
+            let shown: Vec<&str> = hidden.iter().take(10).map(String::as_str).collect();
+            let more = if hidden.len() > 10 { ", …" } else { "" };
+            names.push(format!("({} git-ignored not shown: {}{more})", hidden.len(), shown.join(", ")));
+        }
+    }
+    if unreadable > 0 {
+        let s = if unreadable == 1 { "" } else { "s" };
+        names.push(format!("({unreadable} unreadable entry{s})"));
+    }
+    // Pin the notes (truncation, ignored, unreadable) to the very bottom.
+    let note = |s: &str| s.starts_with("...") || s.starts_with('(');
+    names.sort_by(|a, b| {
+        match (note(a), note(b)) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a.cmp(b),
+        }
+    });
+    if names.is_empty() {
+        "(empty)".into()
+    } else {
+        truncate(&names.join("\n"), MAX_TOOL_OUTPUT)
+    }
+}
+
+// --------------------------------------------------------- write / edit -----
+
+/// Compute a preview diff for an upcoming write (existing content vs new).
+pub fn write_preview(path: &str, content: &str) -> (String, bool) {
+    let p = expand(path);
+    let existed = p.exists();
+    let old = std::fs::read_to_string(&p).unwrap_or_default();
+    (crate::diff::unified(&old, content, 300), existed)
+}
+
+pub fn write_file(path: &str, content: &str) -> String {
+    let p = expand(path);
+    if let Some(dir) = p.parent() {
+        if !dir.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return format!("ERROR: {e}");
+            }
+        }
+    }
+    // O_NOFOLLOW: refuse to write through symlinks atomically.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    return format!("ERROR: {e}");
+                }
+            }
+            Err(e) => {
+                // Distinguish symlink denial from other errors.
+                if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                    if meta.file_type().is_symlink() {
+                        return format!("DENIED: {path} is a symlink; write to the real path instead.");
+                    }
+                }
+                return format!("ERROR: {e}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(err) = deny_symlink(&p, path, "write to") {
+            return err;
+        }
+        match std::fs::write(&p, content) {
+            Err(e) => return format!("ERROR: {e}"),
+            _ => {}
+        }
+    }
+    format!("OK wrote {} ({} bytes)", p.display(), content.len())
+}
+
+pub enum EditPreview {
+    Ok { diff: String, new_content: String },
+    Err(String),
+}
+
+/// One requested edit (a unique-substring replacement in a file).
+#[derive(Debug)]
+pub struct EditReq {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+/// A validated multi-file edit, ready to apply.
+#[derive(Debug)]
+pub struct MultiEditPlan {
+    /// Combined diff across all touched files, for the approval preview.
+    pub diff: String,
+    /// Final content per file, in first-touched order.
+    pub files: Vec<(String, String)>,
+}
+
+/// Validate a batch of edits without writing. Edits are applied to in-memory
+/// copies in order, so several edits to the same file compose correctly. Any
+/// failure (file missing, old_text absent or ambiguous) aborts the whole
+/// batch — nothing is half-applied.
+pub fn multi_edit_plan(edits: &[EditReq]) -> std::result::Result<MultiEditPlan, String> {
+    if edits.is_empty() {
+        return Err("ERROR: no edits provided".into());
+    }
+    let mut originals: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut current: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    // Key every map by the normalized path: `src/a.rs` and `./src/a.rs` are one
+    // file, and two spellings used to load it twice and let the later write
+    // clobber the earlier edit.
+    let mut shown: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // An edit that changes nothing is skipped, not fatal: rejecting a whole
+    // all-or-nothing batch over one no-op only makes the model resend it.
+    if edits.iter().all(|e| e.old_text == e.new_text) {
+        return Err("ERROR: every edit has identical old_text and new_text (no change).".into());
+    }
+    for (i, e) in edits.iter().enumerate() {
+        if e.old_text == e.new_text {
+            continue;
+        }
+        let key = expand(&e.path).to_string_lossy().into_owned();
+        if !current.contains_key(&key) {
+            let disk = read_for_edit(&expand(&e.path), &e.path)
+                .map_err(|err| format!("{} (edit {}: {})", err.trim_end_matches('.'), i + 1, e.path))?;
+            originals.insert(key.clone(), disk.clone());
+            current.insert(key.clone(), disk);
+            shown.insert(key.clone(), e.path.clone());
+            order.push(key.clone());
+        }
+        let cur = current.get(&key).unwrap();
+        let updated = splice_edit(cur, &e.old_text, &e.new_text, &format!("edit {} ({}): ", i + 1, e.path))?;
+        current.insert(key, updated);
+    }
+    let mut diff = String::new();
+    let mut files = Vec::new();
+    for key in &order {
+        let old = &originals[key];
+        let new = &current[key];
+        let path = &shown[key];
+        diff.push_str(&format!("--- {path}\n"));
+        diff.push_str(&crate::diff::unified(old, new, 300));
+        diff.push('\n');
+        files.push((path.clone(), new.clone()));
+    }
+    Ok(MultiEditPlan { diff, files })
+}
+/// Locate `old_text` in `data` and splice in `new_text`. Matches the raw bytes
+/// first so a file is never rewritten wholesale; only when that fails does it
+/// fall back to NFC-normalized matching (the model may emit composed
+/// codepoints for a decomposed file), in which case the whole file comes back
+/// normalized — the diff shows it. Errors are the model-facing messages.
+fn splice_edit(data: &str, old_text: &str, new_text: &str, where_: &str) -> std::result::Result<String, String> {
+    if old_text == new_text {
+        return Err(format!("ERROR: {where_}old_text and new_text are identical (no change)."));
+    }
+    let count = |hay: &str, needle: &str| if needle.is_empty() { 0 } else { hay.matches(needle).count() };
+    match count(data, old_text) {
+        1 => return Ok(data.replacen(old_text, new_text, 1)),
+        n if n > 1 => return Err(format!("ERROR: {where_}old_text matches {n} times; make it unique.")),
+        _ => {}
+    }
+    let data_nfc: String = unicode_normalization::UnicodeNormalization::nfc(data.chars()).collect();
+    let old_nfc: String = unicode_normalization::UnicodeNormalization::nfc(old_text.chars()).collect();
+    match count(&data_nfc, &old_nfc) {
+        0 => {}
+        1 => return Ok(data_nfc.replacen(&old_nfc, new_text, 1)),
+        n => return Err(format!("ERROR: {where_}old_text matches {n} times; make it unique.")),
+    }
+    // Models get whitespace wrong far more often than content: indentation off
+    // by a level, blank lines with stray spaces, read_file's line numbers
+    // pasted in. Match whole lines ignoring that, then re-indent the new text.
+    let (old_t, new_t) = match strip_line_numbers(old_text) {
+        Some(o) => (o, strip_line_numbers(new_text).unwrap_or_else(|| new_text.to_string())),
+        None => (old_text.to_string(), new_text.to_string()),
+    };
+    if let Some(r) = splice_loose(data, &old_t, &new_t, where_) {
+        return r;
+    }
+    Err(format!("ERROR: {where_}old_text not found.{}", closest_hint(data, &old_t)))
+}
+
+/// `text` without read_file's line-number prefixes (`   12<TAB>`, or the old
+/// `   12  `), when every non-blank line carries one. None otherwise.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let re = regex::Regex::new(r"^\s*\d+(\t| {2})").ok()?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut nonblank = lines.iter().filter(|l| !l.trim().is_empty()).peekable();
+    nonblank.peek()?;
+    if !nonblank.all(|l| re.is_match(l)) {
+        return None;
+    }
+    Some(lines.iter().map(|l| re.replace(l, "").into_owned()).collect::<Vec<_>>().join("\n"))
+}
+
+/// Leading spaces and tabs of a line.
+fn indent_of(line: &str) -> &str {
+    &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+}
+
+/// Replace the one run of whole lines in `data` that equals `old_text` line
+/// for line once each line's surrounding whitespace is ignored (blank lines
+/// match blank lines) — or, failing that, all of its whitespace (a space the
+/// model dropped mid-line) — re-indenting `new_text` by the indentation the
+/// model got wrong. None when nothing matches either way.
+fn splice_loose(data: &str, old_text: &str, new_text: &str, where_: &str) -> Option<std::result::Result<String, String>> {
+    let old: Vec<&str> = old_text.trim_end_matches(['\n', '\r']).split('\n').collect();
+    let first = old.iter().position(|l| !l.trim().is_empty())?;
+    let lines: Vec<&str> = data.split_inclusive('\n').collect();
+    let k = old.len();
+    if k > lines.len() {
+        return None;
+    }
+    let trim = |l: &str| l.trim().to_string();
+    let squash = |l: &str| l.split_whitespace().collect::<String>();
+    let mut found = None;
+    for key in [&trim as &dyn Fn(&str) -> String, &squash] {
+        let want: Vec<String> = old.iter().map(|l| key(l)).collect();
+        let have: Vec<String> = lines.iter().map(|l| key(l)).collect();
+        let hits: Vec<usize> = (0..=lines.len() - k).filter(|&i| have[i..i + k] == want[..]).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [i] => {
+                found = Some(*i);
+                break;
+            }
+            many => {
+                return Some(Err(format!(
+                    "ERROR: {where_}old_text matches {} places when whitespace is ignored; include more \
+                     surrounding lines to make it unique.",
+                    many.len()
+                )))
+            }
+        }
+    }
+    let i = found?;
+    let start: usize = lines[..i].iter().map(|l| l.len()).sum();
+    let end = start + lines[i..i + k].iter().map(|l| l.len()).sum::<usize>();
+    let last = lines[i + k - 1];
+    let nl = if last.ends_with("\r\n") || data.contains("\r\n") { "\r\n" } else { "\n" };
+    let eol = if last.ends_with('\n') { nl } else { "" };
+    let (from, to) = (indent_of(old[first]), indent_of(lines[i + first]));
+    let shift = to.len() as isize - from.len() as isize;
+    let reindent = |line: &str| -> String {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            return String::new();
+        }
+        if let Some(rest) = line.strip_prefix(from) {
+            return format!("{to}{rest}");
+        }
+        // Shallower than old_text's first line (a closing brace, say): move it
+        // by the same amount, as far as its own indentation allows.
+        let lead = indent_of(line).len();
+        if shift < 0 {
+            line[(-shift as usize).min(lead)..].to_string()
+        } else {
+            format!("{}{line}", &to[..(shift as usize).min(to.len())])
+        }
+    };
+    let body = if new_text.is_empty() {
+        String::new()
+    } else {
+        let new: Vec<String> = new_text.trim_end_matches(['\n', '\r']).split('\n').map(reindent).collect();
+        format!("{}{eol}", new.join(nl))
+    };
+    Some(Ok(format!("{}{body}{}", &data[..start], &data[end..])))
+}
+
+/// For a failed edit: the stretch of `data` that best lines up with
+/// `old_text` (most lines equal ignoring whitespace), numbered like read_file,
+/// so the model can copy the real text instead of guessing again.
+fn closest_hint(data: &str, old_text: &str) -> String {
+    let old: Vec<&str> = old_text.trim_end_matches('\n').split('\n').map(str::trim).collect();
+    let lines: Vec<&str> = data.lines().collect();
+    let span = old.len().min(lines.len());
+    if span == 0 || old.len() > 400 || lines.len() > 50_000 {
+        return String::new();
+    }
+    let trimmed: Vec<&str> = lines.iter().map(|l| l.trim()).collect();
+    let (mut score, mut at) = (0, 0);
+    for i in 0..=lines.len() - span {
+        let s = (0..span).filter(|&j| !old[j].is_empty() && trimmed[i + j] == old[j]).count();
+        if s > score {
+            (score, at) = (s, i);
+        }
+    }
+    if score == 0 {
+        return " No line of it appears in the file; re-read the file before editing.".into();
+    }
+    let shown = &lines[at..(at + span).min(at + 40)];
+    let body: Vec<String> = shown.iter().enumerate().map(|(j, l)| format!("{:>5}\t{l}", at + j + 1)).collect();
+    format!(
+        " Closest match, lines {}-{} ({score} of {} lines agree ignoring whitespace) — copy old_text \
+         from here exactly (the text after each tab):\n{}",
+        at + 1,
+        at + shown.len(),
+        old.len(),
+        body.join("\n")
+    )
+}
+
+/// Read a file for editing, refusing symlinks atomically (O_NOFOLLOW).
+fn read_for_edit(p: &Path, shown: &str) -> std::result::Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(p) {
+            Ok(mut f) => {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut f, &mut s).map_err(|e| format!("ERROR: {e}"))?;
+                Ok(s)
+            }
+            Err(e) => {
+                if let Ok(meta) = std::fs::symlink_metadata(p) {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!("DENIED: {shown} is a symlink; edit the real path instead."));
+                    }
+                }
+                Err(format!("ERROR: {e}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(err) = deny_symlink(p, shown, "edit") {
+            return Err(err);
+        }
+        std::fs::read_to_string(p).map_err(|e| format!("ERROR: {e}"))
+    }
+}
+
+pub fn edit_preview(path: &str, old_text: &str, new_text: &str) -> EditPreview {
+    let p = expand(path);
+    let data = match read_for_edit(&p, path) {
+        Ok(d) => d,
+        Err(e) => return EditPreview::Err(e),
+    };
+    match splice_edit(&data, old_text, new_text, "") {
+        Ok(new_content) => {
+            let diff = crate::diff::unified(&data, &new_content, 300);
+            EditPreview::Ok { diff, new_content }
+        }
+        Err(e) => EditPreview::Err(e),
+    }
+}
+
+pub fn apply_write(path: &str, content: &str) -> String {
+    let p = expand(path);
+    // O_NOFOLLOW: the preview refused symlinks, the write must too (a link
+    // could be swapped in between, and multi_edit has no other guard).
+    #[cfg(unix)]
+    let res = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&p)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+    };
+    #[cfg(not(unix))]
+    let res = match deny_symlink(&p, path, "edit") {
+        Some(err) => return err,
+        None => std::fs::write(&p, content),
+    };
+    match res {
+        Ok(()) => format!("OK edited {}", p.display()),
+        Err(e) if std::fs::symlink_metadata(&p).map(|m| m.file_type().is_symlink()).unwrap_or(false) => {
+            format!("DENIED: {path} is a symlink; edit the real path instead. ({e})")
+        }
+        Err(e) => format!("ERROR: {e}"),
+    }
+}
+
+// --------------------------------------------------------------- git --------
+
+/// True if `dir` is inside a git work tree.
+pub fn in_git_repo(dir: &Path) -> bool {
+    git_cmd(dir, &["rev-parse", "--is-inside-work-tree"], 10)
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn git_cmd(dir: &Path, args: &[&str], timeout_secs: u64) -> std::io::Result<std::process::ExitStatus> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    run_proc(&mut c, timeout_secs).map(|o| o.status)
+}
+
+/// Like git_status but captures stdout (used for `rev-parse`, `status`, etc.).
+fn git_output(dir: &Path, args: &[&str], timeout_secs: u64) -> std::io::Result<std::process::Output> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_proc(&mut c, timeout_secs)
+}
+
+/// Spawn a command, wait with timeout, kill the process group on timeout.
+/// Returns the captured Output (stdout + stderr) and the exit status.
+fn run_proc(cmd: &mut Command, timeout_secs: u64) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = child.wait_with_output();
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+            let _ = rx.recv_timeout(Duration::from_millis(500));
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("timed out after {timeout_secs}s")))
+        }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+    }
+}
+
+/// Whether edit checkpoints also bump Cargo.toml's patch version. Opt-in with
+/// `"auto_bump_version": true` in config.json or the project's
+/// `.picoder/settings(.local).json` (the most specific layer wins): in someone
+/// else's crate a version bump per edit is noise, not a checkpoint.
+fn auto_bump_version() -> bool {
+    crate::config::settings_layers()
+        .iter()
+        .rev()
+        .find_map(|(_, v)| v.get("auto_bump_version").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Bump the `[package]` patch version in `dir/Cargo.toml`. Returns the new
+/// version string, or None if there's no Cargo.toml or no `[package]` version
+/// to bump (a workspace root, `version.workspace = true`).
+pub fn bump_cargo_version(dir: &Path) -> Option<String> {
+    let path = dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trailing_nl = text.ends_with('\n');
+    // Match `version = "x.y.z"` and bump z. (?m) enables multi-line mode so ^
+    // matches at the start of any line, not just the start of the string.
+    let re = regex::Regex::new(r#"(?m)^(\s*version\s*=\s*")(\d+)\.(\d+)\.(\d+)(")"#).ok()?;
+    let mut bumped = String::new();
+    let mut new_version: Option<String> = None;
+    let mut first = true;
+    // Only the [package] table's own version: a `[dependencies.foo]` table
+    // has a `version = "x.y.z"` line of exactly the same shape.
+    let mut in_package = false;
+    for line in text.lines() {
+        if !first {
+            bumped.push('\n');
+        }
+        first = false;
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_package = t.trim_end().trim_end_matches(|c: char| c != ']') == "[package]";
+        }
+        if new_version.is_none() && in_package {
+            if let Some(caps) = re.captures(line) {
+                let z: u64 = caps[4].parse().ok()?;
+                let v = format!("{}.{}.{}", &caps[2], &caps[3], z + 1);
+                bumped.push_str(&format!("{}{}{}", &caps[1], v, &caps[5]));
+                new_version = Some(v);
+                continue;
+            }
+        }
+        bumped.push_str(line);
+    }
+    let new_version = new_version?;
+    if trailing_nl {
+        bumped.push('\n');
+    }
+    std::fs::write(&path, &bumped).ok()?;
+    Some(new_version)
+}
+
+/// Commit the given paths to the repo at `dir` as an edit checkpoint. With
+/// `auto_bump_version` on, also bumps Cargo.toml's patch version into it.
+/// Returns a short note like ` [committed a1b2c3d]` for the tool result, or ""
+/// when there was nothing to commit / not a repo. Best-effort: never surfaces an
+/// error.
+pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
+    if paths.is_empty() || !in_git_repo(dir) {
+        return String::new();
+    }
+    // Tools expand `~` before touching the filesystem; git does not, so the
+    // model's raw path strings must be expanded the same way here.
+    let paths: Vec<PathBuf> = paths.iter().map(|p| expand(p)).collect();
+
+    // Stage the edited files first, so we can check if there's anything to commit.
+    let mut add = Command::new("git");
+    add.arg("-C").arg(dir).arg("add").arg("--");
+    for p in &paths {
+        add.arg(p);
+    }
+    if run_proc(&mut add, 10).map(|o| !o.status.success()).unwrap_or(true) {
+        return String::new();
+    }
+
+    // Only bump Cargo.toml when the edited files actually changed. Scope the
+    // check to those files: anything the user had staged themselves is not
+    // ours to judge (or, below, to commit).
+    let staged = {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(dir).args(["diff", "--cached", "--quiet", "--"]);
+        for p in &paths {
+            c.arg(p);
+        }
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+        run_proc(&mut c, 10)
+            .map(|o| !o.status.success()) // --quiet exits 1 when there ARE differences
+            .unwrap_or(false)
+    };
+    if !staged {
+        return String::new(); // nothing changed
+    }
+
+    // Bump Cargo.toml version if opted in, and add it to the commit.
+    let cargo_toml = dir.join("Cargo.toml");
+    let version_bumped = if cargo_toml.exists() && auto_bump_version() {
+        bump_cargo_version(dir)
+    } else {
+        None
+    };
+    if version_bumped.is_some() {
+        let mut add_cargo = Command::new("git");
+        add_cargo.arg("-C").arg(dir).arg("add").arg("--").arg(&cargo_toml);
+        run_proc(&mut add_cargo, 10).ok();
+    }
+
+    // A fresh Pi may have no user.name/email; retry with a fallback identity
+    // only if the first attempt fails (so configured identity is preserved).
+    // Capture stderr so we can surface merge-conflict and other commit failures.
+    let run_commit = |ident: bool| -> (bool, String) {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(dir);
+        if ident {
+            c.args(["-c", "user.name=picoder", "-c", "user.email=picoder@localhost"]);
+        }
+        // Commit only the edited files (+ the Cargo.toml bump): with explicit
+        // paths git ignores whatever else the user has staged, so a checkpoint
+        // never sweeps their half-prepared commit into a "picoder: edit" one.
+        c.args(["commit", "--no-verify", "-m", message, "--"]);
+        for p in &paths {
+            c.arg(p);
+        }
+        if version_bumped.is_some() {
+            c.arg(&cargo_toml);
+        }
+        run_proc(&mut c, 30).map(|o| {
+            (o.status.success(), String::from_utf8_lossy(&o.stderr).trim().to_string())
+        }).unwrap_or_default()
+    };
+    let (ok, err) = run_commit(false);
+    let committed = ok || {
+        let (ok2, err2) = run_commit(true);
+        if !ok2 && err2.is_empty() {
+            return if err.is_empty() {
+                String::new()
+            } else {
+                format!(" [commit skipped: {err}]")
+            };
+        }
+        ok2
+    };
+    if !committed {
+        return if err.is_empty() {
+            String::new()
+        } else {
+            format!(" [commit skipped: {err}]")
+        };
+    }
+    let hash = git_output(dir, &["rev-parse", "--short", "HEAD"], 10)
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let mut note = if hash.is_empty() {
+        " [committed]".to_string()
+    } else {
+        format!(" [committed {hash}]")
+    };
+    if let Some(v) = version_bumped {
+        note.push_str(&format!(" version → {v}"));
+    }
+    note
+}
+
+/// Recent git history + working-tree status for `dir`, as a startup context
+/// clue. None outside a repo.
+pub fn git_context(dir: &Path) -> Option<String> {
+    if !in_git_repo(dir) {
+        return None;
+    }
+    let run = |args: &[&str]| {
+        git_output(dir, args, 10)
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let log = run(&["log", "--oneline", "-15"]);
+    let status = run(&["status", "--short"]);
+    let mut out = String::new();
+    if !branch.is_empty() {
+        out.push_str(&format!("branch: {branch}\n"));
+    }
+    if !log.is_empty() {
+        out.push_str(&format!("recent commits:\n{log}\n"));
+    }
+    if !status.is_empty() {
+        out.push_str(&format!("uncommitted changes:\n{}\n", truncate(&status, 2000)));
+    }
+    (!out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
+/// Branch + clean/dirty state for the banner, e.g. `main · 3 changed` or
+/// `main · clean`. `sep` joins them (mode-aware). None outside a repo.
+pub fn git_status_line(dir: &Path, sep: &str) -> Option<String> {
+    if !in_git_repo(dir) {
+        return None;
+    }
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let changed = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+    let state = if changed == 0 {
+        "clean".to_string()
+    } else {
+        format!("{changed} changed")
+    };
+    Some(format!("{branch}{sep}{state}"))
+}
+
+/// Current branch name and whether the working tree is dirty, for the UI title.
+/// `None` when `dir` is not inside a git repo.
+/// Full SHA of HEAD, or None outside a repo / before the first commit.
+pub fn git_rev(dir: &Path) -> Option<String> {
+    let out = git_output(dir, &["rev-parse", "--verify", "HEAD"], 10).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// `git <args>` with captured stdout, for the TUI's /diff and /undo. Returns
+/// Err(stderr) on a non-zero exit.
+pub fn git_run(dir: &Path, args: &[&str], timeout_secs: u64) -> std::result::Result<String, String> {
+    match git_output(dir, args, timeout_secs) {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Undo picoder's own checkpoint commits made after `base` (and `/undo`'s
+/// reverts of them), newest first, as one new commit. Anything else committed
+/// in between is left alone. Returns how many commits were reverted (0 when
+/// there was nothing to undo). Refuses with staged changes, since the commit
+/// would sweep them in; on a conflict everything is put back as it was.
+pub fn revert_checkpoints_since(dir: &Path, base: &str) -> std::result::Result<usize, String> {
+    let log = git_run(dir, &["log", "--format=%H %s", &format!("{base}..HEAD")], 10)?;
+    let shas: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(_, subject)| subject.starts_with("picoder:") || subject.starts_with("Revert \"picoder:"))
+        .map(|(sha, _)| sha)
+        .collect();
+    if shas.is_empty() {
+        return Ok(0);
+    }
+    let staged_clean = |d: &Path| {
+        git_output(d, &["diff", "--cached", "--quiet"], 10).map(|o| o.status.success()).unwrap_or(false)
+    };
+    if !staged_clean(dir) {
+        return Err("you have staged changes; commit or unstage them first".into());
+    }
+    let mut args = vec!["revert", "--no-commit"];
+    args.extend(shas.iter().copied());
+    if let Err(e) = git_run(dir, &args, 60) {
+        let _ = git_run(dir, &["revert", "--abort"], 10);
+        return Err(e);
+    }
+    if staged_clean(dir) {
+        // The checkpoints cancel out (e.g. already undone): nothing to commit.
+        let _ = git_run(dir, &["revert", "--quit"], 10);
+        return Ok(0);
+    }
+    let msg = format!("picoder: rewind (reverted {} checkpoint(s))", shas.len());
+    let commit = |ident: bool| {
+        let mut a: Vec<&str> = Vec::new();
+        if ident {
+            a.extend(["-c", "user.name=picoder", "-c", "user.email=picoder@localhost"]);
+        }
+        a.extend(["commit", "--no-verify", "-m", &msg]);
+        git_run(dir, &a, 30)
+    };
+    match commit(false).or_else(|_| commit(true)) {
+        Ok(_) => Ok(shas.len()),
+        Err(e) => {
+            let _ = git_run(dir, &["revert", "--abort"], 10);
+            Err(e)
+        }
+    }
+}
+
+pub fn git_head(dir: &Path) -> Option<(String, bool)> {
+    if !in_git_repo(dir) {
+        return None;
+    }
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let dirty = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    Some((branch, dirty))
+}
+
+// ----------------------------------------------------------- grep/glob ------
+
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycache__", "dist", "build"];
+
+pub fn grep(pattern: &str, path: &str, ignore_case: bool) -> String {
+    let re = match regex::RegexBuilder::new(pattern).case_insensitive(ignore_case).build() {
+        Ok(r) => r,
+        Err(e) => return format!("ERROR: bad regex: {e}"),
+    };
+    let root = expand(if path.is_empty() { "." } else { path });
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_file() {
+        files.push(root);
+    } else if let Some(listed) = git_visible_files(&root) {
+        // Inside a repo, git's own list honors .gitignore (no node_modules,
+        // target, generated files); the same hidden/build-dir skips and cap
+        // as the walker apply on top.
+        let skipped = |f: &&PathBuf| {
+            f.strip_prefix(&root).unwrap_or(f).parent().is_some_and(|d| {
+                d.components().any(|c| {
+                    let n = c.as_os_str().to_string_lossy();
+                    SKIP_DIRS.contains(&n.as_ref()) || n.starts_with('.') && n.len() > 1
+                })
+            })
+        };
+        files.extend(listed.iter().filter(|f| !skipped(f)).filter(|f| f.is_file()).take(5000).cloned());
+    } else {
+        collect_files(&root, &mut files, 0);
+    }
+    let mut out = String::new();
+    let mut hits = 0usize;
+    'outer: for f in files {
+        let Ok(fh) = std::fs::File::open(&f) else { continue };
+        let mut buf = Vec::new();
+        if fh.take(1_000_000).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if buf.iter().take(1024).any(|&b| b == 0) {
+            continue; // binary
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let rel = f.display().to_string();
+        for (i, line) in text.lines().enumerate() {
+            if re.is_match(line) {
+                out.push_str(&format!("{}:{}: {}\n", rel, i + 1, line.trim_end()));
+                hits += 1;
+                if hits >= 200 {
+                    out.push_str("... (200+ matches, stopping)\n");
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        "(no matches)".into()
+    } else {
+        truncate(&out, MAX_TOOL_OUTPUT)
+    }
+}
+
+/// The files git shows under `dir` — tracked, plus untracked ones .gitignore
+/// doesn't exclude — joined onto `dir`. None outside a repo or without git.
+fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
+    let out = git_output(dir, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"], 20).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| dir.join(String::from_utf8_lossy(s).as_ref()))
+        .collect();
+    files.dedup();
+    Some(files)
+}
+
+/// Match a relative glob against git's file list (and the directories on it)
+/// instead of walking the tree, so ignored trees are neither searched nor
+/// returned. Same matching as `glob::glob`: `*` stops at `/`, `**` spans dirs.
+fn glob_in_repo(pattern: &str, cwd: &Path, listed: &[PathBuf]) -> std::result::Result<Vec<String>, String> {
+    let dotted = pattern.starts_with("./");
+    let pat = glob::Pattern::new(pattern.trim_start_matches("./")).map_err(|e| format!("ERROR: bad glob: {e}"))?;
+    let opts = glob::MatchOptions { case_sensitive: true, require_literal_separator: true, require_literal_leading_dot: false };
+    let mut seen = std::collections::BTreeSet::new();
+    for f in listed {
+        let Ok(rel) = f.strip_prefix(cwd) else { continue };
+        // The file itself and each directory above it are candidates.
+        for p in rel.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+            seen.insert(p.to_path_buf());
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .filter(|p| pat.matches_path_with(p, opts) && cwd.join(p).exists())
+        .take(500)
+        .map(|p| if dotted { format!("./{}", p.display()) } else { p.display().to_string() })
+        .collect())
+}
+
+/// Entries directly in `dir` that git ignores (dirs as `name/`), or None
+/// outside a repo.
+fn git_ignored_children(dir: &Path) -> Option<std::collections::HashSet<String>> {
+    let args = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"];
+    let out = git_output(dir, &args, 20).ok().filter(|o| o.status.success())?;
+    Some(
+        out.stdout
+            .split(|&b| b == 0)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter(|s| !s.is_empty() && !s.trim_end_matches('/').contains('/'))
+            .collect(),
+    )
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 12 || out.len() > 5000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') && name.len() > 1 {
+                continue;
+            }
+            collect_files(&path, out, depth + 1);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+pub fn glob_search(pattern: &str) -> String {
+    let mut matches: Vec<String> = Vec::new();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let relative = !pattern.starts_with(['/', '~']) && !pattern.split('/').any(|c| c == "..");
+    if let Some(listed) = relative.then(|| git_visible_files(&cwd)).flatten() {
+        match glob_in_repo(pattern, &cwd, &listed) {
+            Ok(m) => matches = m,
+            Err(e) => return e,
+        }
+    } else {
+        match glob::glob(pattern) {
+        Ok(paths) => {
+            for entry in paths.flatten() {
+                matches.push(entry.display().to_string());
+                if matches.len() >= 500 {
+                    break;
+                }
+            }
+        }
+        Err(e) => return format!("ERROR: bad glob: {e}"),
+        }
+    }
+    matches.sort();
+    if matches.is_empty() {
+        "(no files match)".into()
+    } else {
+        truncate(&matches.join("\n"), MAX_TOOL_OUTPUT)
+    }
+}
+
+// ------------------------------------------------------------- images -------
+
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+const IMAGE_MAX_BYTES: usize = 5_000_000;
+
+pub fn is_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Read an image file and return a `data:image/...;base64,...` URI.
+pub fn image_data_uri(path: &str) -> std::result::Result<String, String> {
+    let p = expand(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return Err(format!("ERROR: {path} is not a supported image (png/jpg/gif/webp)"));
+    }
+    let bytes = std::fs::read(&p).map_err(|e| format!("ERROR: {e}"))?;
+    if bytes.len() > IMAGE_MAX_BYTES {
+        return Err(format!("ERROR: {path} is too large ({} bytes; max 5MB)", bytes.len()));
+    }
+    let mime = if ext == "jpg" { "jpeg".to_string() } else { ext };
+    Ok(format!("data:image/{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// Standard base64 (no line wrapping). Kept tiny so we add no dependency.
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+// ----------------------------------------------------------- web_fetch ------
+
+/// Truncate `s` to at most `max_bytes`, snapping down to the nearest char
+/// boundary. `String::truncate` panics when the byte index splits a multibyte
+/// codepoint — common on real >2MB web pages — so callers go through here.
+fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
+/// Fetch a URL and return readable text. HTML is stripped to text; anything
+/// else (JSON, plain text, …) comes back as-is. Body capped at 2MB.
+pub fn web_fetch(http: &ureq::Agent, url: &str) -> String {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return "ERROR: url must start with http:// or https://".into();
+    }
+    let resp = http
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .set("Accept", "text/html, application/json, text/plain, */*")
+        .call();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return format!("ERROR: HTTP {code}: {}", truncate(&body, 500));
+        }
+        Err(e) => return format!("ERROR: {e}"),
+    };
+    let html = resp
+        .content_type()
+        .to_ascii_lowercase()
+        .contains("text/html");
+    // Use into_string() (not into_reader()) so ureq's timeout covers the body
+    // read — prevents slow-loris attacks where a server dribbles bytes.
+    let mut body = match resp.into_string() {
+        Ok(s) => s,
+        Err(e) => return format!("ERROR: read failed (binary?): {e}"),
+    };
+    truncate_to_char_boundary(&mut body, 2_000_000);
+    let text = if html { html_to_text(&body) } else { body };
+    let text = text.trim();
+    if text.is_empty() {
+        "(empty response)".into()
+    } else {
+        truncate(text, MAX_TOOL_OUTPUT)
+    }
+}
+
+/// Best-effort HTML → text: drop script/style/head, turn block-level closes
+/// into newlines, strip the remaining tags, decode common entities.
+fn html_to_text(html: &str) -> String {
+    // Lift regex construction into OnceLock statics so they compile once.
+    static BLOCKS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    static BREAKS: OnceLock<regex::Regex> = OnceLock::new();
+    static ANY_TAG: OnceLock<regex::Regex> = OnceLock::new();
+    let blocks = BLOCKS.get_or_init(|| {
+        ["script", "style", "head", "noscript", "svg"]
+            .iter()
+            .map(|tag| {
+                regex::RegexBuilder::new(&format!(r"<{tag}\b.*?</{tag}>"))
+                    .case_insensitive(true)
+                    .dot_matches_new_line(true)
+                    .build()
+                    .unwrap()
+            })
+            .collect()
+    });
+    let mut s = html.to_string();
+    for re in blocks {
+        s = re.replace_all(&s, " ").into_owned();
+    }
+    let breaks = BREAKS.get_or_init(|| {
+        regex::RegexBuilder::new(r"</(p|div|li|tr|h[1-6]|blockquote|pre)>|<br\s*/?>")
+            .case_insensitive(true)
+            .build()
+            .unwrap()
+    });
+    let s = breaks.replace_all(&s, "\n");
+    let tags = ANY_TAG.get_or_init(|| regex::Regex::new(r"<[^>]*>").unwrap());
+    let s = decode_entities(&tags.replace_all(&s, " "));
+    // Collapse runs of spaces and blank lines left behind by stripped markup.
+    let mut out = String::new();
+    let mut blank_run = 0;
+    for line in s.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ")
+}
+
+// ----------------------------------------------------------- web_search -----
+
+/// Where web_search goes. `"web_search"` in config/settings picks one
+/// (`searxng` / `brave` / `tavily` / `duckduckgo`); unset or `"auto"` takes the
+/// first that's configured — a `web_search_url` (SearXNG), TAVILY_API_KEY,
+/// BRAVE_API_KEY — and otherwise keyless DuckDuckGo. `web_search_key`
+/// stands in for the env key.
+#[derive(Debug, PartialEq)]
+enum SearchBackend {
+    Searxng(String),
+    Brave(String),
+    Tavily(String),
+    DuckDuckGo,
+}
+
+fn search_backend(
+    choice: Option<&str>,
+    url: Option<String>,
+    key: Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<SearchBackend, String> {
+    let need = |what: &str, v: Option<String>| v.ok_or(format!("ERROR: web_search is set to {what}"));
+    match choice.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "searxng" => Ok(SearchBackend::Searxng(need("searxng but web_search_url isn't set", url)?)),
+        "brave" => Ok(SearchBackend::Brave(need("brave but BRAVE_API_KEY isn't set", key.or_else(|| env("BRAVE_API_KEY")))?)),
+        "tavily" => {
+            Ok(SearchBackend::Tavily(need("tavily but TAVILY_API_KEY isn't set", key.or_else(|| env("TAVILY_API_KEY")))?))
+        }
+        "duckduckgo" | "ddg" => Ok(SearchBackend::DuckDuckGo),
+        _ => Ok(if let Some(u) = url {
+            SearchBackend::Searxng(u)
+        } else if let Some(k) = env("TAVILY_API_KEY") {
+            SearchBackend::Tavily(k)
+        } else if let Some(k) = env("BRAVE_API_KEY") {
+            SearchBackend::Brave(k)
+        } else {
+            SearchBackend::DuckDuckGo
+        }),
+    }
+}
+
+/// Search the web and return numbered "title / url / snippet" rows.
+pub fn web_search(http: &ureq::Agent, query: &str) -> String {
+    if query.trim().is_empty() {
+        return "ERROR: empty query".into();
+    }
+    let s = |k: &str| crate::config::setting(k).and_then(|v| v.as_str().map(str::to_string)).filter(|v| !v.trim().is_empty());
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let backend = match search_backend(s("web_search").as_deref(), s("web_search_url"), s("web_search_key"), env) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let q = urlencode(query);
+    let get = |url: &str| http.get(url).timeout(Duration::from_secs(30)).set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) picoder/0.3");
+    let (name, resp) = match &backend {
+        SearchBackend::Searxng(base) => {
+            ("SearXNG", get(&format!("{}/search?q={q}&format=json", base.trim_end_matches('/'))).call())
+        }
+        SearchBackend::Brave(key) => (
+            "Brave",
+            get(&format!("https://api.search.brave.com/res/v1/web/search?q={q}&count=8"))
+                .set("Accept", "application/json")
+                .set("X-Subscription-Token", key)
+                .call(),
+        ),
+        SearchBackend::Tavily(key) => (
+            "Tavily",
+            http.post("https://api.tavily.com/search")
+                .timeout(Duration::from_secs(30))
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Content-Type", "application/json")
+                .send_string(&serde_json::json!({ "query": query, "max_results": 8 }).to_string()),
+        ),
+        SearchBackend::DuckDuckGo => ("DuckDuckGo", get(&format!("https://html.duckduckgo.com/html/?q={q}")).call()),
+    };
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let hint = match (code, &backend) {
+                (403, SearchBackend::Searxng(_)) => " (enable the json format in the instance's settings.yml)",
+                (401 | 403, _) => " (check the API key)",
+                (429, _) => " (rate limited; try again shortly)",
+                _ => "",
+            };
+            let _ = r.into_string();
+            return format!("ERROR: {name} search returned HTTP {code}{hint}");
+        }
+        Err(e) => return format!("ERROR: {name} search failed: {e}"),
+    };
+    // DuckDuckGo answers a rate-limited client with 202 and a bot check.
+    let status = resp.status();
+    // into_string() keeps ureq's deadline so a slow server can't hang us.
+    let mut body = resp.into_string().unwrap_or_default();
+    truncate_to_char_boundary(&mut body, 2_000_000);
+    match backend {
+        SearchBackend::DuckDuckGo if status == 202 || ddg_blocked(&body) => DDG_BLOCKED.to_string(),
+        SearchBackend::DuckDuckGo => parse_ddg(&body),
+        SearchBackend::Searxng(_) => format_hits(name, parse_json_hits(&body, "/results", "content")),
+        SearchBackend::Tavily(_) => format_hits(name, parse_json_hits(&body, "/results", "content")),
+        SearchBackend::Brave(_) => format_hits(name, parse_json_hits(&body, "/web/results", "description")),
+    }
+}
+
+const DDG_BLOCKED: &str = "ERROR: DuckDuckGo is rate-limiting this connection with a bot check, so there are no \
+results. Wait a few minutes, or configure another search backend: \"web_search_url\" (a SearXNG \
+instance), BRAVE_API_KEY or TAVILY_API_KEY.";
+
+/// DuckDuckGo's anomaly / bot-check page instead of results.
+fn ddg_blocked(html: &str) -> bool {
+    ["anomaly-modal", "anomaly.js", "bots use DuckDuckGo too", "challenge-form"].iter().any(|m| html.contains(m))
+}
+
+/// (title, url, snippet) rows from a JSON search response: the array at
+/// `pointer`, each item's `title` / `url` and `snippet_key` text.
+fn parse_json_hits(body: &str, pointer: &str, snippet_key: &str) -> std::result::Result<Vec<(String, String, String)>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "the response wasn't JSON (for SearXNG, enable the json format)".to_string())?;
+    let items = v.pointer(pointer).and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    Ok(items
+        .iter()
+        .filter_map(|it| {
+            let s = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let url = s("url");
+            (!url.is_empty()).then(|| (clean_inline(&s("title")), url, clean_inline(&s(snippet_key))))
+        })
+        .take(8)
+        .collect())
+}
+
+fn format_hits(name: &str, hits: std::result::Result<Vec<(String, String, String)>, String>) -> String {
+    let hits = match hits {
+        Ok(h) => h,
+        Err(e) => return format!("ERROR: {name} search: {e}"),
+    };
+    if hits.is_empty() {
+        return format!("(no results from {name})");
+    }
+    let mut out = String::new();
+    for (i, (title, url, snippet)) in hits.iter().enumerate() {
+        out.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+        if !snippet.is_empty() {
+            out.push_str(&format!("   {snippet}\n"));
+        }
+    }
+    truncate(&out, MAX_TOOL_OUTPUT)
+}
+
+fn parse_ddg(html: &str) -> String {
+    let re = |p: &str| {
+        regex::RegexBuilder::new(p)
+            .case_insensitive(true)
+            .dot_matches_new_line(true)
+            .build()
+            .unwrap()
+    };
+    // Match DDG result links — look for uddg= redirect URLs (the stable
+    // structural element) and extract the anchor text as title.  This is
+    // more robust than depending on specific class names.
+    let link_re = re(r#"<a[^>]*href="[^"]*uddg=[^"]*"[^>]*>(.*?)</a>"#);
+    // For snippets, try any element whose class contains "snippet".
+    let snip_re = re(r#"class="[^"]*snippet[^"]*"[^>]*>(.*?)</(?:a|td|div|span)>"#);
+    let snippets: Vec<String> = snip_re
+        .captures_iter(html)
+        .map(|c| clean_inline(&c[1]))
+        .collect();
+    let mut out = String::new();
+    for (i, c) in link_re.captures_iter(html).take(8).enumerate() {
+        let title = clean_inline(&c[1]);
+        // Extract uddg= value from the full match.
+        let full = &c[0];
+        let href_start = full.find("uddg=").map(|p| p + 5).unwrap_or(0);
+        let href_rest = &full[href_start..];
+        let href_end = href_rest.find('"').unwrap_or(href_rest.len());
+        let encoded = &href_rest[..href_end];
+        // The uddg value ends at the next query param (`&rut=…`); keep only the
+        // encoded destination so the URL doesn't carry a tracking suffix.
+        let encoded = &encoded[..encoded.find('&').unwrap_or(encoded.len())];
+        out.push_str(&format!("{}. {title}\n   {}\n", i + 1, urldecode(encoded)));
+        if let Some(s) = snippets.get(i) {
+            if !s.is_empty() {
+                out.push_str(&format!("   {s}\n"));
+            }
+        }
+    }
+    if out.is_empty() {
+        "(no results — DuckDuckGo may have changed its output format)".into()
+    } else {
+        truncate(&out, MAX_TOOL_OUTPUT)
+    }
+}
+
+/// DDG result hrefs are redirects like `//duckduckgo.com/l/?uddg=<encoded>&…`;
+/// pull out and decode the real destination.
+#[cfg(test)]
+fn resolve_ddg_url(href: &str) -> String {
+    if let Some(pos) = href.find("uddg=") {
+        let rest = &href[pos + 5..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        return urldecode(&rest[..end]);
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        href.to_string()
+    }
+}
+
+/// Strip tags and entities from an inline HTML fragment, collapsing whitespace.
+fn clean_inline(s: &str) -> String {
+    static ANY_TAG: OnceLock<regex::Regex> = OnceLock::new();
+    let tags = ANY_TAG.get_or_init(|| regex::Regex::new(r"<[^>]*>").unwrap());
+    decode_entities(&tags.replace_all(s, ""))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// --------------------------------------------------------------- todo -------
+
+/// Format the model's plan as a checklist. The returned string is both the
+/// tool result (so the model sees the current plan) and the transcript view.
+pub fn todo(items: &serde_json::Value) -> String {
+    let Some(arr) = items.as_array() else {
+        return "ERROR: items must be an array of {text, status}".into();
+    };
+    if arr.is_empty() {
+        return "(plan cleared)".into();
+    }
+    let mut out = String::new();
+    for it in arr {
+        let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let mark = match it.get("status").and_then(|v| v.as_str()).unwrap_or("pending") {
+            "completed" => "[x]",
+            "in_progress" => "[>]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("{mark} {text}\n"));
+    }
+    out.trim_end().to_string()
+}
+
+// ------------------------------------------------------------- memory -------
+//
+// memory.md holds one note per line: `- note` is global (a fact about the user,
+// true in every project), `- [/abs/dir] note` belongs to that directory and is
+// only shown in sessions there or below. Notes used to be global only, so a
+// demo's "picoder project: … at ./index.html" was injected everywhere and the
+// model went looking for a `picoder/` folder that never existed.
+
+/// The line `remember` appends: tagged with `scope` unless the note is global.
+fn memory_line(note: &str, scope: Option<&Path>) -> String {
+    match scope {
+        Some(dir) => format!("- [{}] {note}", dir.display()),
+        None => format!("- {note}"),
+    }
+}
+
+/// The notes visible from `cwd`, untagged: every global note plus the ones
+/// scoped to `cwd` or a directory above it.
+fn visible_notes(content: &str, cwd: &Path) -> Vec<String> {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let Some(rest) = line.strip_prefix("- [") else {
+                return Some(line.to_string());
+            };
+            let (dir, note) = rest.split_once("] ")?;
+            cwd.starts_with(dir).then(|| format!("- {note}"))
+        })
+        .collect()
+}
+
+fn notes_here() -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(memory_path()).ok()?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let notes = visible_notes(&content, &cwd);
+    (!notes.is_empty()).then_some(notes)
+}
+
+pub fn remember(note: &str, global: bool) -> String {
+    if let Err(e) = std::fs::create_dir_all(config_dir()) {
+        return format!("ERROR: {e}");
+    }
+    use std::io::Write;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let line = memory_line(note, (!global).then_some(cwd.as_path()));
+    let path = memory_path();
+    // Advisory lockfile to prevent concurrent instances from interleaving
+    // appends. create_new is atomic — only one process can own the lock at once.
+    let lock = path.with_extension("md.lock");
+    if let Err(e) = lock_acquire(&lock) {
+        return format!("ERROR: lock busy — another picoder is writing memory: {e}");
+    }
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    let _ = std::fs::remove_file(&lock);
+    match res {
+        Ok(()) if global => format!("OK remembered (all projects): {note}"),
+        Ok(()) => format!("OK remembered (for {}): {note}", cwd.display()),
+        Err(e) => format!("ERROR: {e}"),
+    }
+}
+
+/// Acquire a lockfile with exponential backoff (up to ~500ms). Returns Ok(())
+/// or the last error from create_new.
+fn lock_acquire(lock_path: &std::path::Path) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(10);
+    loop {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(lock_path)
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A lock left behind by a killed process (or a power cut — the
+                // SD-card scenario this codebase designs for) would otherwise
+                // break `remember` forever; an append takes milliseconds, so a
+                // lock older than a few seconds is stale.
+                let stale = std::fs::metadata(lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age > std::time::Duration::from_secs(10))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(lock_path);
+                    continue;
+                }
+                if delay > std::time::Duration::from_millis(200) {
+                    return Err(e);
+                }
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+pub fn recall(query: Option<&str>) -> String {
+    let Some(notes) = notes_here() else {
+        return "(no memories yet)".into();
+    };
+    match query {
+        Some(q) if !q.is_empty() => {
+            let ql = q.to_lowercase();
+            let filtered: Vec<&str> = notes
+                .iter()
+                .map(String::as_str)
+                .filter(|l| l.to_lowercase().contains(&ql))
+                .collect();
+            if filtered.is_empty() {
+                format!("(no memories matching '{q}')")
+            } else {
+                filtered.join("\n")
+            }
+        }
+        _ => notes.join("\n"),
+    }
+}
+
+/// The memory this directory's sessions see (global notes + its own).
+pub fn load_memory() -> Result<Option<String>> {
+    Ok(notes_here().map(|n| n.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A demo directory's note showed up in every session everywhere, and the
+    /// model went hunting for the "picoder project" it described.
+    #[test]
+    fn project_notes_stay_in_their_directory() {
+        let demo = Path::new("/Users/me/Developer/test");
+        let content = [
+            memory_line("prefers terse answers", None),
+            memory_line("WebGL demo in ./index.html", Some(demo)),
+            memory_line("Rust CLI", Some(Path::new("/Users/me/Developer/picoder"))),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            visible_notes(&content, demo),
+            ["- prefers terse answers", "- WebGL demo in ./index.html"]
+        );
+        assert_eq!(
+            visible_notes(&content, &demo.join("src")),
+            ["- prefers terse answers", "- WebGL demo in ./index.html"],
+            "a subdirectory sees its project's notes"
+        );
+        assert_eq!(
+            visible_notes(&content, Path::new("/Users/me/Developer/testing")),
+            ["- prefers terse answers"],
+            "a sibling that shares a name prefix does not"
+        );
+    }
+
+    #[test]
+    fn html_to_text_strips_markup() {
+        let html = "<html><head><title>T</title><style>x{color:red}</style></head>\
+                    <body><script>var a=1;</script><h1>Hello</h1>\
+                    <p>World &amp; friends</p><ul><li>one</li><li>two</li></ul></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World & friends"));
+        assert!(text.contains("one"));
+        assert!(!text.contains("var a"));
+        assert!(!text.contains('<'));
+    }
+
+    #[test]
+    fn web_fetch_rejects_non_http() {
+        let http = crate::api::agent_http();
+        assert!(web_fetch(&http, "file:///etc/passwd").starts_with("ERROR"));
+        assert!(web_fetch(&http, "ftp://x").starts_with("ERROR"));
+    }
+
+    #[test]
+    fn url_encode_decode_roundtrip() {
+        let s = "rust ureq & \"tools\" ~/.config";
+        assert_eq!(urldecode(&urlencode(s)), s);
+        assert_eq!(urlencode("a b"), "a+b");
+        assert_eq!(urldecode("https%3A%2F%2Fexample.com%2Fx"), "https://example.com/x");
+    }
+
+    #[test]
+    fn ddg_redirect_resolution() {
+        assert_eq!(
+            resolve_ddg_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&rut=abc"),
+            "https://example.com/docs"
+        );
+        assert_eq!(resolve_ddg_url("https://direct.example.com"), "https://direct.example.com");
+    }
+
+    #[test]
+    fn ddg_parse_fixture() {
+        let html = r#"<div class="result"><h2 class="result__title">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=x">Example <b>Domain</b></a></h2>
+            <a class="result__snippet" href="x">This domain is for use in &amp;c.</a></div>"#;
+        let out = parse_ddg(html);
+        assert!(out.contains("1. Example Domain"), "got: {out}");
+        assert!(out.contains("https://example.com/"));
+        // The redirect's trailing tracking param (&rut=…) must be stripped.
+        assert!(!out.contains("rut"), "tracking suffix leaked into url: {out}");
+        assert!(out.contains("This domain is for use in &c."));
+    }
+
+    #[test]
+    fn todo_formats_checklist() {
+        let items = serde_json::json!([
+            {"text": "explore", "status": "completed"},
+            {"text": "edit", "status": "in_progress"},
+            {"text": "test"},
+        ]);
+        assert_eq!(todo(&items), "[x] explore\n[>] edit\n[ ] test");
+        assert!(todo(&serde_json::json!("nope")).starts_with("ERROR"));
+    }
+
+    #[test]
+    fn multi_edit_composes_same_file() {
+        let dir = std::env::temp_dir().join(format!("picoder_multi_edit_test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "one two three\n").unwrap();
+        std::fs::write(&b, "hello world\n").unwrap();
+        let edits = vec![
+            EditReq { path: a.to_string_lossy().into(), old_text: "one".into(), new_text: "1".into() },
+            // Second edit to the same file sees the result of the first.
+            EditReq { path: a.to_string_lossy().into(), old_text: "1 two".into(), new_text: "1 2".into() },
+            EditReq { path: b.to_string_lossy().into(), old_text: "world".into(), new_text: "there".into() },
+        ];
+        let plan = multi_edit_plan(&edits).expect("plan ok");
+        assert_eq!(plan.files.len(), 2);
+        let a_final = &plan.files.iter().find(|(p, _)| p.contains("a.txt")).unwrap().1;
+        assert_eq!(a_final, "1 2 three\n");
+        // Apply and confirm disk matches.
+        for (p, c) in &plan.files {
+            apply_write(p, c);
+        }
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "1 2 three\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "hello there\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_edit_aborts_on_missing_match() {
+        let dir = std::env::temp_dir().join(format!("picoder_multi_edit_abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "keep me\n").unwrap();
+        let edits = vec![
+            EditReq { path: a.to_string_lossy().into(), old_text: "keep".into(), new_text: "KEEP".into() },
+            EditReq { path: a.to_string_lossy().into(), old_text: "absent".into(), new_text: "x".into() },
+        ];
+        assert!(multi_edit_plan(&edits).is_err());
+        // Nothing applied — file unchanged.
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "keep me\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edits_match_raw_text_first_and_only_normalize_as_a_fallback() {
+        // Decomposed "é" (e + U+0301) elsewhere in the file must survive an
+        // unrelated edit untouched.
+        let data = "caf\u{65}\u{301} au lait\nfoo = 1\n";
+        let out = splice_edit(data, "foo = 1", "foo = 2", "").unwrap();
+        assert_eq!(out, "caf\u{65}\u{301} au lait\nfoo = 2\n");
+        // Composed old_text against a decomposed file still matches (fallback).
+        let out = splice_edit(data, "caf\u{e9}", "tea", "").unwrap();
+        assert!(out.starts_with("tea au lait"));
+        assert!(splice_edit(data, "nope", "x", "").unwrap_err().contains("not found"));
+        assert!(splice_edit("a a", "a", "b", "").unwrap_err().contains("2 times"));
+        assert!(splice_edit(data, "foo", "foo", "").unwrap_err().contains("identical"));
+    }
+
+    #[test]
+    fn multi_edit_treats_two_spellings_of_one_file_as_one_file() {
+        let dir = std::env::temp_dir().join(format!("picoder-me-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "one two three\n").unwrap();
+        let spelled = format!("{}/./a.txt", dir.display());
+        let plan = multi_edit_plan(&[
+            EditReq { path: f.to_string_lossy().into_owned(), old_text: "one".into(), new_text: "1".into() },
+            EditReq { path: spelled, old_text: "three".into(), new_text: "3".into() },
+        ])
+        .unwrap();
+        assert_eq!(plan.files.len(), 1, "one file, both edits");
+        assert_eq!(plan.files[0].1, "1 two 3\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_edit_and_apply_write_refuse_symlinks() {
+        let dir = std::env::temp_dir().join(format!("picoder-me-ln-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, "hello\n").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = multi_edit_plan(&[EditReq { path: link.to_string_lossy().into_owned(), old_text: "hello".into(), new_text: "bye".into() }])
+            .unwrap_err();
+        assert!(err.starts_with("DENIED"), "{err}");
+        let r = apply_write(link.to_str().unwrap(), "bye\n");
+        assert!(r.starts_with("DENIED"), "{r}");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "hello\n", "the target is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_file_reports_bad_ranges_instead_of_an_empty_file() {
+        let dir = std::env::temp_dir().join(format!("picoder-rf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("r.txt");
+        std::fs::write(&f, "a\nb\nc\n").unwrap();
+        let p = f.to_str().unwrap();
+        assert!(read_file(p, Some(10), None).starts_with("ERROR: start_line 10 is beyond"));
+        assert!(read_file(p, Some(3), Some(2)).starts_with("ERROR: end_line 2 is before"));
+        assert!(read_file(p, Some(2), Some(2)).contains("    2\tb"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_autocommit_leaves_the_users_own_staged_changes_alone() {
+        let dir = std::env::temp_dir().join(format!("picoder-ac-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "init"]);
+        // The user has staged their own work-in-progress...
+        std::fs::write(dir.join("mine.txt"), "wip").unwrap();
+        git(&["add", "mine.txt"]);
+        // ...and picoder edits a different file.
+        let edited = dir.join("edited.txt");
+        std::fs::write(&edited, "hello").unwrap();
+        let note = git_autocommit(&dir, &[edited.to_string_lossy().into_owned()], "picoder: edit edited.txt");
+        assert!(note.contains("[committed"), "{note}");
+        let files = git(&["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(files.trim(), "edited.txt", "only picoder's file is in the checkpoint");
+        assert_eq!(git(&["diff", "--cached", "--name-only"]), "mine.txt", "the user's staging survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_autocommit_checkpoints_edit() {
+        let dir = std::env::temp_dir().join(format!("picoder_git_test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap()
+        };
+        if !git(&["init", "-q"]).status.success() {
+            return; // no git available; skip
+        }
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        assert!(in_git_repo(&dir));
+        let f = dir.join("x.txt");
+        std::fs::write(&f, "hi\n").unwrap();
+        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: write x.txt");
+        assert!(note.contains("committed"), "got: {note:?}");
+        // A second call with no change commits nothing.
+        let note2 = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: noop");
+        assert!(note2.is_empty(), "got: {note2:?}");
+        let log = git(&["log", "--oneline"]);
+        assert!(String::from_utf8_lossy(&log.stdout).contains("write x.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bump_cargo_version_increments_patch() {
+        let dir = std::env::temp_dir().join(format!("picoder_bump_test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = dir.join("Cargo.toml");
+        std::fs::write(&toml, "[package]\nname = \"t\"\nversion = \"3.14.159\"\nedition = \"2021\"\n").unwrap();
+        let new = bump_cargo_version(&dir).expect("bump should succeed");
+        assert_eq!(new, "3.14.160");
+        let content = std::fs::read_to_string(&toml).unwrap();
+        assert!(content.contains("version = \"3.14.160\""));
+        // Bump again.
+        let new2 = bump_cargo_version(&dir).expect("second bump");
+        assert_eq!(new2, "3.14.161");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The failures seen with a local Qwen (2026-10-06): old_text indented two
+    /// spaces too deep, with a whitespace-only blank line, from mistaking
+    /// read_file's separator for indentation.
+    #[test]
+    fn edit_tolerates_wrong_indentation_and_reindents_the_new_text() {
+        let data = "function frame(now) {\n    const dt = 1;\n    if (x) y();\n\n    gl.draw();\n  }\n";
+        let old = "      const dt = 1;\n      if (x) y();\n  \n      gl.draw();\n    }";
+        let new = "      const dt = 1;\n      if (x) y();\n\n      const d = 2;\n      gl.draw();\n    }";
+        assert_eq!(
+            splice_edit(data, old, new, "").unwrap(),
+            "function frame(now) {\n    const dt = 1;\n    if (x) y();\n\n    const d = 2;\n    gl.draw();\n  }\n",
+            "matched despite the indentation, and the new lines use the file's"
+        );
+    }
+
+    /// The other slip seen live: a space dropped inside a line.
+    /// From a live session: one no-op edit in a batch of six used to reject
+    /// the whole batch.
+    #[test]
+    fn multi_edit_skips_a_no_op_edit() {
+        let dir = std::env::temp_dir().join(format!("picoder_noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+        let path = f.to_string_lossy().into_owned();
+        let req = |o: &str, n: &str| EditReq { path: path.clone(), old_text: o.into(), new_text: n.into() };
+        let plan = multi_edit_plan(&[req("one", "ONE"), req("two", "two")]).unwrap();
+        assert_eq!(plan.files[0].1, "ONE\ntwo\n");
+        assert!(multi_edit_plan(&[req("two", "two")]).unwrap_err().contains("every edit"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_tolerates_a_space_dropped_mid_line() {
+        let data = "  if (u_scene == 1) {\n    // ----- Menger: subdivision with continuous min -----\n    vec3 q = p;\n  }\n";
+        let old = "  if (u_scene == 1) {\n    // ----- Menger: subdivision with continuous min-----\n    vec3 q = p;";
+        let new = "  if (u_scene == 1) {\n    // ----- Menger: subdivision with continuous min-----\n    vec3 q = p * 2.0;";
+        let out = splice_edit(data, old, new, "").unwrap();
+        assert!(out.contains("vec3 q = p * 2.0;") && out.ends_with("  }\n"), "{out}");
+    }
+
+    #[test]
+    fn edit_strips_line_numbers_copied_from_read_file() {
+        let data = "a\n    const dt = 1;\n    go();\nz\n";
+        let old = "    2\t    const dt = 1;\n    3\t    go();";
+        let new = "    2\t    const dt = 2;\n    3\t    go();";
+        assert_eq!(splice_edit(data, old, new, "").unwrap(), "a\n    const dt = 2;\n    go();\nz\n");
+    }
+
+    #[test]
+    fn loose_matching_keeps_crlf_and_refuses_ambiguity() {
+        let crlf = "if (a) {\r\n  x();\r\n}\r\n";
+        assert_eq!(splice_edit(crlf, "    x();", "    y();", "").unwrap(), "if (a) {\r\n  y();\r\n}\r\n");
+        // Two blocks that differ only by indentation: no guessing which.
+        let twice = "  call();\n    call();\n";
+        let err = splice_edit(twice, "\tcall();", "done();", "").unwrap_err();
+        assert!(err.contains("2 places"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_edit_shows_the_closest_real_lines() {
+        let data = "one\n  let a = 1;\n  let b = 2;\n  let c = 3;\nfour\n";
+        let err = splice_edit(data, "  let a = 1;\n  let b = 20;\n  let c = 3;", "x", "").unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        assert!(err.contains("Closest match, lines 2-4 (2 of 3"), "{err}");
+        assert!(err.contains("    3\t  let b = 2;"), "real text, numbered like read_file: {err}");
+        let none = splice_edit(data, "nothing like it", "x", "").unwrap_err();
+        assert!(none.contains("re-read the file"), "{none}");
+    }
+
+    #[test]
+    fn search_tools_honor_gitignore_in_a_repo() {
+        let dir = std::env::temp_dir().join(format!("picoder-gi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["src", "target/debug", "vendor"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\nvendor/\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.join("new.rs"), "// needle, untracked but not ignored\n").unwrap();
+        std::fs::write(dir.join("target/debug/gen.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.join("vendor/dep.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.join("run.log"), "needle\n").unwrap();
+        git(&["add", "src/lib.rs", ".gitignore"]);
+
+        let g = grep("needle", &dir.to_string_lossy(), false);
+        assert!(g.contains("src/lib.rs") && g.contains("new.rs"), "{g}");
+        assert!(!g.contains("target/") && !g.contains("vendor/") && !g.contains("run.log"), "ignored files searched: {g}");
+
+        let listed = git_visible_files(&dir).unwrap();
+        let rs = glob_in_repo("**/*.rs", &dir, &listed).unwrap();
+        assert_eq!(rs, ["new.rs", "src/lib.rs"]);
+        assert_eq!(glob_in_repo("./src/*", &dir, &listed).unwrap(), ["./src/lib.rs"]);
+        assert_eq!(glob_in_repo("s*", &dir, &listed).unwrap(), ["src"], "directories match too");
+        assert!(glob_in_repo("[", &dir, &listed).unwrap_err().contains("bad glob"));
+
+        let ls = list_files(&dir.to_string_lossy());
+        assert!(ls.contains("src/") && ls.contains("new.rs"), "{ls}");
+        assert!(!ls.lines().any(|l| l == "target/" || l == "vendor/" || l == "run.log"), "{ls}");
+        let last = ls.lines().last().unwrap();
+        assert!(last.starts_with("(3 git-ignored not shown:") && last.contains("target/"), "{ls}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn web_search_backend_is_picked_by_setting_or_available_key() {
+        let none = |_: &str| None::<String>;
+        let tavily = |k: &str| (k == "TAVILY_API_KEY").then(|| "tk".to_string());
+        assert_eq!(search_backend(None, None, None, none), Ok(SearchBackend::DuckDuckGo));
+        assert_eq!(search_backend(Some("auto"), None, None, tavily), Ok(SearchBackend::Tavily("tk".into())));
+        assert_eq!(
+            search_backend(None, Some("https://sx.local".into()), None, tavily),
+            Ok(SearchBackend::Searxng("https://sx.local".into())),
+            "a configured SearXNG wins in auto"
+        );
+        assert_eq!(search_backend(Some("Brave"), None, Some("bk".into()), none), Ok(SearchBackend::Brave("bk".into())));
+        assert!(search_backend(Some("brave"), None, None, none).unwrap_err().contains("BRAVE_API_KEY"));
+        assert!(search_backend(Some("searxng"), None, None, none).unwrap_err().contains("web_search_url"));
+        assert_eq!(search_backend(Some("ddg"), None, None, tavily), Ok(SearchBackend::DuckDuckGo));
+    }
+
+    #[test]
+    fn search_responses_parse_per_backend() {
+        let searx = r#"{"query":"rust","results":[{"title":"The Rust Book","url":"https://doc.rust-lang.org/book/","content":"Learn Rust."},{"title":"no url"}]}"#;
+        let out = format_hits("SearXNG", parse_json_hits(searx, "/results", "content"));
+        assert_eq!(out, "1. The Rust Book\n   https://doc.rust-lang.org/book/\n   Learn Rust.\n");
+        let brave = r#"{"web":{"results":[{"title":"Rust &amp; Cargo","url":"https://rust-lang.org","description":"A <strong>language</strong> empowering everyone"}]}}"#;
+        let out = format_hits("Brave", parse_json_hits(brave, "/web/results", "description"));
+        assert!(out.contains("1. Rust & Cargo") && out.contains("A language empowering everyone"), "{out}");
+        let tavily = r#"{"results":[{"title":"T","url":"https://t.example","content":"snippet","score":0.9}]}"#;
+        assert!(format_hits("Tavily", parse_json_hits(tavily, "/results", "content")).starts_with("1. T\n   https://t.example"));
+        assert_eq!(format_hits("Brave", parse_json_hits(r#"{"web":{"results":[]}}"#, "/web/results", "description")), "(no results from Brave)");
+        let html = format_hits("SearXNG", parse_json_hits("<html>no json</html>", "/results", "content"));
+        assert!(html.starts_with("ERROR: SearXNG search:") && html.contains("json format"), "{html}");
+    }
+
+    #[test]
+    fn duckduckgo_bot_check_is_reported_not_swallowed() {
+        let page = r#"<html><body><div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div><form id="challenge-form"></form></body></html>"#;
+        assert!(ddg_blocked(page));
+        assert!(!ddg_blocked(r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com">Ex</a>"#));
+        assert!(DDG_BLOCKED.contains("rate-limiting") && DDG_BLOCKED.contains("web_search_url"));
+    }
+
+    #[test]
+    fn rewind_reverts_only_picoders_checkpoints() {
+        let dir = std::env::temp_dir().join(format!("picoder-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let commit = |msg: &str| git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", msg]);
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        commit("init");
+        let base = git(&["rev-parse", "HEAD"]);
+        // Two picoder checkpoints with the user's own commit in between.
+        std::fs::write(dir.join("a.txt"), "picoder 1\n").unwrap();
+        commit("picoder: edit a.txt");
+        std::fs::write(dir.join("b.txt"), "mine\n").unwrap();
+        commit("user: my change");
+        std::fs::write(dir.join("a.txt"), "picoder 2\n").unwrap();
+        commit("picoder: edit a.txt");
+
+        assert_eq!(revert_checkpoints_since(&dir, &base), Ok(2));
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+        assert_eq!(read("a.txt"), "base\n", "picoder's edits are undone");
+        assert_eq!(read("b.txt"), "mine\n", "the user's commit is kept");
+        assert!(git(&["log", "-1", "--format=%s"]).starts_with("picoder: rewind"));
+        // Rewinding again to the same point has nothing left to undo.
+        assert_eq!(revert_checkpoints_since(&dir, &git(&["rev-parse", "HEAD"])), Ok(0));
+
+        // Staged work of the user's own blocks a rewind instead of being swept in.
+        std::fs::write(dir.join("a.txt"), "picoder 3\n").unwrap();
+        commit("picoder: edit a.txt");
+        std::fs::write(dir.join("b.txt"), "staged\n").unwrap();
+        git(&["add", "b.txt"]);
+        assert!(revert_checkpoints_since(&dir, &base).is_err());
+        assert_eq!(read("a.txt"), "picoder 3\n", "nothing changed on refusal");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bump_cargo_version_only_touches_the_package_table() {
+        let dir = std::env::temp_dir().join(format!("picoder_bump_tables-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml = dir.join("Cargo.toml");
+        // A dependency table ahead of [package] has the same `version = ` shape.
+        std::fs::write(
+            &toml,
+            "[dependencies.serde]\nversion = \"1.0.200\"\n\n[package] # the crate\nname = \"t\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(bump_cargo_version(&dir).as_deref(), Some("0.1.1"));
+        let content = std::fs::read_to_string(&toml).unwrap();
+        assert!(content.contains("version = \"1.0.200\""), "dependency untouched: {content}");
+        assert!(content.contains("version = \"0.1.1\""));
+        // A workspace root has no [package] version to bump.
+        std::fs::write(&toml, "[workspace.package]\nversion = \"2.0.0\"\n").unwrap();
+        assert!(bump_cargo_version(&dir).is_none());
+        assert!(std::fs::read_to_string(&toml).unwrap().contains("\"2.0.0\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bump_cargo_version_no_cargo_toml() {
+        let dir = std::env::temp_dir().join(format!("picoder_bump_nocargo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(bump_cargo_version(&dir).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_autocommit_bumps_version() {
+        let dir = std::env::temp_dir().join(format!("picoder_git_bump_test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap()
+        };
+        if !git(&["init", "-q"]).status.success() {
+            std::fs::remove_dir_all(&dir).ok();
+            return; // no git available; skip
+        }
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let toml = dir.join("Cargo.toml");
+        std::fs::write(&toml, "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        // Initial commit so the repo has a HEAD.
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-q", "-m", "init"]);
+        // Now edit a file and autocommit.
+        let f = dir.join("x.txt");
+        std::fs::write(&f, "hi\n").unwrap();
+        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "picoder: write x.txt");
+        assert!(note.contains("committed"), "got: {note:?}");
+        assert!(note.contains("version → 0.1.1"), "got: {note:?}");
+        let content = std::fs::read_to_string(&toml).unwrap();
+        assert!(content.contains("version = \"0.1.1\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn base64_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // A non-UTF8 byte sequence (real image data isn't text).
+        assert_eq!(base64_encode(&[0xff, 0xd8, 0xff]), "/9j/");
+    }
+
+    #[test]
+    fn image_path_detection_and_uri() {
+        assert!(is_image_path("shot.PNG"));
+        assert!(is_image_path("a/b/diagram.jpeg"));
+        assert!(!is_image_path("notes.txt"));
+        assert!(!is_image_path("Makefile"));
+        // jpg maps to the image/jpeg mime.
+        let dir = std::env::temp_dir().join(format!("picoder_img_test-{}.jpg", std::process::id()));
+        std::fs::write(&dir, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        let uri = image_data_uri(dir.to_str().unwrap()).unwrap();
+        assert!(uri.starts_with("data:image/jpeg;base64,/9j/"), "got: {uri}");
+        std::fs::remove_file(&dir).ok();
+        assert!(image_data_uri("nope.png").unwrap_err().starts_with("ERROR"));
+    }
+
+    #[test]
+    fn background_job_lifecycle() {
+        let cwd = std::env::temp_dir();
+        let start = bash_background("echo hello; sleep 30", &cwd);
+        assert!(start.contains("Started background job"), "got: {start}");
+        let id: u64 = start
+            .split_whitespace()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .expect("job id in start message");
+        std::thread::sleep(Duration::from_millis(300));
+        let out = bash_output(id);
+        assert!(out.contains("hello"), "got: {out}");
+        assert!(out.contains("[running]"), "got: {out}");
+        // Second poll returns only new output.
+        let out2 = bash_output(id);
+        assert!(out2.contains("(no new output)"), "got: {out2}");
+        let killed = bash_kill(id);
+        assert!(killed.contains("killed job"), "got: {killed}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(bash_output(id).contains("[exited"), "job should be dead");
+        assert!(bash_output(999).starts_with("ERROR"));
+    }
+
+    #[test]
+    fn bash_cancel_interrupts_long_command() {
+        // A long sleep must be killed within ~poll interval of the cancel flag
+        // flipping (the Esc-interrupt path), not run to completion.
+        let cwd = std::env::temp_dir();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c2.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let out = bash("sleep 30", 30, &cwd, &cancel);
+        let elapsed = start.elapsed();
+        assert!(out.contains("interrupted by user"), "got: {out}");
+        assert!(elapsed < Duration::from_secs(3), "took too long: {elapsed:?}");
+    }
+
+    #[test]
+    fn bash_runs_without_cancel() {
+        let cwd = std::env::temp_dir();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = bash("echo hi", 10, &cwd, &cancel);
+        assert!(out.contains("hi"), "got: {out}");
+        assert!(out.contains("[exit 0]"), "got: {out}");
+    }
+
+    #[test]
+    fn normalize_collapses_dot_segments() {
+        assert_eq!(normalize(Path::new("a/b/../c")), Path::new("a/c"));
+        assert_eq!(normalize(Path::new("./a/./b")), Path::new("a/b"));
+        assert_eq!(normalize(Path::new("/etc/../etc/passwd")), Path::new("/etc/passwd"));
+        // `..` past the start is preserved (can't pop a non-name component).
+        assert_eq!(normalize(Path::new("../x")), Path::new("../x"));
+        // An absolute root is never climbed past.
+        assert_eq!(normalize(Path::new("/../x")), Path::new("/x"));
+        // Empty / all-dot paths normalize to ".".
+        assert_eq!(normalize(Path::new("")), Path::new("."));
+        assert_eq!(normalize(Path::new("a/..")), Path::new("."));
+    }
+
+    #[test]
+    fn expand_resolves_tilde_and_dots() {
+        std::env::set_var("HOME", "/home/pi");
+        // The sneaky traversal resolves to the plain path it really means.
+        assert_eq!(expand("~/../../etc/passwd"), PathBuf::from("/etc/passwd"));
+        assert_eq!(expand("~/notes.md"), PathBuf::from("/home/pi/notes.md"));
+        assert_eq!(expand("~"), PathBuf::from("/home/pi"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_tools_refuse_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("picoder_symlink_test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.txt");
+        std::fs::write(&target, "secret\n").unwrap();
+        let link = dir.join("link.txt");
+        symlink(&target, &link).unwrap();
+        let lp = link.to_string_lossy();
+        // Reads, writes, and edits through the symlink are all refused.
+        assert!(read_file(&lp, None, None).starts_with("DENIED"));
+        assert!(write_file(&lp, "x").starts_with("DENIED"));
+        assert!(matches!(
+            edit_preview(&lp, "secret", "x"),
+            EditPreview::Err(e) if e.starts_with("DENIED")
+        ));
+        assert!(list_files(&dir.to_string_lossy()).contains("link.txt"));
+        // The real path still works.
+        assert!(read_file(&target.to_string_lossy(), None, None).contains("secret"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore] // hits the network; run with `cargo test -- --ignored`
+    fn web_search_real() {
+        let http = crate::api::agent_http();
+        let out = web_search(&http, "rust programming language");
+        assert!(out.contains("rust-lang.org"), "got: {out}");
+    }
+
+    #[test]
+    #[ignore] // hits the network; run with `cargo test -- --ignored`
+    fn web_fetch_real_page() {
+        let http = crate::api::agent_http();
+        let text = web_fetch(&http, "https://example.com");
+        assert!(text.contains("Example Domain"), "got: {text}");
+        assert!(!text.contains('<'));
+    }
+}
