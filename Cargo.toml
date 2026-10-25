@@ -1,6 +1,6 @@
 [package]
 name = "haikucode"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Haiku Code: a full-screen agentic coding CLI for Haiku (a picoder port)"
 
@@ -21,6 +21,8 @@ textwrap = { version = "0.16", default-features = false, features = ["unicode-wi
 unicode-width = "0.2"
 anyhow = "1"
 libc = "0.2"
+# SHA-256 for verifying OTA update packages (already built for rustls).
+ring = "0.17"
 
 # crossterm's default mio event source goes deaf after the first batch of keys
 # on Haiku (mio's poll(2) selector never reports the tty readable again), so

@@ -2049,6 +2049,16 @@ impl App {
                 );
                 let _ = h.cmd_tx.send(WorkerCmd::User { text: task, images: vec![], typed: "/init".into() });
             }
+            "update" => match _arg {
+                None | Some("--force") => {
+                    self.push(Kind::Notice, "checking GitHub for a newer Haiku Code…");
+                    let _ = h.cmd_tx.send(WorkerCmd::Update(_arg.is_some()));
+                }
+                Some(other) => {
+                    self.push(Kind::ErrorK, format!("unknown option '{other}'"));
+                    self.show_options("/update");
+                }
+            },
             "thinking" => match _arg.map(str::to_ascii_lowercase).as_deref() {
                 None => self.toggle_thinking(),
                 Some("full" | "on") if !self.show_thinking => self.toggle_thinking(),

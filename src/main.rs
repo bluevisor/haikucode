@@ -22,6 +22,7 @@ mod sessions;
 mod sysinfo;
 mod tools;
 mod ui;
+mod update;
 
 use agent::{UiEvent, WorkerCmd};
 use api::Message;
@@ -126,6 +127,7 @@ usage:
   haikucode --stream-json   one-shot: print JSON-lines events as they happen
   haikucode --config        set up provider + API key
   haikucode model [id]      list models, or set the model
+  haikucode update          install the latest release from GitHub (--force reinstalls it)
   haikucode --banner        print the launch banner (debug) and exit
   haikucode -h | --help     this help
   haikucode --version
@@ -224,6 +226,18 @@ fn main() {
 
     if !args.is_empty() && args[0] == "model" {
         model_subcommand(&cfg, args.get(1).cloned());
+        return;
+    }
+    // `haikucode update [--force]` (a bare word, so "update the README" stays a task).
+    if !args.is_empty() && args[0] == "update" && args[1..].iter().all(|a| a == "--force") {
+        let http = api::agent_http();
+        match update::run(&http, args.len() > 1, &|m| println!("{m}")) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("update failed: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     if !args.is_empty() && args[0] == "sessions" {

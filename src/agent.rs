@@ -138,6 +138,8 @@ pub enum WorkerCmd {
     Export(String),
     /// `/sessions [delete <id|name>]`: list or delete saved sessions.
     Sessions(String),
+    /// `/update [--force]`: install the latest GitHub release.
+    Update(bool),
     Quit,
 }
 
@@ -242,6 +244,14 @@ pub fn spawn(
         }
         if !hooks.is_empty() {
             let _ = ui.send(UiEvent::Notice(format!("hooks: {} configured (/hooks)", hooks.hooks.len())));
+        }
+        if cfg.update_check {
+            let ui = ui.clone();
+            std::thread::spawn(move || {
+                if let Some(msg) = crate::update::check_on_launch(&api::agent_http()) {
+                    let _ = ui.send(UiEvent::Notice(msg));
+                }
+            });
         }
         if hooks.has("SessionStart") {
             if let Outcome::Continue { context } = hooks.run("SessionStart", "", &serde_json::json!({})) {
@@ -360,6 +370,21 @@ pub fn spawn(
                 WorkerCmd::Inject(note) => {
                     w.messages.push(Message::user(note));
                     w.save_session();
+                }
+                WorkerCmd::Update(force) => {
+                    // Off the worker thread: a download mustn't hold up a turn.
+                    let (http, ui) = (w.http.clone(), w.ui.clone());
+                    std::thread::spawn(move || {
+                        let note = |m: String| {
+                            let _ = ui.send(UiEvent::Notice(m));
+                        };
+                        match crate::update::run(&http, force, &note) {
+                            Ok(m) => note(m),
+                            Err(e) => {
+                                let _ = ui.send(UiEvent::Error(format!("update failed: {e}")));
+                            }
+                        }
+                    });
                 }
                 WorkerCmd::ReloadSettings => {
                     w.policy = Policy::load();

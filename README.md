@@ -212,6 +212,27 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 
 ## Install / build
 
+The quickest way on Haiku arm64: download the `.hpkg` from the
+[latest release](https://github.com/bluevisor/haikucode/releases/latest) and
+copy it into `~/config/packages` (it activates at once, no reboot).
+
+### Updates
+
+Haiku Code checks GitHub for a newer release when it starts (at most once a
+day) and says so in the transcript. `/update` (or `haikucode update` in a
+shell) downloads the new package, checks its SHA-256 against the release, and
+swaps it into `~/config/packages`; the next launch runs the new version.
+`haikucode update --force` reinstalls the current release. Turn the launch
+check off with `"update_check": false` in `config.json`. Only the
+`~/config/packages` install updates itself; a system-wide (`pkgman`) install
+is left to `pkgman`.
+
+Publishing a release (maintainers, from the Mac): bump `version` in
+`Cargo.toml`, commit and push `main`, then `haiku/release.sh` builds the
+package on the Haiku guest and creates the `v<version>` release with it.
+
+### Building from source
+
 Rust can't cross-compile to Haiku from macOS here, so Haiku Code builds
 natively on Haiku. You need `rustc`/`cargo` for your Haiku architecture (the
 arm64 VM uses a self-built `aarch64-unknown-haiku` nightly in
@@ -396,6 +417,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `/theme [n]` | open the theme picker, or switch directly |
 | `/init` | summarize this project into `HAIKUCODE.md` |
 | `/clear` | clear the screen transcript |
+| `/update [--force]` | install the latest release from GitHub |
 | `/help` · `/exit` | show help · quit |
 
 ## Keyboard

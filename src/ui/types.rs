@@ -130,6 +130,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/commands", "reload and list custom slash commands"),
     ("/thinking", "toggle full thinking + tool output vs brief summaries (Ctrl+T)"),
     ("/clear", "clear the screen transcript"),
+    ("/update", "install the latest Haiku Code release from GitHub"),
     ("/help", "show help"),
     ("/exit", "quit Haiku Code"),
 ];
@@ -172,6 +173,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/model ", "<model id> switch without the picker"),
     ("/review ", "<base> branch to review against (default main/master)"),
     ("/compact ", "<focus> what the summary should keep"),
+    ("/update --force", "reinstall the latest release even if it's this version"),
 ];
 
 /// `SLASH_OPTIONS` for one command (`/effort`), for listing when it runs bare.

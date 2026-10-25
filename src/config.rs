@@ -142,6 +142,10 @@ pub struct Config {
     /// brief summary; Ctrl+T or `/thinking` flips it.
     #[serde(default)]
     pub show_thinking: bool,
+    /// Look for a newer GitHub release at launch (at most daily). `/update`
+    /// installs it either way.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
     /// Permission mode new sessions start in: "ask", "yolo", or "plan" ("bypass"
     /// and "auto" still load as yolo). Saved whenever the mode is switched.
     #[serde(default = "default_permission")]
@@ -344,6 +348,7 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             auto_commit: true,
             show_thinking: false,
+            update_check: true,
             permission: default_permission(),
             max_tool_calls: default_max_tool_calls(),
             temperature: None,
@@ -547,6 +552,9 @@ impl Config {
                 cfg.extra.insert("mcp_servers".into(), m.clone());
             }
         }
+        if let Some(b) = v.get("update_check").and_then(|x| x.as_bool()) {
+            cfg.update_check = b;
+        }
         if let Some(b) = v.get("show_thinking").and_then(|x| x.as_bool()) {
             cfg.show_thinking = b;
         }
@@ -688,6 +696,9 @@ impl Config {
         // non-default values are written, keeping the common file minimal.
         if !on_disk.mcp_servers.is_empty() {
             json["mcp_servers"] = serde_json::to_value(&on_disk.mcp_servers).unwrap_or_default();
+        }
+        if !on_disk.update_check {
+            json["update_check"] = serde_json::json!(false);
         }
         if on_disk.show_thinking {
             json["show_thinking"] = serde_json::json!(true);
