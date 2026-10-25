@@ -109,6 +109,7 @@ can be scripted with `hey`.
 or `cargo`.";
 
 const HELP: &str = "haikucode — Haiku Code, an agentic coding CLI for Haiku (a picoder port)
+`hc` is a short alias for `haikucode` in the Haiku package.
 
 usage:
   haikucode                 interactive full-screen TUI
@@ -571,14 +572,14 @@ fn read_stdin_capped(cap: u64) -> String {
     s
 }
 
-/// The permission mode a session starts in: `--auto` forces bypass, else the
-/// configured default.
+/// The permission mode a session starts in: `--auto` forces YOLO, else the
+/// saved mode ("bypass"/"auto" are the old names for "yolo").
 fn start_perm(cfg: &Config, auto: bool) -> u8 {
     if auto {
         return agent::PERM_AUTO;
     }
     match cfg.permission.as_str() {
-        "bypass" | "auto" => agent::PERM_AUTO,
+        "yolo" | "bypass" | "auto" => agent::PERM_AUTO,
         "plan" => agent::PERM_PLAN,
         _ => agent::PERM_ASK,
     }
@@ -664,7 +665,7 @@ fn run_oneshot(
                     if !at_line_start {
                         println!();
                     }
-                    println!("\x1b[34m⏺ {name}\x1b[0m {summary}");
+                    println!("\x1b[34m◉ {name}\x1b[0m {summary}");
                     at_line_start = true;
                 }
                 emit(serde_json::json!({"type": "tool_start", "name": name, "summary": summary}));
@@ -679,7 +680,7 @@ fn run_oneshot(
                 }
                 emit(serde_json::json!({"type": "tool_result", "ok": ok, "preview": preview}));
             }
-            UiEvent::Notice(s) => {
+            UiEvent::Notice(s) | UiEvent::Progress(s) => {
                 if text_mode {
                     if !at_line_start {
                         println!();
@@ -723,7 +724,7 @@ fn run_oneshot(
                 emit(serde_json::json!({"type": "diff", "text": d}));
             }
             UiEvent::Approval { desc, .. } => {
-                // Nobody is at a terminal to ask. Bypass runs shouldn't get
+                // Nobody is at a terminal to ask. YOLO runs shouldn't get
                 // here; anything else is declined (the model is told and goes
                 // on), never silently approved.
                 if perm == agent::PERM_AUTO {
@@ -731,7 +732,7 @@ fn run_oneshot(
                     eprintln!("\x1b[2m[auto-approved: {desc}]\x1b[0m");
                 } else {
                     let _ = h.appr_tx.send(agent::ApprovalResponse::No);
-                    let note = format!("declined: {desc} (one-shot runs need --auto or \"permission\": \"bypass\")");
+                    let note = format!("declined: {desc} (one-shot runs need --auto or \"permission\": \"yolo\")");
                     eprintln!("\x1b[33m[{note}]\x1b[0m");
                     emit(serde_json::json!({"type": "notice", "text": note}));
                 }
@@ -875,7 +876,7 @@ fn run_tui(
         },
         history,
     );
-    app.banner(ui::term_width(), status);
+    app.banner(status);
     app.welcome();
     app.replay(replay);
     for n in notes {
@@ -994,6 +995,16 @@ fn unescape_history(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A saved "yolo" (or the old "bypass"/"auto") starts the session in YOLO.
+    #[test]
+    fn saved_permission_names_start_the_right_mode() {
+        let mut c = Config::default();
+        for (name, want) in [("yolo", agent::PERM_AUTO), ("bypass", agent::PERM_AUTO), ("plan", agent::PERM_PLAN), ("ask", agent::PERM_ASK)] {
+            c.permission = name.into();
+            assert_eq!(start_perm(&c, false), want, "{name}");
+        }
+    }
+
     use super::*;
     use std::fs;
 

@@ -34,6 +34,11 @@ pub enum Kind {
     #[allow(dead_code)] Heading,
     #[allow(dead_code)] Banner,
     #[allow(dead_code)] BannerDim,
+    /// Placeholder for the launch banner; expanded at the current width on
+    /// every render so it reflows when the terminal is resized.
+    BannerBlock,
+    /// Tool-work progress note; styled like a notice, hidden in brief view.
+    Progress,
 }
 
 /// Glyphs vary by terminal: the Pi's framebuffer console (TERM=linux) lacks
@@ -52,8 +57,10 @@ pub struct Glyphs {
 pub const GLYPHS_U: Glyphs = Glyphs {
     user: "❯ ",
     assistant: "● ",
-    tool: "⏺ ",
-    result: "⎿ ",
+    // ⏺ and ⎿ are missing from DejaVu Sans Mono (the font that draws box
+    // characters correctly in Haiku Terminal) and show as tofu; ◉ and └ aren't.
+    tool: "◉ ",
+    result: "└ ",
     error: "✗ ",
     prompt: "❯ ",
     rounded: true,
@@ -100,9 +107,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session (the current one stays saved)"),
     ("/config", "settings: provider, model, key, reasoning, …"),
     ("/compact", "summarize older turns to free context"),
-    ("/effort", "reasoning effort: auto, off, low, medium, high"),
+    ("/effort", "reasoning effort: auto, off, low, medium, high, xhigh, max"),
     ("/reset", "clear conversation context"),
-    ("/auto", "toggle bypass-permissions"),
+    ("/yolo", "toggle YOLO mode: approve everything (also /auto)"),
     ("/mcp", "MCP servers: state, tools, prompts · /mcp approve|deny|login|logout <server>"),
     ("/memory", "show persistent memory"),
     ("/theme", "open the theme picker"),
@@ -121,6 +128,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "list / allow / deny permission rules"),
     ("/hooks", "list configured lifecycle hooks"),
     ("/commands", "reload and list custom slash commands"),
+    ("/thinking", "toggle full thinking + tool output vs brief summaries (Ctrl+T)"),
     ("/clear", "clear the screen transcript"),
     ("/help", "show help"),
     ("/exit", "quit Haiku Code"),
@@ -130,6 +138,49 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 pub const MAX_SUGGEST: usize = 8;
 /// Window within which a second Ctrl+C/Ctrl+D exits (Claude Code style).
 pub const DOUBLE_PRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Each slash command's options, as the full text they complete to. Shown in
+/// the palette once a command and a space are typed (and listed by commands
+/// run bare); an entry ending in a space still needs an argument, so picking
+/// it fills the line instead of running it.
+pub const SLASH_OPTIONS: &[(&str, &str)] = &[
+    ("/effort auto", "send nothing: the model's own default"),
+    ("/effort off", "no reasoning (or the provider's lowest)"),
+    ("/effort low", "quick, light reasoning"),
+    ("/effort medium", "balanced"),
+    ("/effort high", "thorough"),
+    ("/effort xhigh", "deeper; high where the provider stops there"),
+    ("/effort max", "deepest; high/xhigh where the provider stops there"),
+    ("/permissions list", "show the allow / deny rules in force"),
+    ("/permissions allow ", "<rule> never ask, e.g. bash(cargo test:*)"),
+    ("/permissions deny ", "<rule> always refuse, e.g. bash(rm:*)"),
+    ("/permissions remove ", "<rule> drop a rule from the settings files"),
+    ("/permissions reload", "re-read the settings files"),
+    ("/yolo on", "approve everything"),
+    ("/yolo off", "back to asking before edits"),
+    ("/thinking full", "show reasoning, tool output and diffs"),
+    ("/thinking brief", "one-line summaries of each stretch of work"),
+    ("/mcp approve ", "<server> trust a project's MCP server"),
+    ("/mcp deny ", "<server> refuse a project's MCP server"),
+    ("/mcp login ", "<server> sign in to a server that needs OAuth"),
+    ("/mcp logout ", "<server> forget a server's login"),
+    ("/sessions delete ", "<id|name> delete a saved session"),
+    ("/export --all", "include haikucode's system/context messages"),
+    ("/export ", "<file> write to this path (default: a file in this directory)"),
+    ("/rename ", "<name> name this session"),
+    ("/resume ", "<id|name> switch straight to that session"),
+    ("/model ", "<model id> switch without the picker"),
+    ("/review ", "<base> branch to review against (default main/master)"),
+    ("/compact ", "<focus> what the summary should keep"),
+];
+
+/// `SLASH_OPTIONS` for one command (`/effort`), for listing when it runs bare.
+pub fn options_of(cmd: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    SLASH_OPTIONS
+        .iter()
+        .copied()
+        .filter(move |(o, _)| o.strip_prefix(cmd).is_some_and(|r| r.starts_with(' ')))
+}
 
 /// Rows of the `/config` panel, in display order.
 pub const SETTING_LABELS: &[&str] = &[

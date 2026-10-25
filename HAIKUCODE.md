@@ -76,7 +76,7 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   account using the USD price list), and a one-time notice says how to align
   them; prices are never converted across currencies.
 - Permission modes via Shift+Tab (also Ctrl+P, which the Pi's framebuffer console
-  needs since it can't report Shift+Tab): ask / bypass / plan (read-only); colored
+  needs since it can't report Shift+Tab): ask / YOLO / plan (read-only), saved for the next session; colored
   diff before write/edit. Handled in every mode, and never confused with the
   composer's Tab autocomplete.
 - Instruction files: the first of `HAIKUCODE.md`/`AGENTS.md`/`CLAUDE.md`/`GEMINI.md`
@@ -120,7 +120,7 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   command directly and records the output in the conversation.
 - Permission rules (`policy.rs`): `permissions.allow` / `permissions.deny` arrays merged from
   `config.json`, `.haikucode/settings.json`, `.haikucode/settings.local.json`. Deny is checked
-  before the permission mode (so it holds in bypass), allow skips the prompt in ask mode.
+  before the permission mode (so it holds in YOLO), allow skips the prompt in ask mode.
   The approval prompt offers **P** — persist a suggested rule (`bash(cargo test:*)`,
   `edit_file(src/**)`) to `settings.local.json` (or config.json outside a repo). **N** denies
   and lets the model continue; **Esc** denies and interrupts the turn. Bash rules split on
@@ -143,9 +143,9 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   `--stream-json` prints JSON-lines events (`token`, `tool_start`, `tool_result`, `notice`,
   `error`, `diff`, `reasoning`, `result`).
 - `/config`: interactive settings panel — provider preset (deepseek/openai/anthropic/groq/openrouter/google),
-  base URL, model, API key (masked), reasoning (auto/off/low/medium/high, sent
+  base URL, model, API key (masked), reasoning (auto/off/low/medium/high/xhigh/max, sent
   in each provider's own field; also `/effort`), default
-  permission mode (ask/bypass/plan — applies live and saves for new sessions),
+  permission mode (ask/yolo/plan — applies live and saves for new sessions),
   auto-commit, theme, context window, max tool calls, price currency. Changes
   apply immediately and persist.
 - Costs and balance: `src/money.rs` formats both, tagging each with its ISO code

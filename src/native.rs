@@ -194,7 +194,7 @@ pub(crate) fn anthropic_body(cfg: &Config, messages: &[Message], tools: Option<&
         "off" => body["output_config"] = json!({"effort": "low"}),
         level => {
             body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-            body["output_config"] = json!({"effort": level});
+            body["output_config"] = json!({"effort": anthropic_effort(&cfg.model, level)});
         }
     }
     body
@@ -361,6 +361,33 @@ fn openai_reasoning_model(model: &str) -> bool {
     ["o1", "o3", "o4", "gpt-5", "codex"].iter().any(|p| m.starts_with(p)) || m.contains("gpt-oss")
 }
 
+/// The Messages `output_config.effort` for a haikucode level. Every current
+/// model takes low…max; `xhigh` arrived with Opus 4.7, so the 4.6 models get
+/// `high` for it, and Opus 4.5 tops out at `high`.
+fn anthropic_effort<'a>(model: &str, level: &'a str) -> &'a str {
+    let m = model.to_ascii_lowercase();
+    match level {
+        "xhigh" if m.contains("4-6") => "high",
+        "xhigh" | "max" if m.contains("opus-4-5") => "high",
+        l => l,
+    }
+}
+
+/// OpenAI models that take `xhigh` effort: GPT-5.2 and later, and the
+/// codex-max models. Older ones top out at `high`.
+pub(crate) fn openai_has_xhigh(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let m = m.rsplit('/').next().unwrap_or(&m);
+    let minor = m.strip_prefix("gpt-5.").and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok());
+    minor.is_some_and(|n| n >= 2) || m.contains("codex-max")
+}
+
+/// `xhigh`/`max` for OpenAI: `xhigh` where the model has it (OpenAI has no
+/// `max`), else `high`.
+pub(crate) fn openai_top_effort(model: &str) -> &'static str {
+    if openai_has_xhigh(model) { "xhigh" } else { "high" }
+}
+
 /// The Responses `reasoning.effort` for a haikucode level. "off" is each
 /// family's floor: `none` on gpt-5.1 and later, `minimal` on the original
 /// gpt-5 models, `low` on the o-series.
@@ -369,6 +396,7 @@ fn responses_effort(model: &str, level: &str) -> &'static str {
         "low" => "low",
         "medium" => "medium",
         "high" => "high",
+        "xhigh" | "max" => openai_top_effort(model),
         _ if model.starts_with('o') => "low",
         _ if model.starts_with("gpt-5") && !model.starts_with("gpt-5.") => "minimal",
         _ => "none",
@@ -762,6 +790,13 @@ mod tests {
         assert!(plain.get("include").is_none() && plain.get("reasoning").is_none());
         assert_eq!(responses_effort("gpt-5", "off"), "minimal");
         assert_eq!(responses_effort("o3", "off"), "low");
+        assert_eq!(responses_effort("gpt-5.2", "max"), "xhigh");
+        assert_eq!(responses_effort("gpt-5.1", "xhigh"), "high");
+        assert_eq!(responses_effort("gpt-5.1-codex-max", "max"), "xhigh");
+        assert_eq!(anthropic_effort("claude-opus-5-5", "xhigh"), "xhigh");
+        assert_eq!(anthropic_effort("claude-sonnet-4-6", "xhigh"), "high");
+        assert_eq!(anthropic_effort("claude-sonnet-4-6", "max"), "max");
+        assert_eq!(anthropic_effort("claude-opus-4-5", "max"), "high");
     }
 
     #[test]

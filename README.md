@@ -85,11 +85,14 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
   that send as turns finish.
 - **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to
   disk after the run.
-- **Permission modes** (`Shift+Tab` / `Ctrl+P` to cycle) — *ask* / *bypass* /
-  *plan* (read-only).
+- **Permission modes** (`Shift+Tab` / `Ctrl+P` to cycle) — *ask* / *YOLO*
+  (approve everything; `/yolo` toggles it) / *plan* (read-only).
+- **Remembered settings** — the permission mode, reasoning effort (`/effort`)
+  and the brief/full thinking view (`Ctrl+T`) are saved to `config.json` when
+  you change them, so the next session starts the same way.
 - **Permission rules** — Claude-Code-style `allow` / `deny` patterns
   (`bash(cargo test:*)`, `edit_file(src/**)`, `mcp__fs__*`) in `config.json` or
-  the project's `.haikucode/settings.json`. Deny rules hold even in bypass mode;
+  the project's `.haikucode/settings.json`. Deny rules hold even in YOLO mode;
   pressing **P** at an approval prompt saves a "don't ask again" rule for that
   command prefix or directory. `/permissions` lists, adds, and removes them.
 - **OS sandbox for shell commands** — off by default. `"sandbox": "workspace"`
@@ -143,13 +146,15 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 - **Sampling** — haikucode sends no `temperature` unless you set one in
   `config.json` (`"temperature": 0.7`), so each model's recommended sampling
   applies; the DeepSeek preset keeps `0.2`.
-- **Reasoning effort** — `/effort auto|off|low|medium|high` (or the `/config`
+- **Reasoning effort** — `/effort auto|off|low|medium|high|xhigh|max` (or the `/config`
   row) is translated per provider: DeepSeek/GLM `thinking`, OpenAI/Gemini/Groq
   `reasoning_effort`, OpenRouter `reasoning`, Anthropic adaptive thinking +
   `output_config.effort`, Responses `reasoning.effort`, and for self-hosted
   servers (Splash, vLLM, SGLang, llama.cpp) the chat template's
   `enable_thinking` — so `off` really stops a local Qwen from thinking. `auto`
-  sends nothing.
+  sends nothing. `xhigh` and `max` go out as-is to current Claude models
+  (Opus 4.6/Sonnet 4.6 get `high` for `xhigh`), as `xhigh` to OpenAI GPT-5.2+
+  and OpenRouter, and as `high` everywhere else.
 - **Native APIs** — `"api": "chat" | "messages" | "responses"` picks the wire
   protocol; the anthropic preset defaults to Messages and the openai preset to
   Responses. Within a run, Anthropic's signed thinking and Responses' encrypted
@@ -164,7 +169,7 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 - **Scripting** — `git diff | haikucode "review this"` attaches stdin as context
   (or uses it as the task), and `--json` / `--stream-json` print a result
   object or JSON-lines events for CI and automation. One-shot runs use your
-  `permission` setting (`--auto` forces bypass); with no one to ask, approval
+  `permission` setting (`--auto` forces YOLO); with no one to ask, approval
   prompts are declined, never silently approved. Exit status: `0` ok, `1` the
   run reported an error, `2` bad usage.
 - **Context files** — in `~/config/settings/haikucode/` and in every directory from the
@@ -229,9 +234,9 @@ haiku/deploy.sh fetch            # ...and copy the .hpkg back into ./dist
 HAIKU_HOST=haiku haiku/deploy.sh # another ssh destination (default: haiku-dbg)
 ```
 
-The package installs `bin/haikucode`, the `apps/Haiku Code` launcher and its
-Deskbar entry. Run `haikucode` from any Terminal, or pick *Haiku Code* from the
-Deskbar's Applications menu.
+The package installs `bin/haikucode` (plus `hc`, a short alias), the
+`apps/Haiku Code` launcher and its Deskbar entry. Run `haikucode` or `hc` from
+any Terminal, or pick *Haiku Code* from the Deskbar's Applications menu.
 
 ## Testing / CI
 
@@ -367,7 +372,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | --- | --- |
 | `/model [id\|n]` | open the model picker, or set directly by id/number |
 | `/config` | settings panel (provider, model, key, reasoning, …) |
-| `/effort [level]` | reasoning effort: auto, off, low, medium, high |
+| `/effort [level]` | reasoning effort: auto, off, low, medium, high, xhigh, max |
 | `/compact [focus]` | summarize older turns to free context (auto at 80%) |
 | `/diff` | show everything changed since the session started |
 | `/undo` | revert the last haikucode checkpoint commit |
@@ -384,7 +389,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `/fork` | carry on in a copy of this conversation; the original stays as it was |
 | `/export [--all] [file]` | save the conversation as Markdown (`--all` keeps system/context messages) |
 | `/sessions [delete <id\|name>]` | list or delete this directory's saved sessions |
-| `/auto` | toggle bypass-permissions |
+| `/yolo` (or `/auto`) | toggle YOLO mode (approve everything) |
 | `/mcp` | list MCP servers: state, transport, auth, tools and prompts |
 | `/mcp approve\|deny\|login\|logout <server>` | allow a project server, sign in to an HTTP one, … |
 | `/memory` | show the persistent memory this directory sees |
@@ -411,7 +416,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `Tab` | autocomplete commands / paths |
 | `Ctrl+L` | redraw screen |
 | `Esc` | interrupt turn / clear line; on an approval prompt: deny and stop |
-| `Y` / `N` / `P` / `A` | approval prompt: yes / no (model continues) / don't ask again for this pattern / bypass all |
+| `Y` / `N` / `P` / `A` | approval prompt: yes / no (model continues) / don't ask again for this pattern / YOLO (approve everything) |
 | `Ctrl+C` | clear line, or quit (press twice) |
 
 haikucode enables the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)

@@ -497,14 +497,14 @@ pub fn colors(kind: Kind, p: &Palette) -> (Style, Style) {
         Kind::DiffAdd => (s(p.diff_add), Style::default()),
         Kind::DiffDel => (s(p.diff_del), Style::default()),
         Kind::DiffCtx => (s(p.diff_ctx), s(p.diff_ctx)),
-        Kind::Notice => (s(p.notice), s(p.notice)),
+        Kind::Notice | Kind::Progress => (s(p.notice), s(p.notice)),
         Kind::ErrorK => (s(p.error), s(p.error)),
         // A separator line carries no text — style it like the page itself.
         Kind::Blank => (Style::default(), Style::default()),
         Kind::Code => (s(p.code), s(p.code)),
         Kind::Heading => (bold(p.heading), s(p.assistant_glyph)),
         Kind::Banner => (bold(p.accent), s(p.accent)),
-        Kind::BannerDim => (s(p.notice), Style::default()),
+        Kind::BannerDim | Kind::BannerBlock => (s(p.notice), Style::default()),
     }
 }
 

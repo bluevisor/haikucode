@@ -20,6 +20,7 @@ mkdir -p "$stage/bin" "$stage/apps" "$stage/data/deskbar/menu/Applications" \
 	"$stage/documentation/packages/haikucode"
 
 install -m 755 target/release/haikucode "$stage/bin/haikucode"
+ln -s haikucode "$stage/bin/hc"
 
 app="$stage/apps/Haiku Code"
 install -m 755 haiku/launcher.sh "$app"

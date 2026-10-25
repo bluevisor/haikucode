@@ -3,6 +3,7 @@
 //! worker thread and feeds this UI through a channel.
 
 mod banner;
+mod brief;
 mod helpers;
 mod palette;
 mod types;
@@ -96,6 +97,8 @@ fn echo_excerpt(text: &str) -> String {
 
 pub struct App {
     transcript: Vec<TLine>,
+    /// SYSTEM rows for the launch banner (see `Kind::BannerBlock`).
+    banner_status: Vec<String>,
     live: String,
     live_reasoning: String,
     input: String,
@@ -169,6 +172,10 @@ pub struct App {
     disp_cache: Vec<Line<'static>>,
     disp_cache_width: usize,
     disp_cache_tver: u64,
+    /// (show_thinking, awaiting approval) the cache was built for.
+    disp_cache_view: (bool, bool),
+    /// Full reasoning/tool output/diffs (true) or brief run summaries (false).
+    show_thinking: bool,
     /// Bumped on every transcript-content or palette change to invalidate
     /// `disp_cache`. (`single_width`/`glyphs` are fixed at construction.)
     tver: u64,
@@ -258,6 +265,7 @@ impl App {
         let hist_idx = history.len();
         let mut app = App {
             transcript: Vec::new(),
+            banner_status: Vec::new(),
             live: String::new(),
             live_reasoning: String::new(),
             input: String::new(),
@@ -302,6 +310,8 @@ impl App {
             disp_cache: Vec::new(),
             disp_cache_width: usize::MAX,
             disp_cache_tver: u64::MAX,
+            disp_cache_view: (false, false),
+            show_thinking: cfg.settings.show_thinking,
             tver: 0,
             perm: cfg.perm,
             ctx_limit: cfg.ctx_limit.max(1),
@@ -438,14 +448,17 @@ impl App {
     }
 
     fn flush_live(&mut self) {
+        // Reasoning precedes the answer it produced (and `build_live_lines`
+        // shows them in this order), so commit it first.
+        let reasoning = std::mem::take(&mut self.live_reasoning);
+        if !reasoning.trim().is_empty() {
+            self.separate(Kind::Reasoning);
+            self.transcript.push(TLine { kind: Kind::Reasoning, text: reasoning, lead: true, color: None });
+            self.after_push();
+        }
         if !self.live.is_empty() {
             self.separate(Kind::Assistant);
             self.transcript.push(TLine { kind: Kind::Assistant, text: std::mem::take(&mut self.live), lead: true, color: None });
-            self.after_push();
-        }
-        if !self.live_reasoning.is_empty() {
-            self.separate(Kind::Reasoning);
-            self.transcript.push(TLine { kind: Kind::Reasoning, text: std::mem::take(&mut self.live_reasoning), lead: true, color: None });
             self.after_push();
         }
     }
@@ -625,6 +638,9 @@ impl App {
             UiEvent::Notice(msg) => {
                 self.push(Kind::Notice, msg);
             }
+            UiEvent::Progress(msg) => {
+                self.push(Kind::Progress, msg);
+            }
             UiEvent::Error(msg) => {
                 self.push(Kind::ErrorK, msg);
             }
@@ -637,7 +653,7 @@ impl App {
                 } else {
                     self.clear_busy();
                 }
-                // The worker may reply with Bypass toggled; sync the UI.
+                // The worker may reply with YOLO toggled; sync the UI.
                 self.perm = h.shared.perm.clone();
                 // Dispatch the next queued message, if any — through `dispatch`
                 // so it is echoed, `@file`s attach, and `/cmd` / `!cmd` route
@@ -867,6 +883,15 @@ impl App {
     }
 
     fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        // `/cmd ` + a partial option: that command's options.
+        if self.mode == Mode::Idle && self.input.starts_with('/') && !self.input.contains('\n') {
+            if let Some((cmd, rest)) = self.input.split_once(' ') {
+                if rest.contains(char::is_whitespace) {
+                    return Vec::new();
+                }
+                return types::options_of(cmd).filter(|(o, _)| o.starts_with(&self.input)).collect();
+            }
+        }
         if self.mode == Mode::Idle && self.input.starts_with('/') && !self.input.contains(char::is_whitespace) {
             let mut scored: Vec<_> = SLASH_COMMANDS
                 .iter()
@@ -935,6 +960,14 @@ impl App {
                 self.cycle_perm();
                 return;
             }
+        }
+        // Ctrl+T: full thinking/tool output vs brief summaries.
+        if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(self.mode, Mode::Password { .. } | Mode::Question { .. })
+        {
+            self.toggle_thinking();
+            return;
         }
         // Ctrl+L: full repaint in every mode (advertised in /help; recovers
         // from a desynced screen after e.g. a background job wrote to the tty).
@@ -1033,14 +1066,22 @@ impl App {
         self.resume_busy();
     }
 
-    fn cycle_perm(&self) {
-        let v = self.perm.load(Ordering::Relaxed);
-        let next = match v {
+    fn cycle_perm(&mut self) {
+        let next = match self.perm() {
             crate::agent::PERM_ASK => crate::agent::PERM_AUTO,
             crate::agent::PERM_AUTO => crate::agent::PERM_PLAN,
             _ => crate::agent::PERM_ASK,
         };
-        self.perm.store(next, Ordering::Relaxed);
+        self.set_perm(next);
+    }
+
+    /// Switch the permission mode and save it, so the next session starts in
+    /// the same mode (like effort and the brief view).
+    fn set_perm(&mut self, p: u8) {
+        self.perm.store(p, Ordering::Relaxed);
+        let name = perm_name(p);
+        self.settings.permission = name.to_string();
+        Config::persist_patch(&ConfigPatch::Permission(name.to_string()));
     }
 
     fn perm(&self) -> u8 {
@@ -1058,6 +1099,8 @@ impl App {
                 self.set_busy();
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
+                // The worker flips the shared flag itself; save the mode too.
+                self.set_perm(crate::agent::PERM_AUTO);
                 let _ = h.appr_tx.send(ApprovalResponse::Always);
                 self.set_busy();
             }
@@ -1174,10 +1217,7 @@ impl App {
             }
             6 => {
                 let next = if dir >= 0 { (self.perm() + 1) % 3 } else { (self.perm() + 2) % 3 };
-                self.perm.store(next, Ordering::Relaxed);
-                let name = perm_name(next);
-                self.settings.permission = name.to_string();
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Permission(name.to_string())));
+                self.set_perm(next);
             }
             7 => {
                 let v = !self.settings.auto_commit;
@@ -1525,10 +1565,20 @@ impl App {
                     self.last_ctrl_c = None;
                     // `/mo` + Enter runs the highlighted `/model`; a command
                     // typed out in full runs as typed.
+                    // `/effort hi` + Enter runs `/effort high`; a bare `/effort `
+                    // runs as typed (listing the options).
                     let sugg = self.slash_suggestions();
-                    if !sugg.is_empty() && !sugg.iter().any(|(c, _)| *c == self.input) {
+                    let typed_option = self.input.contains(' ') && !self.input.ends_with(' ');
+                    let picks = !sugg.is_empty() && (!self.input.contains(' ') || typed_option);
+                    if picks && !sugg.iter().any(|(c, _)| *c == self.input) {
                         self.input = sugg[self.suggest_idx.min(sugg.len() - 1)].0.to_string();
                         self.suggest_idx = 0;
+                        // An option that still needs its argument: fill the
+                        // line and let the user finish it.
+                        if self.input.ends_with(' ') {
+                            self.cursor = self.char_len();
+                            return;
+                        }
                     }
                     self.submit(h);
                 }
@@ -1842,19 +1892,17 @@ impl App {
                 Some(a) => {
                     let level = crate::config::normalize_reasoning(a);
                     if level == "auto" && !a.eq_ignore_ascii_case("auto") {
-                        self.push(Kind::ErrorK, format!("unknown effort '{a}' — use auto, off, low, medium or high"));
+                        self.push(Kind::ErrorK, format!("unknown effort '{a}'"));
+                        self.show_options("/effort");
                     } else {
                         self.set_reasoning(&level, h);
                         self.push(Kind::Notice, format!("reasoning effort: {level}"));
                     }
                 }
-                None => self.push(
-                    Kind::Notice,
-                    format!(
-                        "reasoning effort: {} (set with /effort auto|off|low|medium|high; auto leaves the model's default)",
-                        self.settings.reasoning
-                    ),
-                ),
+                None => {
+                    self.push(Kind::Notice, format!("reasoning effort: {}", self.settings.reasoning));
+                    self.show_options("/effort");
+                }
             },
             "compact" => {
                 self.set_busy();
@@ -1876,7 +1924,7 @@ impl App {
                 Some(name) => {
                     let _ = h.cmd_tx.send(WorkerCmd::Rename(name.to_string()));
                 }
-                None => self.push(Kind::Notice, "usage: /rename <name>"),
+                None => self.show_options("/rename"),
             },
             "fork" => {
                 let _ = h.cmd_tx.send(WorkerCmd::Fork);
@@ -1885,6 +1933,9 @@ impl App {
                 let _ = h.cmd_tx.send(WorkerCmd::Export(_arg.unwrap_or("").to_string()));
             }
             "sessions" => {
+                if _arg.is_none() {
+                    self.show_options("/sessions");
+                }
                 let _ = h.cmd_tx.send(WorkerCmd::Sessions(_arg.unwrap_or("").to_string()));
             }
             "cost" => {
@@ -1940,14 +1991,25 @@ impl App {
                 self.transcript.clear();
                 self.dirty();
             }
-            "auto" => {
-                self.cycle_perm();
-                self.push(
-                    Kind::Notice,
-                    format!("permissions: {}", perm_name(self.perm())),
-                );
+            "auto" | "yolo" => {
+                let on = match _arg.map(str::to_ascii_lowercase).as_deref() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    None => self.perm() != crate::agent::PERM_AUTO,
+                    Some(other) => {
+                        self.push(Kind::ErrorK, format!("unknown option '{other}'"));
+                        self.show_options("/yolo");
+                        return;
+                    }
+                };
+                let next = if on { crate::agent::PERM_AUTO } else { crate::agent::PERM_ASK };
+                self.set_perm(next);
+                self.push(Kind::Notice, format!("permissions: {}", perm_name(self.perm())));
             }
             "mcp" => {
+                if _arg.is_none() {
+                    self.show_options("/mcp");
+                }
                 let _ = h.cmd_tx.send(match _arg {
                     None => WorkerCmd::ListMcp,
                     Some(a) => WorkerCmd::Mcp(a.to_string()),
@@ -1987,6 +2049,16 @@ impl App {
                 );
                 let _ = h.cmd_tx.send(WorkerCmd::User { text: task, images: vec![], typed: "/init".into() });
             }
+            "thinking" => match _arg.map(str::to_ascii_lowercase).as_deref() {
+                None => self.toggle_thinking(),
+                Some("full" | "on") if !self.show_thinking => self.toggle_thinking(),
+                Some("brief" | "off") if self.show_thinking => self.toggle_thinking(),
+                Some("full" | "on" | "brief" | "off") => {}
+                Some(other) => {
+                    self.push(Kind::ErrorK, format!("unknown option '{other}'"));
+                    self.show_options("/thinking");
+                }
+            },
             "clear" => {
                 self.transcript.clear();
                 self.dirty();
@@ -2199,10 +2271,7 @@ impl App {
                 for line in crate::policy::Policy::load().describe() {
                     self.push(Kind::Notice, line);
                 }
-                self.push(
-                    Kind::Notice,
-                    "usage: /permissions allow <rule> · deny <rule> · remove <rule>   e.g. bash(cargo test:*), edit_file(src/**)",
-                );
+                self.show_options("/permissions");
             }
             "allow" | "deny" if !rule.is_empty() => {
                 if crate::policy::Rule::parse(rule).is_none() {
@@ -2226,7 +2295,24 @@ impl App {
             "reload" => {
                 let _ = h.cmd_tx.send(WorkerCmd::ReloadSettings);
             }
-            _ => self.push(Kind::ErrorK, "usage: /permissions [allow|deny|remove <rule> | reload]"),
+            _ => {
+                self.push(Kind::ErrorK, format!("/permissions {arg}: missing or unknown option"));
+                self.show_options("/permissions");
+            }
+        }
+    }
+
+    /// List a command's options (from `SLASH_OPTIONS`) under a heading.
+    fn show_options(&mut self, cmd: &str) {
+        let rows: Vec<String> = types::options_of(cmd)
+            .map(|(o, d)| format!("  {:<22} {d}", o.trim_end()))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        self.push(Kind::Notice, format!("{cmd} options:"));
+        for r in rows {
+            self.push(Kind::Notice, r);
         }
     }
 
@@ -2250,29 +2336,79 @@ impl App {
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
         self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  browse history");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
-        self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / bypass / plan)"));
-        self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A bypass all"));
+        self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / YOLO / plan; remembered)"));
+        self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A YOLO (approve everything)"));
         self.push(Kind::Notice, String::from("  Esc         interrupt the agent / clear the line"));
         self.push(Kind::Notice, String::from("  Ctrl+C      clear the line (twice = quit)"));
         self.push(Kind::Notice, String::from("  Ctrl+L      force clear/repaint"));
+        self.push(Kind::Notice, String::from("  Ctrl+T      show full thinking / brief summaries"));
     }
 
-    pub fn banner(&mut self, width: u16, status: Vec<String>) {
-        let w = (width as usize).saturating_sub(4).max(8);
-        for bl in banner_lines(w, self.ascii, &status) {
+    /// Add the launch banner. Only a placeholder goes into the transcript; the
+    /// display cache expands it at the pane's current width, so the logo and
+    /// SYSTEM box reflow live on resize.
+    pub fn banner(&mut self, status: Vec<String>) {
+        self.banner_status = status;
+        self.transcript.push(TLine { kind: Kind::BannerBlock, text: String::new(), lead: false, color: None });
+        self.push_dim(String::new());
+        self.after_push();
+    }
+
+    /// Render the run of work entries starting at `start` as a brief summary;
+    /// returns the index just past the run. Blank separators inside the run are
+    /// absorbed, trailing ones are left to render normally. While an approval
+    /// is pending, the last tool call and its diff stay in full so the change
+    /// being approved is visible.
+    fn render_brief_run(&self, out: &mut Vec<Line<'static>>, start: usize, width: usize, approving: bool) -> usize {
+        let mut end = start;
+        while end < self.transcript.len() && (brief::is_work(self.transcript[end].kind) || self.transcript[end].kind == Kind::Blank) {
+            end += 1;
+        }
+        while end > start && self.transcript[end - 1].kind == Kind::Blank {
+            end -= 1;
+        }
+        let mut cut = end;
+        if approving && end == self.transcript.len() {
+            if let Some(p) = self.transcript[start..end].iter().rposition(|t| t.kind == Kind::Tool) {
+                cut = start + p;
+            }
+        }
+        let run: Vec<TLine> = self.transcript[start..cut]
+            .iter()
+            .filter(|t| t.kind != Kind::Blank)
+            .map(|t| TLine { kind: t.kind, text: t.text.clone(), lead: t.lead, color: None })
+            .collect();
+        let rows = brief::summarize(&run);
+        for (label, text) in &rows {
+            out.push(self.brief_row(label, text, width, false));
+        }
+        for t in &self.transcript[cut..end] {
+            render_tline(out, t.kind, &t.text, t.lead, t.color, width, self.glyphs, &self.palette, self.single_width);
+        }
+        end
+    }
+
+    fn toggle_thinking(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        self.settings.show_thinking = self.show_thinking;
+        Config::persist_show_thinking(self.show_thinking);
+        let what = if self.show_thinking { "full thinking and tool output" } else { "brief summaries (ctrl+t for details)" };
+        self.push(Kind::Notice, format!("showing {what}"));
+    }
+
+    fn render_banner(&self, out: &mut Vec<Line<'static>>, width: usize) {
+        // The pane is 2 columns narrower than the terminal the banner used to be
+        // sized from (term width − 4), so keep the same 2-column margin.
+        let w = width.saturating_sub(2).max(8);
+        for bl in banner_lines(w, self.ascii, &self.banner_status) {
             let (kind, color) = match bl.role {
-                BRole::Art(i) => (
-                    Kind::Banner,
-                    Some(BannerColor::Rainbow(i)),
-                ),
+                BRole::Art(i) => (Kind::Banner, Some(BannerColor::Rainbow(i))),
                 BRole::Version => (Kind::Banner, None),
                 BRole::Tagline => (Kind::BannerDim, None),
                 BRole::Frame | BRole::Data => (Kind::BannerDim, Some(BannerColor::Accent)),
             };
-            self.transcript.push(TLine { kind, text: bl.text, lead: false, color });
+            render_tline(out, kind, &bl.text, false, color, width, self.glyphs, &self.palette, self.single_width);
         }
-        self.push_dim(String::new());
-        self.after_push();
     }
 
     fn push_dim(&mut self, text: String) {
@@ -2554,12 +2690,22 @@ impl App {
     }
 
     fn ensure_display_cache(&mut self, width: usize) {
-        if self.disp_cache_width == width && self.disp_cache_tver == self.tver {
+        let view = (self.show_thinking, matches!(self.mode, Mode::Approval(_)));
+        if self.disp_cache_width == width && self.disp_cache_tver == self.tver && self.disp_cache_view == view {
             return;
         }
         let mut out: Vec<Line<'static>> = Vec::new();
-        for t in &self.transcript {
-            if t.kind == Kind::Assistant {
+        let mut i = 0;
+        while i < self.transcript.len() {
+            let t = &self.transcript[i];
+            if !self.show_thinking && brief::is_work(t.kind) {
+                i = self.render_brief_run(&mut out, i, width, view.1);
+                continue;
+            }
+            i += 1;
+            if t.kind == Kind::BannerBlock {
+                self.render_banner(&mut out, width);
+            } else if t.kind == Kind::Assistant {
                 render_message(&mut out, &t.text, t.lead, width, self.glyphs, &self.palette, self.single_width);
             } else {
                 render_tline(&mut out, t.kind, &t.text, t.lead, t.color, width, self.glyphs, &self.palette, self.single_width);
@@ -2568,32 +2714,47 @@ impl App {
         self.disp_cache = out;
         self.disp_cache_width = width;
         self.disp_cache_tver = self.tver;
+        self.disp_cache_view = view;
     }
 
     fn build_live_lines(&self, width: usize) -> Vec<Line<'static>> {
+        // Mirror exactly what `flush_live` will commit (reasoning first, then
+        // the answer, with the same separators), so nothing on screen moves
+        // the moment the live text becomes transcript.
         let mut out: Vec<Line<'static>> = Vec::new();
-        // Reserve the same blank gap the committed entry will get, so streaming
-        // text doesn't jump up a line the moment it is committed.
-        let lead_kind = if !self.live.is_empty() {
-            Some(Kind::Assistant)
-        } else if !self.live_reasoning.is_empty() {
-            Some(Kind::Reasoning)
-        } else {
-            None
-        };
-        if let (Some(k), Some(last)) = (lead_kind, self.transcript.last()) {
-            if needs_sep(last.kind, k) {
+        let mut prev = self.transcript.last().map(|t| t.kind);
+        if !self.live_reasoning.trim().is_empty() {
+            // In brief view a blank between work entries is absorbed into the
+            // run's summary, so don't reserve one here either.
+            let absorbed = !self.show_thinking && prev.is_some_and(brief::is_work);
+            if prev.is_some_and(|p| needs_sep(p, Kind::Reasoning)) && !absorbed {
                 out.push(Line::default());
             }
+            if self.show_thinking {
+                render_tline(&mut out, Kind::Reasoning, &self.live_reasoning, true, None, width, self.glyphs, &self.palette, self.single_width);
+            } else {
+                out.push(self.brief_row("thinking…", self.live_reasoning.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), width, true));
+            }
+            prev = Some(Kind::Reasoning);
         }
         if !self.live.is_empty() {
-            render_message(&mut out, &self.live, true, width, self.glyphs, &self.palette, self.single_width);
-        } else if !self.live_reasoning.is_empty() {
-            for ln in self.live_reasoning.split('\n') {
-                render_tline(&mut out, Kind::Reasoning, ln, true, None, width, self.glyphs, &self.palette, self.single_width);
+            if prev.is_some_and(|p| needs_sep(p, Kind::Assistant)) {
+                out.push(Line::default());
             }
+            render_message(&mut out, &self.live, true, width, self.glyphs, &self.palette, self.single_width);
         }
         out
+    }
+
+    /// One brief-view row, always exactly one screen line: `label` padded to a
+    /// fixed column, then `text` (its first sentence when `gist`) clipped to fit.
+    fn brief_row(&self, label: &str, text: &str, width: usize, gist: bool) -> Line<'static> {
+        let room = width.saturating_sub(2 + 12).max(4);
+        let text = if gist { brief::gist(text, room) } else { brief::clip(text, room) };
+        let mut out = Vec::new();
+        render_tline(&mut out, Kind::Reasoning, &format!("{label:<11} {text}"), true, None, width, self.glyphs, &self.palette, self.single_width);
+        out.truncate(1);
+        out.pop().unwrap_or_default()
     }
 
     fn render_inputline(&self, f: &mut Frame, area: Rect) {
@@ -2644,7 +2805,7 @@ impl App {
                     opts.push(Span::raw(format!("attern: don't ask again for {rule}  ")));
                 }
                 opts.push(Span::styled("(A)", Style::default().fg(self.palette.accent)));
-                opts.push(Span::raw("lways (bypass all)"));
+                opts.push(Span::raw("lways (YOLO)"));
                 let opts_line = Line::from(opts);
                 f.render_widget(Paragraph::new(vec![desc_line, opts_line]), area);
             }
@@ -2859,6 +3020,9 @@ impl App {
         if !sugg.is_empty() {
             let idx = self.suggest_idx.min(sugg.len() - 1);
             let marker = if self.ascii { ">" } else { "▸" };
+            // Line the descriptions up past the longest entry (options run longer
+            // than bare commands).
+            let col = sugg.iter().map(|(n, _)| n.trim_end().chars().count()).max().unwrap_or(0).max(9);
             for (i, (name, desc)) in sugg.iter().enumerate() {
                 let sel = i == idx;
                 let name_style = if sel {
@@ -2868,7 +3032,7 @@ impl App {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{} {name:<9} ", if sel { marker } else { " " }),
+                        format!("{} {:<col$} ", if sel { marker } else { " " }, name.trim_end()),
                         name_style,
                     ),
                     Span::styled(desc.to_string(), Style::default().fg(self.dim_text())),
@@ -2939,7 +3103,7 @@ impl App {
         let (glyph, text, color) = match self.perm() {
             crate::agent::PERM_AUTO => (
                 if self.ascii { ">>" } else { "▶▶" },
-                "bypass permissions on",
+                "YOLO mode · no approvals",
                 Color::Red,
             ),
             crate::agent::PERM_PLAN => (
@@ -3101,7 +3265,7 @@ mod tests {
                 assert_eq!(
                     app.perm(),
                     crate::agent::PERM_AUTO,
-                    "{name} in {mode:?} must cycle ask → bypass"
+                    "{name} in {mode:?} must cycle ask → yolo"
                 );
                 assert_eq!(app.input, "", "{name} must not type into the composer");
             }
@@ -3118,6 +3282,79 @@ mod tests {
         }
     }
 
+    /// Brief mode folds thinking + tool output into summary rows, keeps the
+    /// diff of a change awaiting approval visible, and Ctrl+T's flag brings the
+    /// full output back.
+    #[test]
+    fn brief_mode_summarizes_and_full_mode_shows_everything() {
+        use crate::ui::types::Kind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.transcript.clear();
+        app.show_thinking = false;
+        app.push(Kind::Reasoning, "Check the config loader first. Then the UI.".to_string());
+        app.push(Kind::Tool, "read_file src/config.rs".to_string());
+        app.push(Kind::ToolResult, "SECRET_TOOL_OUTPUT".to_string());
+        app.push(Kind::Tool, "edit_file src/ui.rs".to_string());
+        app.push(Kind::DiffAdd, "+ added_line".to_string());
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+
+        app.mode = Mode::Approval("edit src/ui.rs".into());
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("considered  Check the config loader first."), "{screen}");
+        assert!(screen.contains("explored    read 1 file"), "{screen}");
+        assert!(!screen.contains("SECRET_TOOL_OUTPUT"), "{screen}");
+        assert!(screen.contains("added_line"), "pending edit's diff stays visible:\n{screen}");
+
+        app.mode = Mode::Idle;
+        app.push(Kind::ToolResult, "OK".to_string());
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("changed     src/ui.rs +1"), "{screen}");
+        assert!(!screen.contains("added_line"), "{screen}");
+
+        app.show_thinking = true;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("SECRET_TOOL_OUTPUT") && screen.contains("Then the UI."), "{screen}");
+    }
+
+    /// Committing live thinking (and the answer streaming after it) must not
+    /// move anything: the brief `thinking…` row becomes the `considered` row on
+    /// the same screen line, and the answer keeps its line too.
+    #[test]
+    fn committing_live_thinking_does_not_shift_the_screen() {
+        use crate::ui::types::Kind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let row_of = |screen: &str, needle: &str| screen.lines().position(|l| l.contains(needle));
+        for show in [false, true] {
+            for after_tool in [false, true] {
+                let mut app = App::new(test_ui_config(), Vec::new());
+                app.transcript.clear();
+                app.show_thinking = show;
+                app.push(Kind::User, "do it".to_string());
+                if after_tool {
+                    app.push(Kind::Tool, "read_file a.rs".to_string());
+                    app.push(Kind::ToolResult, "ok".to_string());
+                }
+                app.live_reasoning = "Look at the banner first. Then wrap.".into();
+                app.live = "Here is the answer.".into();
+                let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+                let before = draw(&mut app, &mut term);
+                app.flush_live();
+                let after = draw(&mut app, &mut term);
+                let thought = if show { "Look at the banner first." } else { "thinking…" };
+                let committed = if show { "Look at the banner first." } else { "considered  Look at the banner first." };
+                let ctx = format!("show={show} after_tool={after_tool}\n--before--\n{before}\n--after--\n{after}");
+                assert!(row_of(&before, thought).is_some(), "{ctx}");
+                assert_eq!(row_of(&before, thought), row_of(&after, committed), "{ctx}");
+                assert_eq!(row_of(&before, "Here is the answer."), row_of(&after, "Here is the answer."), "{ctx}");
+            }
+        }
+    }
+
     /// A tool result with newlines keeps its line structure. The transcript used
     /// to hand the whole multi-line string to the wrapper, which turned every
     /// newline into a space and reflowed `ls`/stack-trace output into one
@@ -3128,6 +3365,7 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::new(test_ui_config(), Vec::new());
+        app.show_thinking = true;
         app.transcript.clear();
         app.push(
             crate::ui::types::Kind::ToolResult,
@@ -3751,6 +3989,54 @@ mod tests {
         app.run_command("effort sideways", &h);
         assert_eq!(app.settings.reasoning, "high", "unchanged by a bad value");
         assert!(cmd_rx.try_iter().next().is_none());
+    }
+
+    /// Typing `/cmd ` lists that command's options in the palette, filtered
+    /// as you type; Enter on an option needing an argument fills the line
+    /// rather than running it, and a bare command lists its options.
+    #[test]
+    fn slash_commands_offer_their_options() {
+        use crate::ui::types::Kind;
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _cmd_rx) = test_handles();
+        for (opt, _) in crate::ui::types::SLASH_OPTIONS {
+            let cmd = opt.split(' ').next().unwrap();
+            assert!(crate::ui::types::SLASH_COMMANDS.iter().any(|(c, _)| *c == cmd), "{opt} names no command");
+        }
+        app.input = "/permissions ".into();
+        let opts: Vec<&str> = app.slash_suggestions().iter().map(|(c, _)| *c).collect();
+        assert_eq!(opts, ["/permissions list", "/permissions allow ", "/permissions deny ", "/permissions remove ", "/permissions reload"]);
+        app.input = "/effort x".into();
+        assert_eq!(app.slash_suggestions().iter().map(|(c, _)| *c).collect::<Vec<_>>(), ["/effort xhigh"]);
+        app.input = "/permissions allow bash(ls:*)".into();
+        assert!(app.slash_suggestions().is_empty(), "palette closes once the argument is being typed");
+
+        // Enter on a partial option that needs an argument fills the line.
+        app.input = "/permissions al".into();
+        app.cursor = app.char_len();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(app.input, "/permissions allow ");
+
+        // A bare command lists its options.
+        app.transcript.clear();
+        app.run_command("permissions", &h);
+        let text: Vec<&str> = app.transcript.iter().filter(|l| l.kind == Kind::Notice).map(|l| l.text.as_str()).collect();
+        assert!(text.contains(&"/permissions options:"), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("/permissions allow") && t.contains("never ask")), "{text:?}");
+    }
+
+    /// /yolo (and its old name /auto) toggles YOLO on and off, and the mode
+    /// lands in the settings that get saved for the next session.
+    #[test]
+    fn yolo_command_toggles_and_records_the_mode() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _cmd_rx) = test_handles();
+        app.run_command("yolo", &h);
+        assert_eq!((app.perm(), app.settings.permission.as_str()), (crate::agent::PERM_AUTO, "yolo"));
+        app.run_command("auto", &h);
+        assert_eq!((app.perm(), app.settings.permission.as_str()), (crate::agent::PERM_ASK, "ask"));
+        app.cycle_perm();
+        assert_eq!(app.settings.permission, "yolo", "Shift+Tab is recorded too");
     }
 
     /// Esc clears the line too (as the README promises) and must never quit.

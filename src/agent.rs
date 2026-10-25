@@ -22,7 +22,7 @@ const SESSION_START_TAG: &str = "SessionStart hook context:";
 
 /// Permission modes (cycled with Shift+Tab in the UI).
 pub const PERM_ASK: u8 = 0; // prompt before each write/edit/bash
-pub const PERM_AUTO: u8 = 1; // bypass — auto-approve everything
+pub const PERM_AUTO: u8 = 1; // YOLO — auto-approve everything
 pub const PERM_PLAN: u8 = 2; // read-only — refuse writes/bash, ask the model to plan
 
 /// Worker → UI.
@@ -73,6 +73,9 @@ pub enum UiEvent {
     /// `money::Balance`), so the status line can't mix units silently.
     Balance(crate::money::Balance),
     Notice(String),
+    /// Progress chatter about tool work ("running 3 read-only calls in
+    /// parallel…"): folded into the brief summary like the tools themselves.
+    Progress(String),
     Error(String),
     TurnDone,
     /// A suggested follow-up prompt generated after the turn completes.
@@ -1381,7 +1384,7 @@ impl Worker {
     /// sequential and in call order; only the tools' own work overlaps. The
     /// transcript gets each call's start/result pair once the batch is done.
     fn handle_parallel(&mut self, batch: &[AccumCall], base: usize) {
-        let _ = self.ui.send(UiEvent::Notice(format!(
+        let _ = self.ui.send(UiEvent::Progress(format!(
             "running {} read-only calls in parallel…",
             batch.len()
         )));
@@ -1504,7 +1507,7 @@ impl Worker {
 
     /// PreToolUse hooks (which may veto) and the permission rules. Err is the
     /// refusal to return as the call's result; deny rules are absolute, so
-    /// they hold in bypass mode too.
+    /// they hold in YOLO mode too.
     fn pre_tool(&mut self, name: &str, args: &Value) -> Result<Decision, String> {
         if self.hooks.has("PreToolUse") {
             match self.hooks.run("PreToolUse", name, &serde_json::json!({ "tool_input": args })) {

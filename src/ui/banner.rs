@@ -145,10 +145,20 @@ pub fn banner_lines(w: usize, ascii: bool, status: &[String]) -> Vec<BLine> {
     let head = format!("{tl}{h} SYSTEM ");
     let fill = w.saturating_sub(head.chars().count() + 1); // +1 for right corner
     out.push(BLine { text: format!("{head}{}{tr}", h.repeat(fill)), role: BRole::Frame });
-    // Status lines: │ text ... │
+    // Status lines: │ text ... │, wrapped inside the box with continuation rows
+    // indented past the 5-column label ("HW   ") so they never poke out of it.
+    let inner = w.saturating_sub(4).max(8); // 4 = "│ " + " │"
+    let opts = textwrap::Options::new(inner).subsequent_indent("     ");
     for line in status {
-        let pad = w.saturating_sub(line.chars().count() + 3); // 3 = "│ " + "│"
-        out.push(BLine { text: format!("{vbar} {line}{}{vbar}", " ".repeat(pad)), role: BRole::Data });
+        for (i, row) in textwrap::wrap(line, &opts).into_iter().enumerate() {
+            // A break before a " · " separator would start the row with it.
+            let row = match (i, row.trim_start().strip_prefix("· ").or_else(|| row.trim_start().strip_prefix("- "))) {
+                (1.., Some(rest)) => format!("     {rest}"),
+                _ => row.into_owned(),
+            };
+            let pad = w.saturating_sub(row.chars().count() + 3); // 3 = "│ " + "│"
+            out.push(BLine { text: format!("{vbar} {row}{}{vbar}", " ".repeat(pad)), role: BRole::Data });
+        }
     }
     // Bottom border: └───...──┘
     let bfill = w.saturating_sub(2); // bl + br = 2
@@ -253,5 +263,20 @@ mod tests {
         let ascii = banner_art(76, true);
         assert!(ascii.iter().all(|l| l.is_ascii()) && ascii.last().unwrap().contains('.'), "{ascii:?}");
         assert_eq!(banner_art(20, false), ["H A I K U   C O D E"]);
+    }
+
+    /// A long HW row wraps inside the SYSTEM box instead of running past its
+    /// right border, and every box row is exactly the banner width.
+    #[test]
+    fn long_status_rows_wrap_inside_the_box() {
+        let hw = "HW   Haiku R1~beta6+development (hrev60295) · aarch64 · 8 cores · MEM 831/16379MB".to_string();
+        for w in [40, 60, 76, 120] {
+            let lines = banner_lines(w, false, std::slice::from_ref(&hw));
+            let boxed: Vec<_> = lines.iter().skip_while(|l| !l.text.contains("SYSTEM")).collect();
+            assert!(boxed.iter().all(|l| l.text.chars().count() == w), "w={w}: {:?}", boxed.iter().map(|l| &l.text).collect::<Vec<_>>());
+            let data: Vec<_> = boxed.iter().filter(|l| matches!(l.role, BRole::Data)).collect();
+            assert_eq!(data.len() > 1, w < 90, "w={w}");
+            assert!(data.iter().skip(1).all(|l| l.text.starts_with("│      ") && !l.text.starts_with("│      ·")), "continuations indent past the label, no leading separator");
+        }
     }
 }

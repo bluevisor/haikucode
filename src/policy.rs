@@ -18,7 +18,7 @@
 //!
 //! Rules are merged from, lowest to highest priority: `config.json`
 //! (`permissions`), `.haikucode/settings.json`, `.haikucode/settings.local.json`.
-//! `deny` always wins over `allow` and is enforced even in bypass mode; a
+//! `deny` always wins over `allow` and is enforced even in YOLO mode; a
 //! matching `allow` skips the approval prompt in ask mode. Compound bash
 //! commands (`a && b | c`) are allowed only when every segment is allowed and
 //! denied when any segment is denied.

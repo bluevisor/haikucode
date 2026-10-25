@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 
 pub fn perm_name(p: u8) -> &'static str {
     match p {
-        crate::agent::PERM_AUTO => "bypass",
+        crate::agent::PERM_AUTO => "yolo",
         crate::agent::PERM_PLAN => "plan",
         _ => "ask",
     }
@@ -771,12 +771,12 @@ pub fn layout(kind: Kind, g: Glyphs) -> (usize, &'static str) {
         Kind::Tool => (2, g.tool),
         Kind::ToolResult | Kind::ToolErr => (4, g.result),
         Kind::DiffAdd | Kind::DiffDel | Kind::DiffCtx => (4, ""),
-        Kind::Notice => (2, ""),
+        Kind::Notice | Kind::Progress => (2, ""),
         Kind::ErrorK => (0, g.error),
         Kind::Blank => (0, ""),
         Kind::Code => (2, ""),
         Kind::Heading => (0, g.assistant),
-        Kind::Banner | Kind::BannerDim => (0, ""),
+        Kind::Banner | Kind::BannerDim | Kind::BannerBlock => (0, ""),
     }
 }
 

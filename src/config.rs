@@ -137,7 +137,13 @@ pub struct Config {
     /// every change is a restorable checkpoint. On by default; no-op outside a repo.
     #[serde(default = "default_true")]
     pub auto_commit: bool,
-    /// Default permission mode for new sessions: "ask", "bypass", or "plan".
+    /// Show the model's full reasoning, tool output and diffs in the
+    /// transcript. Off (the default), each run of work is collapsed into a
+    /// brief summary; Ctrl+T or `/thinking` flips it.
+    #[serde(default)]
+    pub show_thinking: bool,
+    /// Permission mode new sessions start in: "ask", "yolo", or "plan" ("bypass"
+    /// and "auto" still load as yolo). Saved whenever the mode is switched.
     #[serde(default = "default_permission")]
     pub permission: String,
     /// Max tool-call rounds per turn. 0 means "auto" (an internal safe limit).
@@ -148,7 +154,7 @@ pub struct Config {
     #[serde(default)]
     pub temperature: Option<f64>,
     /// How hard the model should reason: "auto" (send nothing; the model's own
-    /// default), "off", "low", "medium" or "high". Mapped per provider in
+    /// default), "off", "low", "medium", "high", "xhigh" or "max". Mapped per provider in
     /// `api::reasoning_fields` / the native adapters. Replaces the old
     /// DeepSeek-only `thinking` bool, which still loads (true → "medium").
     #[serde(default = "default_reasoning")]
@@ -283,7 +289,9 @@ fn default_price_out() -> f64 {
 const DEEPSEEK_CACHE_HIT_PRICE: f64 = 0.0028;
 
 /// The reasoning settings, in `/config` cycling order.
-pub const REASONING_LEVELS: [&str; 5] = ["auto", "off", "low", "medium", "high"];
+/// `xhigh` and `max` go out as-is where the provider has them (current Claude
+/// models, newer OpenAI GPT-5 models, OpenRouter) and as `high` elsewhere.
+pub const REASONING_LEVELS: [&str; 7] = ["auto", "off", "low", "medium", "high", "xhigh", "max"];
 
 fn default_reasoning() -> String {
     "auto".to_string()
@@ -335,6 +343,7 @@ impl Default for Config {
             price_currency: default_price_currency(),
             mcp_servers: BTreeMap::new(),
             auto_commit: true,
+            show_thinking: false,
             permission: default_permission(),
             max_tool_calls: default_max_tool_calls(),
             temperature: None,
@@ -538,6 +547,9 @@ impl Config {
                 cfg.extra.insert("mcp_servers".into(), m.clone());
             }
         }
+        if let Some(b) = v.get("show_thinking").and_then(|x| x.as_bool()) {
+            cfg.show_thinking = b;
+        }
         if let Some(b) = v.get("auto_commit").and_then(|x| x.as_bool()) {
             cfg.auto_commit = b;
         }
@@ -627,6 +639,11 @@ impl Config {
 
     /// Persist to disk with 0600 perms. An env-injected key is never written.
     pub fn save(&self) -> Result<()> {
+        // UI tests flip the theme, permission mode and brief view, each of
+        // which saves; never let them rewrite the real ~/config file.
+        if cfg!(test) {
+            return Ok(());
+        }
         let dir = config_dir();
         std::fs::create_dir_all(&dir).context("create config dir")?;
         let json = self.to_disk_json();
@@ -671,6 +688,9 @@ impl Config {
         // non-default values are written, keeping the common file minimal.
         if !on_disk.mcp_servers.is_empty() {
             json["mcp_servers"] = serde_json::to_value(&on_disk.mcp_servers).unwrap_or_default();
+        }
+        if on_disk.show_thinking {
+            json["show_thinking"] = serde_json::json!(true);
         }
         if !on_disk.auto_commit {
             json["auto_commit"] = serde_json::json!(false);
@@ -794,6 +814,13 @@ impl Config {
     /// DeepSeek is text-only and rejects the variant; most others accept it.
     pub fn supports_images(&self) -> bool {
         !matches!(self.provider.as_str(), "deepseek" | "zai")
+    }
+
+    /// Persist only the show-thinking toggle, preserving the rest of the file.
+    pub fn persist_show_thinking(on: bool) {
+        let mut disk = Config::load_disk();
+        disk.show_thinking = on;
+        let _ = disk.save();
     }
 
     /// Persist only the theme name, preserving the rest of the file.

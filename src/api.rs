@@ -583,11 +583,16 @@ pub(crate) fn reasoning_fields(cfg: &Config) -> Vec<(&'static str, serde_json::V
         return Vec::new();
     }
     let off = level == "off";
-    let effort = if off { "none" } else { level };
+    let top = matches!(level, "xhigh" | "max");
+    // Most effort dials stop at high.
+    let effort = if off { "none" } else if top { "high" } else { level };
     match cfg.provider.as_str() {
         // DeepSeek and Zhipu switch thinking on or off; there's no effort dial.
         "deepseek" | "zai" => vec![("thinking", json!({"type": if off { "disabled" } else { "enabled" }}))],
+        "openai" if top => vec![("reasoning_effort", json!(crate::native::openai_top_effort(&cfg.model)))],
         "openai" | "google" | "groq" => vec![("reasoning_effort", json!(effort))],
+        // OpenRouter's scale ends at xhigh and maps it to each model's own.
+        "openrouter" if top => vec![("reasoning", json!({"effort": "xhigh"}))],
         "openrouter" => vec![("reasoning", if off { json!({"enabled": false}) } else { json!({"effort": level}) })],
         // Its own Messages API carries effort; the compat endpoint isn't mapped.
         "anthropic" => Vec::new(),
@@ -950,6 +955,12 @@ mod balance_tests {
         assert_eq!(fields("openrouter", "medium"), j!({"reasoning": {"effort": "medium"}}));
         assert_eq!(fields("openrouter", "off"), j!({"reasoning": {"enabled": false}}));
         assert_eq!(fields("anthropic", "high"), j!({}));
+        // xhigh/max: passed on where the dial has them, else capped at high.
+        assert_eq!(fields("google", "max"), j!({"reasoning_effort": "high"}));
+        assert_eq!(fields("groq", "xhigh"), j!({"reasoning_effort": "high"}));
+        assert_eq!(fields("openrouter", "max"), j!({"reasoning": {"effort": "xhigh"}}));
+        assert_eq!(fields("deepseek", "max"), j!({"thinking": {"type": "enabled"}}));
+        assert_eq!(fields("splash", "xhigh")["reasoning_effort"], "high");
         assert_eq!(
             fields("splash", "off"),
             j!({"chat_template_kwargs": {"enable_thinking": false}, "reasoning_effort": "none"}),
