@@ -1,13 +1,14 @@
 # Haiku Code (haikucode)
 
 A full-screen agentic coding CLI written in Rust, running **on Haiku** (the
-BeOS-lineage OS; developed against Haiku R1~beta6 hrev60290 arm64 in a UTM VM).
+BeOS-lineage OS; developed against Haiku R1~beta6 hrev60290 arm64 in a UTM VM)
+and on macOS and Linux, where it replaces picoder.
 It talks to any OpenAI-compatible chat API (default: DeepSeek) and drives a
 Codex/Claude-Code-style tool loop with a ratatui terminal UI. It is a port of
 picoder (the Raspberry Pi Zero W agent); the `picoder` git remote is upstream.
 
-This is haikucode's own source. It builds natively on Haiku with
-`cargo build --release` — see "Building" below.
+This is haikucode's own source. It builds natively on Haiku, macOS and Linux
+with `cargo build --release` — see "Building" below.
 
 ## Layout
 
@@ -17,6 +18,9 @@ haiku/package.sh      on Haiku: build + wrap dist/haikucode-<ver>-<rev>-<arch>.h
 haiku/deploy.sh       on the Mac: sync source to $HAIKU_HOST, build + package there, activate
 haiku/launcher.sh     "apps/Haiku Code": Deskbar entry that opens haikucode in Terminal
 haiku/PackageInfo.in  .PackageInfo template (version/revision/arch filled in)
+haiku/release.sh      publish v<version> with the three Haiku packages
+.github/workflows/release.yml  on publish: attach macOS + Linux (musl) tarballs
+install.sh            curl | sh installer for macOS/Linux (→ ~/.local/bin)
 src/
   main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
   config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
@@ -171,6 +175,14 @@ Copying the .hpkg into `~/config/packages` activates it a moment later
 `~/config/data/deskbar/menu`). `deploy.sh` waits for deactivation, then
 activation, and `cmp`s the installed binary with the build: swapping a
 same-version package in one go races the package daemon.
+
+On macOS and Linux it's a plain `cargo build --release`; release builds come
+from `.github/workflows/release.yml`, which stamps `HAIKUCODE_ASSET`
+(`macos-arm64`, `linux-armv6`, …) into each so `update::platform()` finds its
+own tarball (the 32-bit ARM builds share a Rust arch). `update::install`
+replaces the running binary by renaming a staged copy over it, after the new
+one has answered `--version`. `config::adopt_picoder` copies
+`~/.config/picoder` into `~/.config/haikucode` on first run.
 
 Haiku-specific code is behind `cfg(target_os = "haiku")`: `config::CONFIG_SUBDIR`,
 `sysinfo::{haiku_os_name, mem_used_total}`, the `HAIKU_SHELL_RULE` in the system

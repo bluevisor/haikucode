@@ -373,6 +373,50 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(home).join(CONFIG_SUBDIR)
 }
 
+/// On first run on a host that had picoder (which Haiku Code replaces), copy
+/// its settings, memory, history, sessions, skills and commands from
+/// `~/.config/picoder` so nothing has to be set up again. Leaves picoder's
+/// directory as it was; does nothing once `config_dir()` exists. Returns a
+/// line saying what happened.
+pub fn adopt_picoder() -> Option<String> {
+    if cfg!(target_os = "haiku") || cfg!(test) {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    adopt_picoder_from(&home.join(".config/picoder"), &config_dir())
+}
+
+fn adopt_picoder_from(old: &Path, new: &Path) -> Option<String> {
+    if new.exists() || !old.join("config.json").is_file() {
+        return None;
+    }
+    fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            let ty = e.file_type()?;
+            if ty.is_dir() {
+                // `run/` holds a live picoder's sockets and locks.
+                if e.file_name() != "run" {
+                    copy_tree(&src, &dst)?;
+                }
+            } else if ty.is_file() {
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(())
+    }
+    match copy_tree(old, new) {
+        Ok(()) => Some(format!("imported your picoder settings, memory and sessions from {}", old.display())),
+        Err(e) => {
+            // Half a copy would hide the rest next launch: start clean instead.
+            let _ = std::fs::remove_dir_all(new);
+            Some(format!("couldn't import picoder's settings from {} ({e})", old.display()))
+        }
+    }
+}
+
 /// `config_dir()` as shown to people and the model, e.g. `~/config/settings/haikucode/`.
 pub fn config_dir_label() -> String {
     format!("~/{CONFIG_SUBDIR}/")
@@ -1087,6 +1131,26 @@ mod tests {
         atomic_write(&fresh, b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "{}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// picoder's directory is copied over once, without its `run/` sockets,
+    /// and never over an existing Haiku Code setup.
+    #[test]
+    fn picoder_settings_are_adopted_once() {
+        let root = std::env::temp_dir().join(format!("hc-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, new) = (root.join("picoder"), root.join("haikucode"));
+        std::fs::create_dir_all(old.join("sessions/abc")).unwrap();
+        std::fs::create_dir_all(old.join("run")).unwrap();
+        std::fs::write(old.join("config.json"), "{}").unwrap();
+        std::fs::write(old.join("sessions/abc/1.json"), "[]").unwrap();
+        std::fs::write(old.join("run/sock"), "").unwrap();
+        assert!(adopt_picoder_from(&old, &new).unwrap().starts_with("imported"));
+        assert!(new.join("config.json").is_file());
+        assert!(new.join("sessions/abc/1.json").is_file());
+        assert!(!new.join("run").exists());
+        assert!(adopt_picoder_from(&old, &new).is_none(), "second run copies nothing");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

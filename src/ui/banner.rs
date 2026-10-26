@@ -5,7 +5,14 @@
 use super::palette::{self};
 use super::types::{BannerColor, Kind, TLine};
 
-pub const TAGLINE: &str = "an agentic coding CLI for Haiku";
+/// Names the OS it's running on.
+pub const TAGLINE: &str = if cfg!(target_os = "macos") {
+    "an agentic coding CLI for macOS"
+} else if cfg!(target_os = "linux") {
+    "an agentic coding CLI for Linux"
+} else {
+    "an agentic coding CLI for Haiku"
+};
 
 /// 3x5 block glyphs for "HAIKU CODE" (the blank is the word gap). Small enough
 /// that the heavy, double-width logo still fits Haiku Terminal's default 80
