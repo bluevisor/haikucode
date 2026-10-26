@@ -109,7 +109,7 @@ can be scripted with `hey`.
 - Native apps use the C++ Be API (`#include <Application.h>`, link `-lbe`); build with gcc/g++ \
 or `cargo`.";
 
-const HELP: &str = "haikucode — Haiku Code, an agentic coding CLI for Haiku (a picoder port)
+const HELP: &str = "haikucode — Haiku Code, an agentic coding CLI for Haiku, macOS and Linux
 `hc` is a short alias for `haikucode` in the Haiku package.
 
 usage:
@@ -155,12 +155,19 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{HELP}");
+        // The paths in HELP are Haiku's; show this host's.
+        let dir = config::config_dir_label();
+        println!("{}", HELP.replace("~/config/settings/haikucode/", &dir).replace("~/config/settings/haikucode", dir.trim_end_matches('/')));
         return;
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("haikucode {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+    // Haiku Code replaces picoder: carry its setup over on first run.
+    let adopted = config::adopt_picoder();
+    if let Some(a) = &adopted {
+        eprintln!("haikucode: {a}");
     }
     if args.iter().any(|a| a == "--config" || a == "--setup") {
         if let Err(e) = config::run_setup() {
@@ -330,7 +337,8 @@ fn main() {
             std::process::exit(2);
         }
         let replay = resumed.as_ref().map(|(_, _, msgs)| sessions::replay(msgs)).unwrap_or_default();
-        let (messages, session, notes) = start_session(&store, resumed, fork_session, &cfg);
+        let (messages, session, mut notes) = start_session(&store, resumed, fork_session, &cfg);
+        notes.splice(0..0, adopted);
         run_tui(cfg, messages, notes, auto, session, replay, resume == Some(None));
     }
 }

@@ -1,14 +1,18 @@
 # Haiku Code
 
 A full-screen **agentic coding CLI** for [Haiku](https://www.haiku-os.org/),
-the BeOS-inspired open-source OS. It runs in Haiku's Terminal, talks to any
+the BeOS-inspired open-source OS, and for macOS and Linux (Intel and ARM). It
+runs in Haiku's Terminal or any other terminal, talks to any
 OpenAI-compatible chat API (default: DeepSeek) plus Anthropic's Messages API
 and OpenAI's Responses API natively, and drives a Codex / Claude-Code-style
 tool loop inside a [ratatui](https://ratatui.rs) terminal UI.
 
 Haiku Code is a port of [picoder](https://github.com/bluevisor/picoder), the
-coding agent built for the Raspberry Pi Zero W. It is one ~5 MB native Haiku
-binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
+coding agent built for the Raspberry Pi Zero W, and replaces it: it does
+everything picoder does, on the same machines. It is one ~5 MB native binary
+(`haikucode`), packaged on Haiku as an `.hpkg` with a Deskbar entry. Coming
+from picoder, the first launch copies `~/.config/picoder` (settings, keys,
+memory, sessions, skills) into `~/.config/haikucode`.
 
 ![Haiku Code in Haiku's Terminal](assets/screenshot.png)
 
@@ -212,29 +216,47 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 
 ## Install / build
 
-The quickest way: download the `.hpkg` for your Haiku (arm64, x86_64, or
-x86_gcc2 for 32-bit) from the
+**Haiku:** download the `.hpkg` for your Haiku (arm64, x86_64, or x86_gcc2 for
+32-bit) from the
 [latest release](https://github.com/bluevisor/haikucode/releases/latest) and
 copy it into `~/config/packages` (it activates at once, no reboot).
+
+**macOS and Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bluevisor/haikucode/main/install.sh | sh
+```
+
+installs the build for your machine in `~/.local/bin` (`HAIKUCODE_DIR=…` for
+elsewhere). Releases carry `macos-arm64`, `macos-x86_64`, `linux-x86_64`,
+`linux-arm64` (Pi 3/4/5, Jetson, ARM servers), `linux-armv7` (32-bit Pi OS)
+and `linux-armv6` (Pi Zero W) tarballs; the Linux ones are static musl
+binaries, so any distro and glibc works.
 
 ### Updates
 
 Haiku Code checks GitHub for a newer release when it starts (at most once a
 day) and says so in the transcript. `/update` (or `haikucode update` in a
-shell) downloads the new package, checks its SHA-256 against the release, and
-swaps it into `~/config/packages`; the next launch runs the new version.
-`haikucode update --force` reinstalls the current release. Turn the launch
-check off with `"update_check": false` in `config.json`. Only the
-`~/config/packages` install updates itself; a system-wide (`pkgman`) install
-is left to `pkgman`.
+shell) downloads the build for this machine and checks its SHA-256 against the
+release. On Haiku it swaps the package into `~/config/packages`; on macOS and
+Linux it replaces the `haikucode` binary in place, after checking the new one
+runs. The next launch runs the new version. `haikucode update --force`
+reinstalls the current release. Turn the launch check off with
+`"update_check": false` in `config.json`. A copy someone else manages (a
+system-wide `pkgman` install, Homebrew, a `cargo build` tree) is left alone.
 
-Publishing a release (maintainers, from the Mac): bump `version` in
-`Cargo.toml`, commit and push `main`, then `haiku/release.sh` builds the
-package on the Haiku guest and creates the `v<version>` release with it.
+Publishing a release (maintainers, from the Mac): land the version bump in
+`Cargo.toml` through a PR, then on an up-to-date `main` run
+`haiku/release.sh`. It builds the Haiku packages and creates the `v<version>`
+release with them; publishing it starts `.github/workflows/release.yml`, which
+attaches the macOS and Linux tarballs.
 
 ### Building from source
 
-Rust can't cross-compile to Haiku from macOS here, so Haiku Code builds
+On macOS or Linux it's a plain `cargo build --release`
+(`target/release/haikucode`).
+
+For Haiku, Rust can't cross-compile to Haiku from macOS here, so Haiku Code builds
 natively on Haiku. You need `rustc`/`cargo` for your Haiku architecture (the
 arm64 VM uses a self-built `aarch64-unknown-haiku` nightly in
 `/boot/system/non-packaged`; on x86_64, `pkgman install rust_bin` works).
@@ -281,12 +303,14 @@ cargo test -- --ignored   # also runs the live MCP / web tests
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite on Linux;
-Haiku itself is covered by running the suite on the VM.
+Haiku itself is covered by running the suite on the VM, and macOS by running
+it on the Mac.
 
 ## Configuration
 
 On first run, Haiku Code walks you through provider, model, and API key. State lives
-in `~/config/settings/haikucode/`:
+in `~/config/settings/haikucode/` on Haiku and `~/.config/haikucode/` on macOS
+and Linux:
 
 ```
 config.json   provider / model / key (0600), max_tool_calls, prices

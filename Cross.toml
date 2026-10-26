@@ -1,0 +1,4 @@
+# cross builds inside a container and forwards no env by default. The release
+# workflow stamps each build's asset name in (see src/update.rs `platform`).
+[build.env]
+passthrough = ["HAIKUCODE_ASSET"]
