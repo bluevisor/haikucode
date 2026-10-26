@@ -212,7 +212,8 @@ binary (`haikucode`), packaged as an `.hpkg` with a Deskbar entry.
 
 ## Install / build
 
-The quickest way on Haiku arm64: download the `.hpkg` from the
+The quickest way: download the `.hpkg` for your Haiku (arm64, x86_64, or
+x86_gcc2 for 32-bit) from the
 [latest release](https://github.com/bluevisor/haikucode/releases/latest) and
 copy it into `~/config/packages` (it activates at once, no reboot).
 
@@ -254,6 +255,19 @@ haiku/deploy.sh                  # sync source, build + package on Haiku, activa
 haiku/deploy.sh fetch            # ...and copy the .hpkg back into ./dist
 HAIKU_HOST=haiku haiku/deploy.sh # another ssh destination (default: haiku-dbg)
 ```
+
+For Intel Haiku, cross-compile from the Mac in Docker (Haiku's R1/beta5
+cross-compiler image plus Rust nightly with `-Zbuild-std`, since the Haiku
+targets are tier 3); the package is then made on the Haiku box:
+
+```sh
+haiku/cross.sh x86_64            # dist/haikucode-<ver>-1-x86_64.hpkg
+haiku/cross.sh x86               # dist/haikucode-<ver>-1-x86_gcc2.hpkg (32-bit Haiku,
+                                 # built for its gcc 13 x86 secondary architecture)
+```
+
+`haiku/release.sh` builds all three (arm64, x86_64, x86_gcc2) and attaches them
+to the GitHub release.
 
 The package installs `bin/haikucode` (plus `hc`, a short alias), the
 `apps/Haiku Code` launcher and its Deskbar entry. Run `haikucode` or `hc` from

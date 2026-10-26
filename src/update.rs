@@ -24,10 +24,13 @@ pub struct Release {
     sha256: Option<String>,
 }
 
-/// This machine's package architecture, as `getarch` names it.
+/// The package architecture this build's release asset carries: `getarch`'s
+/// name, except that the 32-bit build (for the x86 secondary arch of
+/// x86_gcc2h Haiku) ships in an x86_gcc2 package, like HaikuPorts' `_x86` ones.
 fn arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
+        "x86" => "x86_gcc2",
         a => a,
     }
 }
