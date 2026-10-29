@@ -2412,7 +2412,7 @@ impl App {
         let w = width.saturating_sub(2).max(8);
         for bl in banner_lines(w, self.ascii, &self.banner_status) {
             let (kind, color) = match bl.role {
-                BRole::Art(i) => (Kind::Banner, Some(BannerColor::Rainbow(i))),
+                BRole::Art(i, half) => (Kind::Banner, Some(BannerColor::Rainbow(i, half))),
                 BRole::Version => (Kind::Banner, None),
                 BRole::Tagline => (Kind::BannerDim, None),
                 BRole::Frame | BRole::Data => (Kind::BannerDim, Some(BannerColor::Accent)),

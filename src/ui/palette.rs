@@ -337,6 +337,17 @@ pub fn ansi_fg(c: Color) -> String {
     }
 }
 
+/// `ansi_fg`'s background twin: 38→48, 3x→4x, 9x→10x.
+pub fn ansi_bg(c: Color) -> String {
+    let fg = ansi_fg(c);
+    match fg.strip_prefix("\x1b[") {
+        Some(rest) if rest.starts_with("38;") => format!("\x1b[48{}", &rest[2..]),
+        Some(rest) if rest.starts_with('3') => format!("\x1b[4{}", &rest[1..]),
+        Some(rest) if rest.starts_with('9') => format!("\x1b[10{}", &rest[1..]),
+        _ => fg,
+    }
+}
+
 /// Best-effort RGB for a `Color`, so we can shade named theme colors too.
 pub fn color_to_rgb(c: Color) -> (u8, u8, u8) {
     match c {

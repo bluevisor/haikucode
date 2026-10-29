@@ -351,11 +351,12 @@ fn render_one_line(
         let rainbow = if is_16color_terminal() { palette::APPLE_RAINBOW_16 } else { palette::APPLE_RAINBOW };
         let c = match bc {
             BannerColor::Fixed(c) => c,
-            BannerColor::Rainbow(i) => palette::banner_row_color(p, &rainbow, i, is_16color_terminal()),
+            BannerColor::Rainbow(i, _) => palette::banner_row_color(p, &rainbow, i, is_16color_terminal()),
             BannerColor::Accent => p.accent,
         };
-        if matches!(bc, BannerColor::Rainbow(_)) {
-            art = Some(c);
+        if let BannerColor::Rainbow(i, half) = bc {
+            let below = palette::banner_row_color(p, &rainbow, i + 1, is_16color_terminal());
+            art = Some((c, half.then_some(below)));
         }
         base = base.fg(c);
     }
@@ -397,7 +398,7 @@ fn render_one_line(
         }
         let used = prefix_w + piece.chars().count();
         match art {
-            Some(c) => spans.extend(art_spans(&piece, c, p.bg, base)),
+            Some((top, bottom)) => spans.extend(art_spans(&piece, top, bottom, p.bg, base)),
             None => spans.push(Span::styled(piece, base)),
         }
         // Extend the gray band to the full width.
@@ -408,26 +409,31 @@ fn render_one_line(
     }
 }
 
-/// A logo row as colored cells: `█` and its `░` shadow become spaces with a
-/// background. Fonts draw block elements at their own widths (Haiku Terminal's
-/// fallback glyph is wider than a cell, so the logo smeared across the line); a
-/// space is one cell everywhere.
-fn art_spans(piece: &str, c: Color, bg: Color, base: Style) -> Vec<Span<'static>> {
-    let shadow = palette::shadow_color(c, bg, is_16color_terminal());
-    let style_of = |ch: char| match ch {
-        '█' => Style::default().bg(c),
-        '░' => Style::default().bg(shadow),
-        _ => base,
+/// A logo row as colored cells. A half-block row (`bottom` set) keeps `▀`/`▄`
+/// in their pixel row's color and turns `█` into `▀` over the lower row's
+/// color, so each pixel row keeps its own stripe. Other rows draw `█` and its
+/// `░` shadow as background-colored spaces: fonts draw block elements at their
+/// own widths (Haiku Terminal's fallback glyph is wider than a cell, so the
+/// logo smeared across the line); a space is one cell everywhere.
+fn art_spans(piece: &str, top: Color, bottom: Option<Color>, bg: Color, base: Style) -> Vec<Span<'static>> {
+    let shadow = palette::shadow_color(top, bg, is_16color_terminal());
+    let cell = |ch: char| match (ch, bottom) {
+        ('█', Some(b)) => ('▀', Style::default().fg(top).bg(b)),
+        ('▀', Some(_)) => ('▀', Style::default().fg(top)),
+        ('▄', Some(b)) => ('▄', Style::default().fg(b)),
+        ('█', None) => (' ', Style::default().bg(top)),
+        ('░', None) => (' ', Style::default().bg(shadow)),
+        _ => (ch, base),
     };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let (mut run, mut cur) = (String::new(), base);
     for ch in piece.chars() {
-        let st = style_of(ch);
+        let (out, st) = cell(ch);
         if st != cur && !run.is_empty() {
             spans.push(Span::styled(std::mem::take(&mut run), cur));
         }
         cur = st;
-        run.push(if matches!(ch, '█' | '░') { ' ' } else { ch });
+        run.push(out);
     }
     if !run.is_empty() {
         spans.push(Span::styled(run, cur));
@@ -797,18 +803,30 @@ pub fn parse_max_tool_calls(s: &str) -> u32 {
 mod tests {
     use super::*;
 
-    /// Haiku Terminal drew `█` wider than a cell and smeared the logo; logo
-    /// rows must reach the screen as background-colored spaces instead.
+    /// Haiku Terminal drew `█` wider than a cell and smeared the logo, so cell
+    /// rows reach the screen as background-colored spaces.
     #[test]
-    fn logo_rows_render_as_colored_cells_not_block_glyphs() {
+    fn logo_cell_rows_render_as_colored_cells_not_block_glyphs() {
         let p = palette::palette_by_name("Rainbow");
         let mut out = Vec::new();
-        render_tline(&mut out, Kind::Banner, " ██ ░░x", false, Some(BannerColor::Rainbow(0)), 80, super::super::types::GLYPHS_U, &p, false);
+        render_tline(&mut out, Kind::Banner, " ██ ░░x", false, Some(BannerColor::Rainbow(0, false)), 80, super::super::types::GLYPHS_U, &p, false);
         let spans = &out[0].spans;
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "      x");
-        assert!(spans.iter().any(|s| s.content == "  " && s.style.bg.is_some()), "{spans:?}");
         assert_eq!(spans.iter().filter(|s| s.style.bg.is_some()).count(), 2, "fill and shadow: {spans:?}");
+    }
+
+    /// A half-block row's full cells are `▀` over the next pixel row's color.
+    #[test]
+    fn logo_half_rows_color_each_pixel_row() {
+        let p = palette::palette_by_name("Rainbow");
+        let mut out = Vec::new();
+        render_tline(&mut out, Kind::Banner, " ██ ▄x", false, Some(BannerColor::Rainbow(0, true)), 80, super::super::types::GLYPHS_U, &p, false);
+        let spans = &out[0].spans;
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " ▀▀ ▄x");
+        let full = spans.iter().find(|s| s.content == "▀▀").unwrap();
+        assert!(full.style.fg.is_some() && full.style.bg.is_some() && full.style.fg != full.style.bg, "{spans:?}");
     }
 
     // Plain (text, modifier-or-fg) view of inline parsing, ignoring the base style.

@@ -14,9 +14,9 @@ pub const TAGLINE: &str = if cfg!(target_os = "macos") {
     "an agentic coding CLI for Haiku"
 };
 
-/// 3x5 block glyphs for "HAIKU CODE" (the blank is the word gap). Small enough
-/// that the heavy, double-width logo still fits Haiku Terminal's default 80
-/// columns; adding a letter is a one-line change.
+/// 3x5 block glyphs for "HAIKU CODE" (the blank is the word gap). Drawn with
+/// half blocks, two pixel rows per text row, the logo is 37x3 cells; adding a
+/// letter is a one-line change.
 const ART_GLYPHS: [&[&str; 5]; 10] = [
     &["# #", "# #", "###", "# #", "# #"], // H
     &["###", "# #", "###", "# #", "# #"], // A
@@ -30,6 +30,11 @@ const ART_GLYPHS: [&[&str; 5]; 10] = [
     &["###", "#  ", "## ", "#  ", "###"], // E
 ];
 
+/// Whether the Unicode logo is drawn with `▀`/`▄` half blocks. Haiku Terminal's
+/// default font has no block elements and its fallback glyphs are wider than a
+/// cell, so there the logo stays one background-colored cell per pixel.
+pub const HALF_BLOCKS: bool = !cfg!(target_os = "haiku");
+
 /// The glyph table as a grid of cells, one column between glyphs.
 fn art_cells() -> Vec<Vec<bool>> {
     (0..5)
@@ -40,8 +45,8 @@ fn art_cells() -> Vec<Vec<bool>> {
         .collect()
 }
 
-/// Heavy Unicode logo: every cell two columns wide, with a `░` drop shadow one
-/// cell down and to the right of each filled cell.
+/// Heavy Unicode logo for very wide terminals: every cell two columns wide,
+/// with a `░` drop shadow one cell down and to the right of each filled cell.
 fn art_heavy() -> Vec<String> {
     let cells = art_cells();
     let (rows, cols) = (cells.len(), cells[0].len());
@@ -57,6 +62,30 @@ fn art_heavy() -> Vec<String> {
                     } else {
                         "  "
                     }
+                })
+                .collect();
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// Banner width from which the heavy logo replaces the small one.
+const HEAVY_MIN_WIDTH: usize = 150;
+
+/// Half-block logo: pixel rows packed in pairs, `▀` top only, `▄` bottom
+/// only, `█` both (the renderers color the two halves separately).
+fn art_half() -> Vec<String> {
+    let cells = art_cells();
+    cells
+        .chunks(2)
+        .map(|pair| {
+            let bottom = |c: usize| pair.get(1).is_some_and(|r| r[c]);
+            let line: String = (0..pair[0].len())
+                .map(|c| match (pair[0][c], bottom(c)) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (false, false) => ' ',
                 })
                 .collect();
             line.trim_end().to_string()
@@ -86,22 +115,21 @@ fn ascii_shadow_row() -> String {
     shadow.into_iter().collect::<String>().trim_end().to_string()
 }
 
-/// Pick the widest HAIKU CODE art that fits in `w` columns.
-fn banner_art(w: usize, ascii: bool) -> Vec<String> {
-    let heavy = art_heavy();
-    let heavy_w = heavy.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let narrow_w = art_cells()[0].len();
-    if !ascii && w >= heavy_w {
-        heavy
-    } else if w > narrow_w {
-        let mut art = art_glyphs(if ascii { '#' } else { '█' });
-        // ASCII gets a drop-shadow row; Unicode non-heavy gets none (too narrow).
-        if ascii {
-            art.push(ascii_shadow_row());
-        }
-        art
+/// The HAIKU CODE art for `w` columns, or the name spelled out when it won't
+/// fit, and whether it's half blocks (two pixel rows per line).
+fn banner_art(w: usize, ascii: bool) -> (Vec<String>, bool) {
+    if w < art_cells()[0].len() {
+        (vec!["H A I K U   C O D E".to_string()], false)
+    } else if ascii {
+        let mut art = art_glyphs('#');
+        art.push(ascii_shadow_row());
+        (art, false)
+    } else if w >= HEAVY_MIN_WIDTH {
+        (art_heavy(), false)
+    } else if HALF_BLOCKS {
+        (art_half(), true)
     } else {
-        vec!["H A I K U   C O D E".to_string()]
+        (art_glyphs('█'), false)
     }
 }
 
@@ -109,7 +137,7 @@ fn banner_art(w: usize, ascii: bool) -> Vec<String> {
 /// same layout identically.
 #[derive(Clone, Copy)]
 pub enum BRole {
-    Art(usize), // rainbow/mono block-art row
+    Art(usize, bool), // rainbow/mono block-art row by its top pixel row; half blocks?
     Version,    // bold accent
     Tagline,    // dim
     Frame,      // dim panel rule / blank
@@ -128,7 +156,7 @@ pub fn banner_lines(w: usize, ascii: bool, status: &[String]) -> Vec<BLine> {
         let pad = " ".repeat(w.saturating_sub(s.chars().count()) / 2);
         format!("{pad}{s}")
     };
-    let art = banner_art(w, ascii);
+    let (art, half) = banner_art(w, ascii);
     let artw = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let art_pad = " ".repeat(w.saturating_sub(artw) / 2);
 
@@ -136,7 +164,7 @@ pub fn banner_lines(w: usize, ascii: bool, status: &[String]) -> Vec<BLine> {
     // Breathing room between the box title (working path) and the logo.
     out.push(BLine { text: String::new(), role: BRole::Frame });
     for (i, l) in art.iter().enumerate() {
-        out.push(BLine { text: format!("{art_pad}{l}"), role: BRole::Art(i) });
+        out.push(BLine { text: format!("{art_pad}{l}"), role: BRole::Art(if half { 2 * i } else { i }, half) });
     }
     out.push(BLine { text: String::new(), role: BRole::Frame });
     out.push(BLine { text: center(&format!("Haiku Code v{}", env!("CARGO_PKG_VERSION"))), role: BRole::Version });
@@ -186,17 +214,24 @@ pub fn banner_ansi(width: u16, ascii: bool, theme: &str, status: &[String]) -> S
     let mut out = String::new();
     for bl in banner_lines(w, ascii, status) {
         let text = match bl.role {
-            // Same cells-not-glyphs logo as the TUI (see helpers::art_spans),
-            // drawn as reverse-video spaces.
-            BRole::Art(i) => {
+            // Same logo as the TUI (see helpers::art_spans): half blocks with
+            // the lower pixel row's color, or reverse-video spaces.
+            BRole::Art(i, half) => {
                 let c = palette::banner_row_color(&p, &rainbow, i, sixteen);
-                let (fg, shadow) = (palette::ansi_fg(c), palette::ansi_fg(palette::shadow_color(c, p.bg, sixteen)));
-                bl.text.replace('█', "\x1b[7m \x1b[27m").replace('░', &format!("{shadow}\x1b[7m \x1b[27m{fg}"))
+                let below = palette::banner_row_color(&p, &rainbow, i + 1, sixteen);
+                let fg = palette::ansi_fg(c);
+                if half {
+                    let (fg_below, bg_below) = (palette::ansi_fg(below), palette::ansi_bg(below));
+                    bl.text.replace('█', &format!("{bg_below}▀\x1b[49m")).replace('▄', &format!("{fg_below}▄{fg}"))
+                } else {
+                    let shadow = palette::ansi_fg(palette::shadow_color(c, p.bg, sixteen));
+                    bl.text.replace('█', "\x1b[7m \x1b[27m").replace('░', &format!("{shadow}\x1b[7m \x1b[27m{fg}"))
+                }
             }
             _ => bl.text,
         };
         let prefix = match bl.role {
-            BRole::Art(i) => palette::ansi_fg(palette::banner_row_color(&p, &rainbow, i, sixteen)),
+            BRole::Art(i, _) => palette::ansi_fg(palette::banner_row_color(&p, &rainbow, i, sixteen)),
             // Accent/notice are the theme's own colors; on a 16-color console an
             // `Rgb` prefix is an escape the console drops, so the frame/data
             // text would inherit whatever color was last set.
@@ -231,7 +266,7 @@ pub fn push_banner_transcript(
     let w = (width as usize).saturating_sub(4).max(8);
     for bl in banner_lines(w, ascii, &status) {
         let color = match bl.role {
-            BRole::Art(i) => Some(BannerColor::Rainbow(i)),
+            BRole::Art(i, half) => Some(BannerColor::Rainbow(i, half)),
             BRole::Version | BRole::Data => Some(BannerColor::Accent),
             BRole::Tagline | BRole::Frame => Some(BannerColor::Fixed(
                 palette::palette_by_name(theme).notice,
@@ -254,22 +289,29 @@ pub fn push_banner_transcript(
 mod tests {
     use super::*;
 
-    /// Haiku Terminal opens at 80 columns; the TUI leaves 76 for the banner.
+    /// The logo is opencode-sized: 37 columns, 3 half-block rows (5 cell rows
+    /// on Haiku, where block glyphs smear).
     #[test]
-    fn the_heavy_logo_fits_an_80_column_terminal() {
-        let art = banner_art(76, false);
-        assert!(art[0].contains('█') && art.iter().any(|l| l.contains('░')), "{art:?}");
-        assert!(art.iter().all(|l| l.chars().count() <= 76), "{art:?}");
-        assert_eq!(art.len(), 6, "five glyph rows plus the shadow row");
+    fn the_logo_is_small() {
+        let (art, half) = banner_art(76, false);
+        assert!(art.iter().all(|l| l.chars().count() <= 37), "{art:?}");
+        assert_eq!((art.len(), half), if HALF_BLOCKS { (3, true) } else { (5, false) }, "{art:?}");
+        assert!(art[0].contains('█'), "{art:?}");
+    }
+
+    /// Very wide terminals get the big double-width logo with its drop shadow.
+    #[test]
+    fn very_wide_terminals_get_the_heavy_logo() {
+        let (art, half) = banner_art(HEAVY_MIN_WIDTH, false);
+        assert!(!half && art.len() == 6 && art.iter().any(|l| l.contains('░')), "{art:?}");
+        assert!(banner_art(HEAVY_MIN_WIDTH - 1, false).0.iter().all(|l| !l.contains('░')));
     }
 
     #[test]
-    fn narrow_terminals_fall_back_to_smaller_art() {
-        let small = banner_art(50, false);
-        assert!(small.iter().all(|l| !l.contains('░')) && small[0].contains('█'), "{small:?}");
-        let ascii = banner_art(76, true);
+    fn narrow_terminals_fall_back_to_text() {
+        let (ascii, _) = banner_art(HEAVY_MIN_WIDTH, true);
         assert!(ascii.iter().all(|l| l.is_ascii()) && ascii.last().unwrap().contains('.'), "{ascii:?}");
-        assert_eq!(banner_art(20, false), ["H A I K U   C O D E"]);
+        assert_eq!(banner_art(36, false).0, ["H A I K U   C O D E"]);
     }
 
     /// A long HW row wraps inside the SYSTEM box instead of running past its
