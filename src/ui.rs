@@ -3888,6 +3888,95 @@ mod tests {
         assert!(matches!(app.mode, Mode::Busy), "still busy, not interrupted");
     }
 
+    /// The composer carries the readline/Emacs line-editing shortcuts: Ctrl+A/E
+    /// (start/end), Ctrl+K/U (kill to end/start), Ctrl+W (kill word), Ctrl+Y
+    /// (yank it back), Ctrl+B/F and Alt+B/F (char/word motion), Ctrl+D
+    /// (delete-char, quitting only on an empty line), Alt+D (kill word
+    /// forward) — and Ctrl+K/U must not eat the newline that ends the line.
+    #[test]
+    fn composer_accepts_readline_shortcuts() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        typed(&mut app, &h, "one two three");
+
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        assert_eq!(app.cursor, 0, "Ctrl+A goes to the start of the line");
+        app.on_key(ctrl(KeyCode::Char('e')), &h);
+        assert_eq!(app.cursor, 13, "Ctrl+E goes to the end of the line");
+
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        assert_eq!(app.cursor, 11, "Ctrl+B moves back a char");
+        app.on_key(ctrl(KeyCode::Char('f')), &h);
+        assert_eq!(app.cursor, 12, "Ctrl+F moves forward a char");
+
+        // Alt+B/F move by word (they used to type a bare 'b'/'f').
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT), &h);
+        assert_eq!(app.cursor, 8, "Alt+B lands on the start of \"three\"");
+        assert_eq!(app.input, "one two three", "Alt+B doesn't type its letter");
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT), &h);
+        assert_eq!(app.cursor, 13);
+
+        // Ctrl+K kills to the end of the line, Ctrl+U back to its start, and
+        // Ctrl+Y puts the last kill back at the cursor.
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('k')), &h);
+        assert_eq!(app.input, "one two t", "Ctrl+K kills to the end of the line");
+        app.on_key(ctrl(KeyCode::Char('u')), &h);
+        assert_eq!(app.input, "", "Ctrl+U kills back to the start");
+        app.on_key(ctrl(KeyCode::Char('y')), &h);
+        assert_eq!(app.input, "one two t", "Ctrl+Y yanks the last kill");
+
+        // Ctrl+W kills the word before the cursor.
+        app.on_key(ctrl(KeyCode::Char('w')), &h);
+        assert_eq!(app.input, "one two ", "Ctrl+W kills the word before");
+        app.on_key(ctrl(KeyCode::Char('y')), &h);
+        assert_eq!(app.input, "one two t");
+
+        // Alt+D kills the word after the cursor.
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT), &h);
+        assert_eq!(app.input, "two t", "Alt+D kills the word forward");
+
+        // Lines are separate: Ctrl+K stops at the newline, Ctrl+D joins them.
+        app.input = "abc\ndef".into();
+        app.cursor = 1;
+        app.on_key(ctrl(KeyCode::Char('k')), &h);
+        assert_eq!(app.input, "a\ndef", "Ctrl+K stops at the end of the line");
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert_eq!(app.input, "adef", "Ctrl+D deletes the newline, joining the lines");
+
+        // Ctrl+D on a non-empty line edits instead of arming the quit; an
+        // empty line still quits on the second press.
+        app.cursor = 0;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert_eq!(app.input, "def");
+        assert!(!app.should_quit(), "a delete must not quit");
+        app.input.clear();
+        app.cursor = 0;
+        app.last_ctrl_c = None;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert!(!app.should_quit(), "one press only arms the quit");
+        assert!(app.last_ctrl_c.is_some(), "the empty line does arm it");
+    }
+
+    /// The readline keys edit the queued draft while the agent is running too;
+    /// only Esc / Ctrl+C / Ctrl+D keep their interrupt meaning there.
+    #[test]
+    fn readline_shortcuts_work_while_busy() {
+        let (mut app, h) = scrollable_app();
+        app.mode = Mode::Busy;
+        typed(&mut app, &h, "queued draft");
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        assert_eq!(app.cursor, 0);
+        app.on_key(ctrl(KeyCode::Char('e')), &h);
+        assert_eq!(app.cursor, 12);
+        app.on_key(ctrl(KeyCode::Char('w')), &h);
+        assert_eq!(app.input, "queued ", "Ctrl+W edits the queued draft");
+        assert!(matches!(app.mode, Mode::Busy), "and doesn't interrupt the turn");
+    }
+
     /// Ctrl+C must work with a draft in the composer. It used to be swallowed:
     /// the `Char` arm's CONTROL guard rejected it, so nothing happened at all —
     /// no clear, no quit, no way out of the TUI short of killing the process.
