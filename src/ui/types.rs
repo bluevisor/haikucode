@@ -211,8 +211,9 @@ pub enum BannerColor {
     /// A fixed color (no palette reactivity).
     #[allow(dead_code)] Fixed(Color),
     /// Rainbow art row: uses `palette.mono_banner` when set, else
-    /// the Apple rainbow at the given index.
-    Rainbow(usize),
+    /// the Apple rainbow at the given index; `true` for a half-block row,
+    /// whose lower halves take the next index's color.
+    Rainbow(usize, bool),
     /// Uses `palette.accent`.
     Accent,
 }
