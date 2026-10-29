@@ -83,6 +83,19 @@ struct ComposerLayout {
 /// e.g. a pasted Makefile, but drawn as spaces).
 const TAB_W: usize = 4;
 
+/// A char that belongs to a word for line-breaking purposes: letters, digits
+/// and the punctuation that glues identifiers, paths and flags together
+/// (`src/main.rs`, `--flag`, `foo_bar`). Punctuation that ends a clause or
+/// starts a quote (`+ = , ( "`) is not — a break there splits nothing.
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '~' | '@')
+}
+
+/// True when a line break between these two chars would cut a word in half.
+fn splits_word_between(before: Option<char>, after: Option<char>) -> bool {
+    matches!((before, after), (Some(b), Some(a)) if word_char(b) && word_char(a))
+}
+
 /// Lines of a prompt echoed into the transcript before the rest is elided.
 const ECHO_LINES: usize = 24;
 
@@ -155,6 +168,9 @@ pub struct App {
     esc_deadline: Option<Instant>,
     /// Time of last Ctrl+C with empty input; used for double-press-to-quit.
     last_ctrl_c: Option<Instant>,
+    /// Text cut by Ctrl+K/U/W, put back by Ctrl+Y — readline's kill ring
+    /// (a single slot: the last kill).
+    kill_ring: String,
     /// Cached slash-command usage counts (command → times used). Rebuilt when
     /// history grows so we don't scan full history per keystroke.
     cmd_uses: HashMap<String, usize>,
@@ -303,6 +319,7 @@ impl App {
             should_quit: false,
             esc_deadline: None,
             last_ctrl_c: None,
+            kill_ring: String::new(),
             cmd_uses: HashMap::new(),
             force_clear: false,
             single_width: cfg.ascii
@@ -790,57 +807,88 @@ impl App {
         s.chars().map(|c| self.cell_w(c)).sum()
     }
 
-    /// Lay the composer text out in rows of at most `w` cells, wrapping a char
-    /// that would not fit onto the next row, and locate the cursor (a char
-    /// index) as a (row, cell column, chars-into-row) triple. `input_rows` and
-    /// `render_composer` both come from here, so the caret can never sit N
-    /// cells left of the glyph it belongs to on a line with wide characters.
+    /// Lay the composer text out in rows of at most `w` cells, wrapping at a
+    /// word boundary whenever there is one: a word is never cut in half just
+    /// because it didn't fit — the whole word moves down and the spaces before
+    /// it stay on the row above (so the rows still cover the text with no
+    /// chars skipped, which keeps `starts` a simple offset table). A single
+    /// word longer than a row has no boundary to use and is split, as before.
+    ///
+    /// Locates the cursor (a char index) as a (row, cell column,
+    /// chars-into-row) triple. `input_rows` and `render_composer` both come
+    /// from here, so the caret can never sit N cells left of the glyph it
+    /// belongs to on a line with wide characters.
     fn layout_input(&self, w: usize) -> ComposerLayout {
         let w = w.max(1);
-        let mut rows: Vec<String> = vec![String::new()];
-        let mut starts = vec![0usize];
-        let mut col = 0usize;
-        let mut idx = 0usize;
-        let (mut cur_row, mut cur_col, mut cur_idx) = (0usize, 0usize, 0usize);
-        let mut placed = false;
-        for (i, c) in self.input.chars().enumerate() {
-            let cw = self.cell_w(c);
-            if c != '\n' && col + cw > w && col > 0 {
-                rows.push(String::new());
-                starts.push(i);
-                col = 0;
-                idx = 0;
+        let chars: Vec<char> = self.input.chars().collect();
+        let n = chars.len();
+        let mut rows: Vec<String> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        loop {
+            starts.push(i);
+            // The row runs from `i` to `j`: as many chars as fit, stopping at
+            // the end of the line or the end of the text.
+            let mut j = i;
+            let mut col = 0usize;
+            while j < n && chars[j] != '\n' {
+                let cw = self.cell_w(chars[j]);
+                if col + cw > w && j > i {
+                    break;
+                }
+                col += cw;
+                j += 1;
             }
-            if i == self.cursor {
-                cur_row = rows.len() - 1;
-                cur_col = col;
-                cur_idx = idx;
-                placed = true;
+            // Word wrap: the char that didn't fit is part of a word that has no
+            // room on this row, so break at the last space instead and let the
+            // whole word start the next row. Without a space to break at (one
+            // long word, or leading indentation) the char split above stands.
+            if j < n && chars[j] != '\n' && !chars[j].is_whitespace() {
+                if let Some(k) = (i..j).rfind(|&k| chars[k].is_whitespace()) {
+                    j = k + 1;
+                }
             }
-            if c == '\n' {
-                // A hard break: the row ends here and the newline isn't drawn.
-                rows.push(String::new());
-                starts.push(i + 1);
-                col = 0;
-                idx = 0;
+            rows.push(chars[i..j].iter().collect());
+            if j < n && chars[j] == '\n' {
+                // A hard break: the row ends here and the newline isn't drawn,
+                // so the next row starts past it (and may be empty).
+                i = (j + 1).min(n);
                 continue;
             }
-            rows.last_mut().unwrap().push(c);
-            col += cw;
-            idx += 1;
-        }
-        if !placed {
-            // Cursor after the last char: a full last row spills onto a fresh one.
-            if col >= w {
-                rows.push(String::new());
-                starts.push(self.char_len());
-                col = 0;
-                idx = 0;
+            if j >= n {
+                break;
             }
-            cur_row = rows.len() - 1;
-            cur_col = col;
-            cur_idx = idx;
+            i = j;
         }
+        // The cursor sits on the row that holds it; at a soft wrap the caret
+        // belongs to the row the char it precedes starts (the text reads on
+        // from there), and after the last char it is past the end of the last
+        // row.
+        let cur = self.cursor.min(n);
+        let mut cur_row = 0usize;
+        let mut cur_idx = 0usize;
+        for r in 0..rows.len() {
+            let start = starts[r];
+            let end = start + rows[r].chars().count();
+            // A row that ends at a newline doesn't hold it, but the cursor on
+            // that newline still belongs to the row (at the end of it).
+            let on_its_newline = cur == end && chars.get(cur) == Some(&'\n');
+            if cur >= start && (cur < end || on_its_newline || r + 1 == rows.len()) {
+                cur_row = r;
+                cur_idx = cur - start;
+                break;
+            }
+        }
+        let last = rows.len() - 1;
+        if cur_row == last && cur_idx >= rows[last].chars().count() && self.str_w(&rows[last]) >= w {
+            // Cursor after the last char of a full last row: it spills onto a
+            // fresh row, so the caret isn't drawn past the terminal edge.
+            rows.push(String::new());
+            starts.push(n);
+            cur_row = rows.len() - 1;
+            cur_idx = 0;
+        }
+        let cur_col = rows[cur_row].chars().take(cur_idx).map(|c| self.cell_w(c)).sum();
         ComposerLayout { rows, cur_row, cur_col, cur_idx, starts }
     }
 
@@ -906,10 +954,18 @@ impl App {
     /// works on the Pi's framebuffer console, where Shift+Enter is plain Enter.
     fn enter_inserts_newline(&mut self, key: &KeyEvent) -> bool {
         if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-            self.insert_char('\n');
+            // The key asked for a row; a word is never split in two, so inside
+            // one it is a no-op (still handled — Enter must not send).
+            self.insert_newline();
             return true;
         }
         if self.cursor > 0 && self.input.chars().nth(self.cursor - 1) == Some('\\') {
+            // The backslash is replaced by the break, so the word test is the
+            // one at the backslash: mid-word nothing happens at all (and the
+            // backslash stays — it isn't swallowed for nothing).
+            if self.splits_word_over(self.cursor - 1) {
+                return true;
+            }
             self.cursor -= 1;
             let pos = self.byte_at(self.cursor);
             self.input.remove(pos);
@@ -917,6 +973,30 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Break the line at the cursor — unless that would cut a word in half
+    /// (`fo|o`, `src/ma|in.rs`), which is how a prompt ends up as two lines
+    /// with half a word on each.
+    fn insert_newline(&mut self) {
+        if !self.splits_word(self.cursor) {
+            self.insert_char('\n');
+        }
+    }
+
+    /// True when a break at char index `at` would land inside a word: a word
+    /// char on each side of it.
+    fn splits_word(&self, at: usize) -> bool {
+        let chars: Vec<char> = self.input.chars().collect();
+        splits_word_between(at.checked_sub(1).and_then(|i| chars.get(i).copied()), chars.get(at).copied())
+    }
+
+    /// The same test for a break at char index `at` where the char there is a
+    /// trailing backslash about to be replaced by the newline: the word on
+    /// either side of it is what a break would cut, not the backslash.
+    fn splits_word_over(&self, at: usize) -> bool {
+        let chars: Vec<char> = self.input.chars().collect();
+        splits_word_between(at.checked_sub(1).and_then(|i| chars.get(i).copied()), chars.get(at + 1).copied())
     }
 
     fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
@@ -1412,14 +1492,27 @@ impl App {
     }
 
     fn on_key_busy(&mut self, key: KeyEvent, h: &Handles) {
-        match key.code {
-            KeyCode::Esc => self.interrupt(h),
-            KeyCode::Char('c') | KeyCode::Char('d')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+        // Esc / Ctrl+C / Ctrl+D stop the turn; everything else is composer
+        // editing, so the readline keys work while the agent runs too. Ctrl+D
+        // keeps its readline meaning (delete-char) while there is a draft, the
+        // same as idle — interrupting has Esc and Ctrl+C.
+        if key.code == KeyCode::Esc {
+            self.interrupt(h);
+            return;
+        }
+        if ctrl_c_or_d(&key) {
+            if matches!(key.code, KeyCode::Char('d')) && !self.input.is_empty() {
+                self.delete_forward();
+            } else {
                 self.interrupt(h);
             }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            return;
+        }
+        if self.on_key_readline(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_newline(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard_image(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_char(caps_char(&key, c));
@@ -1435,6 +1528,13 @@ impl App {
                 if !self.enter_inserts_newline(&key) {
                     self.queue_input();
                 }
+            }
+            // Ctrl/Alt+←/→ move by word, as idle — Ctrl+←/→ is the word move
+            // that survives Haiku's Terminal, so it can't go char-only here.
+            KeyCode::Left | KeyCode::Right
+                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.cursor = if key.code == KeyCode::Left { self.prev_word() } else { self.next_word() };
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.char_len()),
@@ -1461,6 +1561,122 @@ impl App {
             KeyCode::PageDown => self.scroll_page(false),
             _ => {}
         }
+    }
+
+    /// Readline / Emacs line editing in the composer: the shortcuts anyone who
+    /// has spent time in a shell or Emacs reaches for. Returns true when the
+    /// key was consumed.
+    ///
+    /// Ctrl+A/E jump to the start/end of the line, Ctrl+B/F move a char,
+    /// Ctrl+K/U kill to the end/start of the line, Ctrl+W (and Alt+Backspace)
+    /// kill the word before the cursor, Alt+D the word after it, Ctrl+Y yanks
+    /// the last kill back, Ctrl+H is a backspace, Alt+B/F move by word, and
+    /// Ctrl+D deletes the char under the cursor when the line isn't empty
+    /// (an empty line still arms/quits, as a bare shell prompt does).
+    ///
+    /// The app's own Ctrl bindings are matched before this and win: Ctrl+C/D
+    /// (quit — handled by the caller), Ctrl+J (newline), Ctrl+L (repaint),
+    /// Ctrl+P (permissions), Ctrl+T (brief) and Ctrl+V (paste image).
+    ///
+    /// Where the keys go on the way in — the audit behind picking them, checked
+    /// against Haiku's Terminal (src/apps/terminal in the Haiku tree), macOS and
+    /// Linux:
+    /// - Ctrl+letter is a plain 0x01..0x1a byte, and Haiku's Terminal writes
+    ///   every key it doesn't specially handle straight through
+    ///   (TermViewStates::DefaultState::KeyDown), so it works there too. The
+    ///   exceptions are Ctrl+H (0x08), Ctrl+I (0x09) and Ctrl+M (0x0d), which
+    ///   *are* Backspace, Tab and Enter on the wire — crossterm reports 0x08 as
+    ///   Ctrl+H, so it is a usable alias here, but it is never the only binding
+    ///   for an action. Ctrl+S/Ctrl+Q are avoided: XOFF/XON on a Linux console
+    ///   freeze the output. Ctrl+J reaches us as 0x0a, which crossterm maps to
+    ///   Ctrl+J in raw mode (it is only Enter outside raw mode).
+    /// - Alt+letter is the fragile class. On Haiku it is B_COMMAND_KEY, i.e.
+    ///   Terminal's *menu* accelerator — Alt+A/C/F/G/L/P/Q/T/V/W are Select all,
+    ///   Copy, Find, Find next, Clear all, Print, Quit, New tab, Paste, Close —
+    ///   and the menu wins over the view, so Alt+F (next word) can never reach
+    ///   us there. It also arrives as ESC+letter only when Terminal's
+    ///   Settings → "Use Option as Meta key" is on (macOS needs its Option-as-Meta
+    ///   equivalent); otherwise it is not reported as a modified key at all.
+    ///   Hence no action is Alt-only: Ctrl+W/Alt+Backspace (back a word),
+    ///   Alt+B/F and Ctrl+←/→ (by word, and Haiku's Terminal encodes
+    ///   modifiers on the arrows as xterm `ESC[1;<mod><letter>`), Ctrl+Y.
+    /// - Haiku's Terminal strips modifiers from Backspace and Delete
+    ///   (B_BACKSPACE/B_DELETE are rewritten without `mod`), so Ctrl+Backspace
+    ///   and Ctrl+Delete degrade to a plain char delete there (checked live in
+    ///   the UTM VM). Alt+Backspace still deletes a word with "Use Option as
+    ///   Meta key" off; Alt+D needs the meta option. Ctrl+W, Alt+Backspace and
+    ///   Ctrl+←/→ are the Haiku-safe spellings. It also keeps Ctrl+Shift+↑/↓ and
+    ///   Shift+PgUp/PgDn for scrolling itself.
+    /// - A multiplexer eats one of them: tmux's default prefix is Ctrl+B and
+    ///   GNU screen's is Ctrl+A (a popular tmux setting too). Those two reach
+    ///   the app only as the prefix; Ctrl+A-in-tmux users get Ctrl+E/Home and
+    ///   the arrows (which is why the arrow motions stay bound).
+    /// - Ctrl+P is *not* readline's history-back here: it cycles permission
+    ///   modes because the Pi's console can't report Shift+Tab. Ctrl+N is left
+    ///   alone so history isn't half-bound; ↑/↓ do that.
+    fn on_key_readline(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Ctrl+<letter> arrives as Char with CONTROL under both legacy and the
+        // Kitty protocol; Alt+<letter> as Char with ALT, which used to fall
+        // through and type the bare letter.
+        match key.code {
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_bounds().0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_bounds().1,
+            KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Char('f') if ctrl => self.cursor = (self.cursor + 1).min(self.char_len()),
+            KeyCode::Char('b') if alt => self.cursor = self.prev_word(),
+            KeyCode::Char('f') if alt => self.cursor = self.next_word(),
+            KeyCode::Char('h') if ctrl => self.on_key_edit(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            KeyCode::Char('d') if ctrl => self.delete_forward(),
+            KeyCode::Char('d') if alt => {
+                let end = self.next_word();
+                self.kill(self.cursor, end);
+            }
+            KeyCode::Char('k') if ctrl => {
+                let end = self.line_bounds().1;
+                self.kill(self.cursor, end);
+            }
+            KeyCode::Char('u') if ctrl => {
+                let start = self.line_bounds().0;
+                self.kill(start, self.cursor);
+            }
+            KeyCode::Char('w') if ctrl => {
+                let start = self.prev_word();
+                self.kill(start, self.cursor);
+            }
+            KeyCode::Char('y') if ctrl => {
+                let ring = self.kill_ring.clone();
+                for c in ring.chars() {
+                    self.insert_char(c);
+                }
+            }
+            _ => return false,
+        }
+        // Any edit invalidates the `/` palette highlight (as typing does).
+        self.suggest_idx = 0;
+        true
+    }
+
+    /// Cut chars `from..to` out of the composer into the kill ring.
+    fn kill(&mut self, from: usize, to: usize) {
+        if to <= from {
+            return;
+        }
+        let (start, end) = (self.byte_at(from), self.byte_at(to));
+        self.kill_ring = self.input[start..end].to_string();
+        self.input.drain(start..end);
+        self.cursor = from;
+    }
+
+    /// Delete the char under the cursor (Ctrl+D, readline's delete-char), or
+    /// the newline that ends the line so two lines join.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let pos = self.byte_at(self.cursor);
+        self.input.remove(pos);
     }
 
     /// Arms — or fires — the Ctrl+C/Ctrl+D (and empty-composer Esc) quit. True
@@ -1493,8 +1709,14 @@ impl App {
         // must not swallow the first press (it used to: with a non-empty line
         // the key fell through to the `Char` arm's CONTROL guard and did
         // nothing at all) — a single press clears the line, Codex/Claude-Code
-        // style, and still arms the timer so the second press quits.
+        // style, and still arms the timer so the second press quits. Ctrl+D on
+        // a non-empty line is readline's delete-char instead (as in a shell):
+        // only an empty line arms the quit.
         if ctrl_c_or_d(&key) {
+            if matches!(key.code, KeyCode::Char('d')) && !self.input.is_empty() {
+                self.delete_forward();
+                return;
+            }
             if self.double_press_quit() {
                 return;
             }
@@ -1513,10 +1735,14 @@ impl App {
         }
         self.last_ctrl_c = None;
 
+        if self.on_key_readline(key) {
+            return;
+        }
+
         match key.code {
             // Ctrl+J is a literal line feed: a newline everywhere, including the
             // Pi's framebuffer console where Shift+Enter is plain Enter.
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_newline(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.paste_clipboard_image();
                 self.suggest_idx = 0;
@@ -1632,11 +1858,20 @@ impl App {
         }
     }
 
+    /// Backspace / Delete, with the word-deleting modifiers: Alt+Backspace and
+    /// Alt+Delete (what macOS and most terminals send), plus Ctrl+Backspace
+    /// and Ctrl+Delete for the platforms where Alt is not the app's to take —
+    /// on Haiku Alt is the menu accelerator key, so Ctrl is the reliable
+    /// modifier there (though its Terminal strips modifiers from Backspace and
+    /// Delete, so Ctrl+W / Alt+Backspace are the Haiku spellings). All of them go through the kill ring, so a kill that was
+    /// one word too many comes back with Ctrl+Y.
     fn on_key_edit(&mut self, key: KeyEvent) {
+        let word = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Backspace => {
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    self.delete_word();
+                if word {
+                    let start = self.prev_word();
+                    self.kill(start, self.cursor);
                 } else if self.cursor > 0 {
                     self.cursor -= 1;
                     let pos = self.byte_at(self.cursor);
@@ -1644,8 +1879,9 @@ impl App {
                 }
             }
             KeyCode::Delete => {
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    self.delete_word_forward();
+                if word {
+                    let end = self.next_word();
+                    self.kill(self.cursor, end);
                 } else {
                     let pos = self.byte_at(self.cursor);
                     if pos < self.input.len() {
@@ -1679,21 +1915,6 @@ impl App {
             i += 1;
         }
         i
-    }
-
-    fn delete_word(&mut self) {
-        let target = self.prev_word();
-        let start = self.byte_at(target);
-        let end = self.byte_at(self.cursor);
-        self.input.drain(start..end);
-        self.cursor = target;
-    }
-
-    fn delete_word_forward(&mut self) {
-        let target = self.next_word();
-        let start = self.byte_at(self.cursor);
-        let end = self.byte_at(target);
-        self.input.drain(start..end);
     }
 
     /// Tab-complete the `@path` word ending at the cursor, wherever it sits in
@@ -2382,11 +2603,21 @@ impl App {
         }
         self.push(Kind::Notice, String::from("  @file       attach a file"));
         self.push(Kind::Notice, String::from("  !cmd        run a shell command (output goes to the model too)"));
-        self.push(Kind::Notice, "  Shift/Alt+Enter, Ctrl+J, \\+Enter  new line (Enter sends)");
-        self.push(Kind::Notice, "  ↑/↓         move between draft lines, else scroll the output (3 lines)");
+        self.push(Kind::Notice, "  Shift/Alt+Enter, Ctrl+J, \\+Enter  new line (Enter sends; never inside a word)");
+        self.push(Kind::Notice, "  (Haiku's Terminal can't tell Shift+Enter from Enter: use \\+Enter or Ctrl+J)");
+        self.push(Kind::Notice, "  ↑/↓         move between draft lines, else browse history");
         self.push(Kind::Notice, "  Home/End    start / end of the line");
+        self.push(Kind::Notice, "  Ctrl+A/E    start / end of the line (readline)");
+        self.push(Kind::Notice, "  Ctrl+B/F    back / forward a char · Alt+B/F by word");
+        self.push(Kind::Notice, "  Ctrl+K/U    delete to the end / start of the line");
+        self.push(Kind::Notice, "  Ctrl+W, Alt+Backspace  delete the word before · Ctrl+Y yanks it back");
+        self.push(Kind::Notice, "  Ctrl+D      delete the char under the cursor (empty line: quit)");
+        self.push(Kind::Notice, "  (Ctrl+<letter> works on every terminal. Alt+<letter> is the fragile");
+        self.push(Kind::Notice, "   one: on Haiku it is Terminal's menu key (Alt+F = Find) and needs");
+        self.push(Kind::Notice, "   Settings → \"Use Option as Meta key\", on macOS Option-as-Meta,");
+        self.push(Kind::Notice, "   and tmux/screen keep Ctrl+B/Ctrl+A for themselves)");
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
-        self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  browse history");
+        self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  scroll the output 3 lines");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
         self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / YOLO / plan; remembered)"));
         self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A YOLO (approve everything)"));
@@ -3787,6 +4018,224 @@ mod tests {
         assert_eq!(app.scroll, 37, "queued-input mode scrolls too");
         assert!(!app.follow);
         assert!(matches!(app.mode, Mode::Busy), "still busy, not interrupted");
+    }
+
+    /// The composer carries the readline/Emacs line-editing shortcuts: Ctrl+A/E
+    /// (start/end), Ctrl+K/U (kill to end/start), Ctrl+W (kill word), Ctrl+Y
+    /// (yank it back), Ctrl+B/F and Alt+B/F (char/word motion), Ctrl+D
+    /// (delete-char, quitting only on an empty line), Alt+D (kill word
+    /// forward) — and Ctrl+K/U must not eat the newline that ends the line.
+    #[test]
+    fn composer_accepts_readline_shortcuts() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        typed(&mut app, &h, "one two three");
+
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        assert_eq!(app.cursor, 0, "Ctrl+A goes to the start of the line");
+        app.on_key(ctrl(KeyCode::Char('e')), &h);
+        assert_eq!(app.cursor, 13, "Ctrl+E goes to the end of the line");
+
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        assert_eq!(app.cursor, 11, "Ctrl+B moves back a char");
+        app.on_key(ctrl(KeyCode::Char('f')), &h);
+        assert_eq!(app.cursor, 12, "Ctrl+F moves forward a char");
+
+        // Alt+B/F move by word (they used to type a bare 'b'/'f').
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT), &h);
+        assert_eq!(app.cursor, 8, "Alt+B lands on the start of \"three\"");
+        assert_eq!(app.input, "one two three", "Alt+B doesn't type its letter");
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT), &h);
+        assert_eq!(app.cursor, 13);
+
+        // Ctrl+K kills to the end of the line, Ctrl+U back to its start, and
+        // Ctrl+Y puts the last kill back at the cursor.
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('b')), &h);
+        app.on_key(ctrl(KeyCode::Char('k')), &h);
+        assert_eq!(app.input, "one two thr", "Ctrl+K kills to the end of the line");
+        app.on_key(ctrl(KeyCode::Char('u')), &h);
+        assert_eq!(app.input, "", "Ctrl+U kills back to the start");
+        app.on_key(ctrl(KeyCode::Char('y')), &h);
+        assert_eq!(app.input, "one two thr", "Ctrl+Y yanks the last kill");
+
+        // Ctrl+W kills the word before the cursor.
+        app.on_key(ctrl(KeyCode::Char('w')), &h);
+        assert_eq!(app.input, "one two ", "Ctrl+W kills the word before");
+        app.on_key(ctrl(KeyCode::Char('y')), &h);
+        assert_eq!(app.input, "one two thr");
+
+        // Alt+D kills the word after the cursor.
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT), &h);
+        assert_eq!(app.input, "two thr", "Alt+D kills the word forward");
+
+        // Lines are separate: Ctrl+K stops at the newline, Ctrl+D joins them.
+        app.input = "abc\ndef".into();
+        app.cursor = 1;
+        app.on_key(ctrl(KeyCode::Char('k')), &h);
+        assert_eq!(app.input, "a\ndef", "Ctrl+K stops at the end of the line");
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert_eq!(app.input, "adef", "Ctrl+D deletes the newline, joining the lines");
+
+        // Ctrl+D on a non-empty line edits instead of arming the quit; an
+        // empty line still quits on the second press.
+        app.cursor = 0;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert_eq!(app.input, "def");
+        assert!(!app.should_quit(), "a delete must not quit");
+        app.input.clear();
+        app.cursor = 0;
+        app.last_ctrl_c = None;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert!(!app.should_quit(), "one press only arms the quit");
+        assert!(app.last_ctrl_c.is_some(), "the empty line does arm it");
+    }
+
+    /// The word-delete spellings: Alt+Backspace / Alt+Delete and the Ctrl
+    /// variants (the Alt-free route on Haiku, where Alt drives the menus) both
+    /// cut a whole word and leave it in the kill ring for Ctrl+Y.
+    #[test]
+    fn modifier_word_delete_works_with_alt_and_ctrl() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        typed(&mut app, &h, "alpha beta gamma");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT), &h);
+        assert_eq!(app.input, "alpha beta ", "Alt+Backspace deletes the word before");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL), &h);
+        assert_eq!(app.input, "alpha ", "Ctrl+Backspace does the same");
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT), &h);
+        assert_eq!(app.input, "alpha ", "nothing to the right of the end");
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), &h);
+        assert_eq!(app.input, "", "Ctrl+Delete deletes the word after the cursor");
+        app.on_key(ctrl(KeyCode::Char('y')), &h);
+        assert_eq!(app.input, "alpha ", "and Ctrl+Y yanks it back");
+    }
+
+    /// Ctrl+D keeps readline's meaning (delete-char) while a turn is running
+    /// and there is a draft to edit — Esc and Ctrl+C already interrupt, so
+    /// interrupting on Ctrl+D too would only cost the edit. An empty line is
+    /// still an interrupt, as it has always been.
+    #[test]
+    fn ctrl_d_deletes_under_the_cursor_while_busy_too() {
+        let (mut app, h) = scrollable_app();
+        app.mode = Mode::Busy;
+        typed(&mut app, &h, "abc");
+        app.cursor = 1;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert_eq!(app.input, "ac", "Ctrl+D is delete-char, not interrupt, with a draft");
+        assert!(matches!(app.mode, Mode::Busy), "the turn keeps running");
+        app.input.clear();
+        app.cursor = 0;
+        app.on_key(ctrl(KeyCode::Char('d')), &h);
+        assert!(matches!(app.mode, Mode::Idle), "an empty line still interrupts");
+    }
+
+    /// A newline key never cuts a word in two: mid-word (Shift+Enter, Ctrl+J or
+    /// a trailing backslash) it does nothing at all, while at a word boundary —
+    /// after a space, at either end of the line — it breaks as usual.
+    #[test]
+    fn a_newline_key_never_splits_a_word() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        typed(&mut app, &h, "foo bar");
+        app.cursor = 2; // fo|o
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &h);
+        assert_eq!(app.input, "foo bar", "Shift+Enter inside a word adds no line");
+        app.on_key(ctrl(KeyCode::Char('j')), &h);
+        assert_eq!(app.input, "foo bar", "nor does Ctrl+J");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &h);
+        assert_eq!(app.input, "foo bar", "nor Alt+Enter");
+
+        // A path or an identifier is one word, punctuation and all.
+        app.input = "see src/main.rs".into();
+        app.cursor = 8; // src/|main.rs
+        app.on_key(ctrl(KeyCode::Char('j')), &h);
+        assert_eq!(app.input, "see src/main.rs", "a path isn't split either");
+
+        // A space is a boundary: the break goes in.
+        app.cursor = 4; // see |
+        app.on_key(ctrl(KeyCode::Char('j')), &h);
+        assert_eq!(app.input, "see \nsrc/main.rs", "after a space the line breaks");
+        // So is either end of the line.
+        app.cursor = app.char_len();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &h);
+        assert_eq!(app.input, "see \nsrc/main.rs\n", "and at the end of the line");
+        app.cursor = 0;
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), &h);
+        assert_eq!(app.input, "\nsee \nsrc/main.rs\n", "and at the start");
+
+        // The backslash idiom: mid-word nothing happens and the backslash
+        // stays put (it isn't eaten for nothing); at a boundary it becomes the
+        // break.
+        app.input = "ab\\".into();
+        app.cursor = 3;
+        app.on_key(key(KeyCode::Enter), &h);
+        assert_eq!(app.input, "ab\n", "a trailing backslash plus Enter breaks the line");
+        app.input = "fo\\o".into(); // the backslash sits inside the word
+        app.cursor = 3;
+        app.on_key(key(KeyCode::Enter), &h);
+        assert_eq!(app.input, "fo\\o", "mid-word the backslash is left alone");
+
+        // A paste keeps its own newlines: it is deliberate, whole text.
+        app.on_paste("x\ny".into());
+        assert!(app.input.contains("x\ny"));
+    }
+
+    /// The composer wraps at a word boundary: a word that doesn't fit moves
+    /// whole to the next row instead of being cut in half, and the rows still
+    /// cover the text so the caret and Up/Down stay exact.
+    #[test]
+    fn composer_wraps_at_word_boundaries() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.single_width = true;
+        app.input = "hello world foo".into();
+        app.cursor = app.char_len();
+        let l = app.layout_input(10);
+        assert_eq!(l.rows, vec!["hello ", "world foo"], "the word moves down, not in half");
+        assert_eq!(l.starts, vec![0, 6], "rows still tile the text exactly");
+        assert_eq!((l.cur_row, l.cur_idx), (1, 9), "the caret follows the text");
+
+        // A word wider than a row has no boundary to break at: it is split.
+        app.input = "abcdefgh".into();
+        app.cursor = 6;
+        assert_eq!(app.layout_input(4).rows, vec!["abcd", "efgh"]);
+        app.input = "aaa bbbbb".into();
+        app.cursor = 7;
+        let l = app.layout_input(5);
+        assert_eq!(l.rows, vec!["aaa ", "bbbbb"], "the whole word takes the next row");
+        assert_eq!((l.cur_row, l.cur_idx), (1, 3));
+        app.cursor = 4; // the first char of the moved word
+        let l = app.layout_input(5);
+        assert_eq!((l.cur_row, l.cur_col, l.cur_idx), (1, 0, 0));
+
+        // Indented text with no room left: the indent stays, the word moves.
+        app.input = "0123     deed".into();
+        app.cursor = app.char_len();
+        let l = app.layout_input(10);
+        assert_eq!(l.rows, vec!["0123     ", "deed"]);
+    }
+
+    /// The readline keys edit the queued draft while the agent is running too;
+    /// only Esc, Ctrl+C and Ctrl+D on an empty line interrupt there.
+    #[test]
+    fn readline_shortcuts_work_while_busy() {
+        let (mut app, h) = scrollable_app();
+        app.mode = Mode::Busy;
+        typed(&mut app, &h, "queued draft");
+        app.on_key(ctrl(KeyCode::Char('a')), &h);
+        assert_eq!(app.cursor, 0);
+        app.on_key(ctrl(KeyCode::Char('e')), &h);
+        assert_eq!(app.cursor, 12);
+        app.on_key(ctrl(KeyCode::Char('w')), &h);
+        assert_eq!(app.input, "queued ", "Ctrl+W edits the queued draft");
+        assert!(matches!(app.mode, Mode::Busy), "and doesn't interrupt the turn");
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL), &h);
+        assert_eq!(app.cursor, 0, "Ctrl+← moves by word while busy too");
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), &h);
+        assert_eq!(app.cursor, 7, "and Ctrl+→");
     }
 
     /// Ctrl+C must work with a draft in the composer. It used to be swallowed:

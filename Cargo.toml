@@ -1,6 +1,6 @@
 [package]
 name = "haikucode"
-version = "0.1.7"
+version = "0.1.15"
 edition = "2021"
 description = "Haiku Code: a full-screen agentic coding CLI for Haiku (a picoder port)"
 
