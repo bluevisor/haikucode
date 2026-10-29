@@ -1417,16 +1417,26 @@ impl App {
 
     fn on_key_busy(&mut self, key: KeyEvent, h: &Handles) {
         // Esc / Ctrl+C / Ctrl+D stop the turn; everything else is composer
-        // editing, so the readline keys work while the agent runs too.
-        if key.code == KeyCode::Esc || ctrl_c_or_d(&key) {
+        // editing, so the readline keys work while the agent runs too. Ctrl+D
+        // keeps its readline meaning (delete-char) while there is a draft, the
+        // same as idle — interrupting has Esc and Ctrl+C.
+        if key.code == KeyCode::Esc {
             self.interrupt(h);
+            return;
+        }
+        if ctrl_c_or_d(&key) {
+            if matches!(key.code, KeyCode::Char('d')) && !self.input.is_empty() {
+                self.delete_forward();
+            } else {
+                self.interrupt(h);
+            }
             return;
         }
         if self.on_key_readline(key) {
             return;
         }
         match key.code {
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_newline(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard_image(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_char(caps_char(&key, c));
@@ -1484,6 +1494,24 @@ impl App {
     /// The app's own Ctrl bindings are matched before this and win: Ctrl+C/D
     /// (quit — handled by the caller), Ctrl+J (newline), Ctrl+L (repaint),
     /// Ctrl+P (permissions), Ctrl+T (brief) and Ctrl+V (paste image).
+    ///
+    /// Where the keys go on the way in — the audit behind picking them:
+    /// - Ctrl+letter is a plain 0x01..0x1a byte, so every terminal delivers it
+    ///   (Haiku's Terminal, the Pi's framebuffer console, macOS Terminal, ssh).
+    ///   Ctrl+S/Ctrl+Q are avoided: they are XOFF/XON on a Linux console and
+    ///   freeze output. Ctrl+H is really Backspace there (0x08), Ctrl+I Tab —
+    ///   so Ctrl+H is only an alias, never the sole binding for an action.
+    /// - Alt+letter is the fragile class: it arrives as ESC+letter, which needs
+    ///   "Use Option as Meta" on macOS (otherwise Option+B types '∫'), and on
+    ///   Haiku Alt is the menu accelerator key (Alt+F opens the File menu), so
+    ///   every Alt binding here also has a Ctrl spelling.
+    /// - A multiplexer eats one of them: tmux's default prefix is Ctrl+B and
+    ///   GNU screen's is Ctrl+A (a popular tmux setting too). Those two reach
+    ///   the app only as the prefix; Ctrl+A-in-tmux users get Ctrl+E/Home and
+    ///   the arrows (which is why the arrow motions stay bound).
+    /// - Ctrl+P is *not* readline's history-back here: it cycles permission
+    ///   modes because the Pi's console can't report Shift+Tab. Ctrl+N is left
+    ///   alone so history isn't half-bound; ↑/↓ do that.
     fn on_key_readline(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1612,7 +1640,7 @@ impl App {
         match key.code {
             // Ctrl+J is a literal line feed: a newline everywhere, including the
             // Pi's framebuffer console where Shift+Enter is plain Enter.
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_newline(),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.paste_clipboard_image();
                 self.suggest_idx = 0;
@@ -3924,22 +3952,22 @@ mod tests {
         app.on_key(ctrl(KeyCode::Char('b')), &h);
         app.on_key(ctrl(KeyCode::Char('b')), &h);
         app.on_key(ctrl(KeyCode::Char('k')), &h);
-        assert_eq!(app.input, "one two t", "Ctrl+K kills to the end of the line");
+        assert_eq!(app.input, "one two thr", "Ctrl+K kills to the end of the line");
         app.on_key(ctrl(KeyCode::Char('u')), &h);
         assert_eq!(app.input, "", "Ctrl+U kills back to the start");
         app.on_key(ctrl(KeyCode::Char('y')), &h);
-        assert_eq!(app.input, "one two t", "Ctrl+Y yanks the last kill");
+        assert_eq!(app.input, "one two thr", "Ctrl+Y yanks the last kill");
 
         // Ctrl+W kills the word before the cursor.
         app.on_key(ctrl(KeyCode::Char('w')), &h);
         assert_eq!(app.input, "one two ", "Ctrl+W kills the word before");
         app.on_key(ctrl(KeyCode::Char('y')), &h);
-        assert_eq!(app.input, "one two t");
+        assert_eq!(app.input, "one two thr");
 
         // Alt+D kills the word after the cursor.
         app.on_key(ctrl(KeyCode::Char('a')), &h);
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT), &h);
-        assert_eq!(app.input, "two t", "Alt+D kills the word forward");
+        assert_eq!(app.input, "two thr", "Alt+D kills the word forward");
 
         // Lines are separate: Ctrl+K stops at the newline, Ctrl+D joins them.
         app.input = "abc\ndef".into();
