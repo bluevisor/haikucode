@@ -96,7 +96,24 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   Ctrl+B/F char and Alt+B/F word moves, Ctrl+K/U kill to the end/start of
   the line, Ctrl+W kill word, Ctrl+Y yank it back, Alt+D kill the next
   word, Ctrl+D delete the char under the cursor — an empty line still
-  quits), code-block highlighting.
+  quits, and while a turn runs a draft's Ctrl+D edits instead of
+  interrupting), code-block highlighting. The readline keys are Ctrl+letter
+  because that is a plain 0x01..0x1a byte that every terminal writes through
+  — Haiku's Terminal included (TermViewStates::DefaultState::KeyDown passes
+  anything it doesn't specially handle straight to the tty). Alt is the
+  fragile class and no action depends on it alone: on Haiku it is Terminal's
+  *menu* accelerator (Alt+A/C/F/G/L/P/Q/T/V/W; Alt+F = Find, so it never
+  reaches the app) and it is only reported as ESC+<key> with Settings →
+  "Use Option as Meta key" on; macOS needs its Option-as-Meta equivalent.
+  Haiku's Terminal also strips modifiers from Backspace and Delete, so
+  Ctrl+Backspace/Ctrl+Delete degrade there and Ctrl+W, Alt+Backspace (meta on)
+  and Ctrl+←/→ are the spellings that always work. It keeps Ctrl+Shift+↑/↓ and
+  Shift+PgUp/PgDn for its own scrolling; tmux's default prefix is Ctrl+B and
+  screen's Ctrl+A, and those reach the app only as the prefix.
+- The composer never breaks a line in the middle of a word: the newline keys
+  (Shift/Alt+Enter, Ctrl+J, a trailing `\`+Enter) do nothing while the caret
+  sits inside one (`fo|o`, `src/ma|in.rs`), and the wrapped display moves a
+  word that doesn't fit down whole instead of splitting it across two rows.
 - Enables the Kitty keyboard protocol when the terminal supports it, so
   modified keys (e.g. Option+Backspace) are reported unambiguously instead of
   being flattened to a bare Backspace by terminals like Warp.
