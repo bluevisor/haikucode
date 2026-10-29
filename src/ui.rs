@@ -2479,6 +2479,11 @@ impl App {
         self.push(Kind::Notice, "  Shift/Alt+Enter, Ctrl+J, \\+Enter  new line (Enter sends)");
         self.push(Kind::Notice, "  ↑/↓         move between draft lines, else scroll the output (3 lines)");
         self.push(Kind::Notice, "  Home/End    start / end of the line");
+        self.push(Kind::Notice, "  Ctrl+A/E    start / end of the line (readline)");
+        self.push(Kind::Notice, "  Ctrl+B/F    back / forward a char · Alt+B/F by word");
+        self.push(Kind::Notice, "  Ctrl+K/U    delete to the end / start of the line");
+        self.push(Kind::Notice, "  Ctrl+W      delete the word before · Ctrl+Y yanks it back");
+        self.push(Kind::Notice, "  Ctrl+D      delete the char under the cursor (empty line: quit)");
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
         self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  browse history");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
