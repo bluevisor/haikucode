@@ -92,7 +92,11 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   usage history; ↑/↓ select, Tab fills, Enter runs), `@file` attach, Tab
   autocomplete (commands + paths), history (↑/↓ on the composer's first/last line),
   word-skip (Alt/Ctrl/Cmd + arrows), word-delete (Option/Alt+Backspace and
-  Option/Alt+Delete), code-block highlighting.
+  Option/Alt+Delete), readline line editing (Ctrl+A/E line start/end,
+  Ctrl+B/F char and Alt+B/F word moves, Ctrl+K/U kill to the end/start of
+  the line, Ctrl+W kill word, Ctrl+Y yank it back, Alt+D kill the next
+  word, Ctrl+D delete the char under the cursor — an empty line still
+  quits), code-block highlighting.
 - Enables the Kitty keyboard protocol when the terminal supports it, so
   modified keys (e.g. Option+Backspace) are reported unambiguously instead of
   being flattened to a bare Backspace by terminals like Warp.
