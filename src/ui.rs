@@ -1544,13 +1544,7 @@ impl App {
             return;
         }
         let pos = self.byte_at(self.cursor);
-        if self.input[pos..].starts_with('\n') {
-            self.input.remove(pos);
-            self.kill_ring.clear();
-            return;
-        }
         self.input.remove(pos);
-        self.kill_ring.clear();
     }
 
     /// Arms — or fires — the Ctrl+C/Ctrl+D (and empty-composer Esc) quit. True
@@ -1583,8 +1577,14 @@ impl App {
         // must not swallow the first press (it used to: with a non-empty line
         // the key fell through to the `Char` arm's CONTROL guard and did
         // nothing at all) — a single press clears the line, Codex/Claude-Code
-        // style, and still arms the timer so the second press quits.
+        // style, and still arms the timer so the second press quits. Ctrl+D on
+        // a non-empty line is readline's delete-char instead (as in a shell):
+        // only an empty line arms the quit.
         if ctrl_c_or_d(&key) {
+            if matches!(key.code, KeyCode::Char('d')) && !self.input.is_empty() {
+                self.delete_forward();
+                return;
+            }
             if self.double_press_quit() {
                 return;
             }
@@ -1602,6 +1602,10 @@ impl App {
             return;
         }
         self.last_ctrl_c = None;
+
+        if self.on_key_readline(key) {
+            return;
+        }
 
         match key.code {
             // Ctrl+J is a literal line feed: a newline everywhere, including the
