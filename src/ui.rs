@@ -1416,13 +1416,16 @@ impl App {
     }
 
     fn on_key_busy(&mut self, key: KeyEvent, h: &Handles) {
+        // Esc / Ctrl+C / Ctrl+D stop the turn; everything else is composer
+        // editing, so the readline keys work while the agent runs too.
+        if key.code == KeyCode::Esc || ctrl_c_or_d(&key) {
+            self.interrupt(h);
+            return;
+        }
+        if self.on_key_readline(key) {
+            return;
+        }
         match key.code {
-            KeyCode::Esc => self.interrupt(h),
-            KeyCode::Char('c') | KeyCode::Char('d')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.interrupt(h);
-            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard_image(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1465,6 +1468,89 @@ impl App {
             KeyCode::PageDown => self.scroll_page(false),
             _ => {}
         }
+    }
+
+    /// Readline / Emacs line editing in the composer: the shortcuts anyone who
+    /// has spent time in a shell or Emacs reaches for. Returns true when the
+    /// key was consumed.
+    ///
+    /// Ctrl+A/E jump to the start/end of the line, Ctrl+B/F move a char,
+    /// Ctrl+K/U kill to the end/start of the line, Ctrl+W (and Alt+Backspace)
+    /// kill the word before the cursor, Alt+D the word after it, Ctrl+Y yanks
+    /// the last kill back, Ctrl+H is a backspace, Alt+B/F move by word, and
+    /// Ctrl+D deletes the char under the cursor when the line isn't empty
+    /// (an empty line still arms/quits, as a bare shell prompt does).
+    ///
+    /// The app's own Ctrl bindings are matched before this and win: Ctrl+C/D
+    /// (quit — handled by the caller), Ctrl+J (newline), Ctrl+L (repaint),
+    /// Ctrl+P (permissions), Ctrl+T (brief) and Ctrl+V (paste image).
+    fn on_key_readline(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Ctrl+<letter> arrives as Char with CONTROL under both legacy and the
+        // Kitty protocol; Alt+<letter> as Char with ALT, which used to fall
+        // through and type the bare letter.
+        match key.code {
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_bounds().0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_bounds().1,
+            KeyCode::Char('b') if ctrl || alt => self.cursor = self.prev_word(),
+            KeyCode::Char('f') if ctrl || alt => self.cursor = self.next_word(),
+            KeyCode::Char('h') if ctrl => self.on_key_edit(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            KeyCode::Char('d') if ctrl => self.delete_forward(),
+            KeyCode::Char('d') if alt => {
+                let end = self.next_word();
+                self.kill(self.cursor, end);
+            }
+            KeyCode::Char('k') if ctrl => {
+                let end = self.line_bounds().1;
+                self.kill(self.cursor, end);
+            }
+            KeyCode::Char('u') if ctrl => {
+                let start = self.line_bounds().0;
+                self.kill(start, self.cursor);
+            }
+            KeyCode::Char('w') if ctrl => {
+                let start = self.prev_word();
+                self.kill(start, self.cursor);
+            }
+            KeyCode::Char('y') if ctrl => {
+                let ring = self.kill_ring.clone();
+                for c in ring.chars() {
+                    self.insert_char(c);
+                }
+            }
+            _ => return false,
+        }
+        // Any edit invalidates the `/` palette highlight (as typing does).
+        self.suggest_idx = 0;
+        true
+    }
+
+    /// Cut chars `from..to` out of the composer into the kill ring.
+    fn kill(&mut self, from: usize, to: usize) {
+        if to <= from {
+            return;
+        }
+        let (start, end) = (self.byte_at(from), self.byte_at(to));
+        self.kill_ring = self.input[start..end].to_string();
+        self.input.drain(start..end);
+        self.cursor = from;
+    }
+
+    /// Delete the char under the cursor (Ctrl+D, readline's delete-char), or
+    /// the newline that ends the line so two lines join.
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let pos = self.byte_at(self.cursor);
+        if self.input[pos..].starts_with('\n') {
+            self.input.remove(pos);
+            self.kill_ring.clear();
+            return;
+        }
+        self.input.remove(pos);
+        self.kill_ring.clear();
     }
 
     /// Arms — or fires — the Ctrl+C/Ctrl+D (and empty-composer Esc) quit. True
