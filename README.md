@@ -76,7 +76,13 @@ memory, sessions, skills) into `~/.config/haikucode`.
   `/mcp__<server>__<prompt>` commands. A project's servers only start once you
   `/mcp approve` them. `/mcp` shows each server's state, transport and auth.
 - **Images** — `@image.png` attaches as a base64 data URI and `view_image`
-  loads one from disk, sent as OpenAI multimodal content parts.
+  loads one from disk, sent as OpenAI multimodal content parts. **Ctrl+V**
+  attaches the clipboard's image (macOS via `osascript`, Linux via `wl-paste`
+  or `xclip`, Haiku via `clipboard -s` + the PNG translator). The terminal's
+  own paste key (Cmd+V, Alt+V in Temino) does the same in terminals that send
+  an empty paste for an image-only clipboard; Haiku Terminal and Terminal.app
+  send nothing, so use Ctrl+V there. Image files dragged into the terminal
+  attach instead of pasting as bare paths.
 - **Streaming TUI** — a Claude-style composer with a reverse-block cursor,
   live token streaming, and colored unified diffs previewed before every
   write/edit.

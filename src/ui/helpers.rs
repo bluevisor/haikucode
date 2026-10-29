@@ -145,6 +145,195 @@ pub fn extract_images(text: &str) -> (Vec<String>, Vec<String>) {
     (uris, names)
 }
 
+/// A fresh temp path for an image the composer attaches by `@path`. No
+/// whitespace in it, since `@path` tokens split on whitespace.
+fn paste_temp_path(ext: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("haikucode-paste-{}-{n}.{ext}", std::process::id()))
+}
+
+/// Save the system clipboard's image to a temp PNG and return its path.
+/// Terminals only paste text, so an image copied to the clipboard (a
+/// screenshot, say) never arrives as a paste event; Ctrl+V fetches it here.
+pub fn clipboard_image() -> Result<String, String> {
+    let path = paste_temp_path("png");
+    let p = path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "set f to open for access POSIX file \"{p}\" with write permission\n\
+             try\n\
+             write (the clipboard as «class PNGf») to f\n\
+             on error e\n\
+             close access f\n\
+             error e\n\
+             end try\n\
+             close access f"
+        );
+        let out = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("osascript: {e}"))?;
+        let ok = out.status.success() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            return Err("no image on the clipboard".into());
+        }
+        Ok(p)
+    }
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "haiku")))]
+    {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let tries: [(&str, &[&str]); 2] = [
+            ("wl-paste", &["--no-newline", "--type", "image/png"]),
+            ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
+        ];
+        let order: Vec<_> = if wayland { tries.iter().collect() } else { tries.iter().rev().collect() };
+        let mut missing = Vec::new();
+        for (cmd, args) in order {
+            match std::process::Command::new(cmd).args(*args).output() {
+                Ok(out) if out.status.success() && out.stdout.starts_with(b"\x89PNG") => {
+                    std::fs::write(&path, &out.stdout).map_err(|e| e.to_string())?;
+                    return Ok(p);
+                }
+                Ok(_) => return Err("no image on the clipboard".into()),
+                Err(_) => missing.push(*cmd),
+            }
+        }
+        Err(format!("reading clipboard images needs {}", missing.join(" or ")))
+    }
+    // Haiku: `clipboard -s` saves the whole clipboard, image included, as a
+    // flattened BMessage; the bitmap in it goes through the PNG translator.
+    #[cfg(target_os = "haiku")]
+    {
+        let msg = paste_temp_path("msg");
+        let bits = paste_temp_path("bits");
+        let saved = std::process::Command::new("clipboard")
+            .arg("-s")
+            .arg(&msg)
+            .output()
+            .map_err(|e| format!("clipboard: {e}"))?;
+        let clip = std::fs::read(&msg).unwrap_or_default();
+        let _ = std::fs::remove_file(&msg);
+        let image = saved.status.success().then(|| super::beclip::clipboard_bits(&clip)).flatten();
+        let Some(image) = image else {
+            return Err("no image on the clipboard".into());
+        };
+        std::fs::write(&bits, image).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("translate")
+            .arg(&bits)
+            .arg(&path)
+            .arg("image/png")
+            .output();
+        let _ = std::fs::remove_file(&bits);
+        let ok = out.is_ok_and(|o| o.status.success())
+            && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0);
+        if !ok {
+            let _ = std::fs::remove_file(&path);
+            return Err("couldn't convert the clipboard image to PNG".into());
+        }
+        Ok(p)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        Err("clipboard images aren't supported here; drop the file in or type @path".into())
+    }
+}
+
+/// Split pasted text into shell-style words: backslash escapes and single or
+/// double quotes, as terminals write a dragged-in file's path. `file://` URLs
+/// (some Linux terminals) become plain paths.
+fn shell_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(cur);
+    }
+    words
+        .into_iter()
+        .map(|w| match w.strip_prefix("file://") {
+            Some(rest) => percent_decode(rest),
+            None => w,
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If a paste is nothing but image file paths (files dragged into the
+/// terminal), return them as `@path` attachments. A path with whitespace is
+/// copied to a temp file first, since `@path` tokens split on whitespace.
+pub fn pasted_image_attachments(text: &str) -> Option<String> {
+    let words = shell_words(text);
+    if words.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for w in &words {
+        if !crate::tools::is_image_path(w) || !expand_user(w).is_file() {
+            return None;
+        }
+        if w.contains(char::is_whitespace) {
+            let ext = std::path::Path::new(w).extension()?.to_str()?.to_ascii_lowercase();
+            let tmp = paste_temp_path(&ext);
+            std::fs::copy(expand_user(w), &tmp).ok()?;
+            out.push(format!("@{}", tmp.display()));
+        } else {
+            out.push(format!("@{w}"));
+        }
+    }
+    Some(out.join(" "))
+}
+
 /// Filesystem completions for a path prefix; dirs get a trailing '/'.
 pub fn complete_path(prefix: &str) -> Vec<String> {
     let (dir, base) = match prefix.rfind('/') {
@@ -974,5 +1163,34 @@ mod tests {
         let rows = question_lines(&long, 20, true);
         assert!(rows.last().unwrap().ends_with("..."));
         assert!(rows.iter().all(|r| r.chars().count() <= 20));
+    }
+
+    #[test]
+    fn dragged_paths_split_like_a_shell() {
+        assert_eq!(shell_words(r"/a/My\ Shot.png '/b/c d.jpg' x"), ["/a/My Shot.png", "/b/c d.jpg", "x"]);
+        assert_eq!(shell_words("file:///tmp/a%20b.png\n"), ["/tmp/a b.png"]);
+        assert!(shell_words("  ").is_empty());
+    }
+
+    #[test]
+    fn pasted_image_paths_become_attachments() {
+        let d = std::env::temp_dir().join(format!("haikucode-pasteimg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let plain = d.join("shot.png");
+        let spaced = d.join("my shot.png");
+        std::fs::write(&plain, b"\x89PNG").unwrap();
+        std::fs::write(&spaced, b"\x89PNG").unwrap();
+        let p = plain.display().to_string();
+        assert_eq!(pasted_image_attachments(&p).as_deref(), Some(format!("@{p}").as_str()));
+        // A path with a space is copied somewhere whitespace-free.
+        let esc = spaced.display().to_string().replace(' ', "\\ ");
+        let att = pasted_image_attachments(&esc).unwrap();
+        assert!(att.starts_with('@') && !att.contains(' '), "{att}");
+        assert!(std::path::Path::new(&att[1..]).is_file());
+        // Ordinary text, or a path that isn't an image or doesn't exist, pastes as text.
+        assert!(pasted_image_attachments("fix the bug").is_none());
+        assert!(pasted_image_attachments(&format!("{p} please")).is_none());
+        assert!(pasted_image_attachments("/nope/missing.png").is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

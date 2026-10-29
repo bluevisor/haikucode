@@ -3,6 +3,8 @@
 //! worker thread and feeds this UI through a channel.
 
 mod banner;
+#[cfg_attr(not(target_os = "haiku"), allow(dead_code))]
+mod beclip;
 mod brief;
 mod helpers;
 mod palette;
@@ -18,7 +20,8 @@ use crate::config::{Config, ConfigPatch, PROVIDERS};
 use crate::money;
 use banner::{BRole, banner_lines};
 use helpers::{
-    bar, complete_path, humanize, longest_common_prefix, pad1,
+    bar, clipboard_image, complete_path, humanize, longest_common_prefix, pad1,
+    pasted_image_attachments,
     perm_name, render_message, render_tline, setting_max_tool_calls,
 };
 use palette::{Palette, palette_by_name};
@@ -706,11 +709,45 @@ impl App {
             Mode::Settings { edit: Some(buf), .. } => buf.extend(one_line()),
             Mode::Settings { edit: None, .. } | Mode::Approval(_) | Mode::ThemeSelect { .. } => {}
             Mode::Idle | Mode::Busy => {
+                // An empty paste is what some terminals send for Cmd+V when
+                // the clipboard holds only an image: fetch the image instead.
+                if clean.trim().is_empty() {
+                    if let Ok(path) = clipboard_image() {
+                        self.insert_attachment(&format!("@{path}"));
+                    }
+                    return;
+                }
+                // Files dragged into the terminal paste as their paths.
+                if let Some(att) = pasted_image_attachments(&clean) {
+                    self.insert_attachment(&att);
+                    return;
+                }
                 for c in clean.chars() {
                     self.insert_char(c);
                 }
             }
         }
+    }
+
+    /// Ctrl+V: attach the clipboard's image (terminals only paste text).
+    fn paste_clipboard_image(&mut self) {
+        match clipboard_image() {
+            Ok(path) => self.insert_attachment(&format!("@{path}")),
+            Err(e) => self.push(Kind::Notice, format!("paste image: {e}")),
+        }
+    }
+
+    /// Insert `@path` attachment text at the cursor, space-separated from
+    /// its neighbours so the token stays whole.
+    fn insert_attachment(&mut self, att: &str) {
+        let before = self.input[..self.byte_at(self.cursor)].chars().next_back();
+        if before.is_some_and(|c| !c.is_whitespace()) {
+            self.insert_char(' ');
+        }
+        for c in att.chars() {
+            self.insert_char(c);
+        }
+        self.insert_char(' ');
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1383,6 +1420,7 @@ impl App {
                 self.interrupt(h);
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => self.paste_clipboard_image(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_char(caps_char(&key, c));
             }
@@ -1479,6 +1517,10 @@ impl App {
             // Ctrl+J is a literal line feed: a newline everywhere, including the
             // Pi's framebuffer console where Shift+Enter is plain Enter.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => self.insert_char('\n'),
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.paste_clipboard_image();
+                self.suggest_idx = 0;
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if c == '/' && self.input.is_empty() {
                     self.suggest_idx = 0;
