@@ -106,8 +106,9 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   reaches the app) and it is only reported as ESC+<key> with Settings →
   "Use Option as Meta key" on; macOS needs its Option-as-Meta equivalent.
   Haiku's Terminal also strips modifiers from Backspace and Delete, so
-  Ctrl+Backspace/Ctrl+Delete degrade there and Ctrl+W, Alt+Backspace (meta on)
-  and Ctrl+←/→ are the spellings that always work. It keeps Ctrl+Shift+↑/↓ and
+  Ctrl+Backspace/Ctrl+Delete delete just one char there; Alt+Backspace still
+  deletes a word with the meta option off (checked live in the UTM VM), and
+  Ctrl+W, Alt+Backspace and Ctrl+←/→ are the spellings that work. It keeps Ctrl+Shift+↑/↓ and
   Shift+PgUp/PgDn for its own scrolling; tmux's default prefix is Ctrl+B and
   screen's Ctrl+A, and those reach the app only as the prefix.
 - The composer never breaks a line in the middle of a word: the newline keys

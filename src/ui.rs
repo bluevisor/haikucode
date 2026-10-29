@@ -1602,9 +1602,10 @@ impl App {
     ///   modifiers on the arrows as xterm `ESC[1;<mod><letter>`), Ctrl+Y.
     /// - Haiku's Terminal strips modifiers from Backspace and Delete
     ///   (B_BACKSPACE/B_DELETE are rewritten without `mod`), so Ctrl+Backspace
-    ///   and Ctrl+Delete degrade to a plain char delete there and Alt+D /
-    ///   Alt+Backspace need the meta option — Ctrl+W and Ctrl+←/→ are the
-    ///   Haiku-safe spellings. It also keeps Ctrl+Shift+↑/↓ and
+    ///   and Ctrl+Delete degrade to a plain char delete there (checked live in
+    ///   the UTM VM). Alt+Backspace still deletes a word with "Use Option as
+    ///   Meta key" off; Alt+D needs the meta option. Ctrl+W, Alt+Backspace and
+    ///   Ctrl+←/→ are the Haiku-safe spellings. It also keeps Ctrl+Shift+↑/↓ and
     ///   Shift+PgUp/PgDn for scrolling itself.
     /// - A multiplexer eats one of them: tmux's default prefix is Ctrl+B and
     ///   GNU screen's is Ctrl+A (a popular tmux setting too). Those two reach
@@ -1862,8 +1863,7 @@ impl App {
     /// and Ctrl+Delete for the platforms where Alt is not the app's to take —
     /// on Haiku Alt is the menu accelerator key, so Ctrl is the reliable
     /// modifier there (though its Terminal strips modifiers from Backspace and
-    /// Delete, so Ctrl+W / Alt+Backspace with Option-as-Meta are the Haiku
-    /// spellings). All of them go through the kill ring, so a kill that was
+    /// Delete, so Ctrl+W / Alt+Backspace are the Haiku spellings). All of them go through the kill ring, so a kill that was
     /// one word too many comes back with Ctrl+Y.
     fn on_key_edit(&mut self, key: KeyEvent) {
         let word = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
@@ -2610,7 +2610,7 @@ impl App {
         self.push(Kind::Notice, "  Ctrl+A/E    start / end of the line (readline)");
         self.push(Kind::Notice, "  Ctrl+B/F    back / forward a char · Alt+B/F by word");
         self.push(Kind::Notice, "  Ctrl+K/U    delete to the end / start of the line");
-        self.push(Kind::Notice, "  Ctrl+W      delete the word before · Ctrl+Y yanks it back");
+        self.push(Kind::Notice, "  Ctrl+W, Alt+Backspace  delete the word before · Ctrl+Y yanks it back");
         self.push(Kind::Notice, "  Ctrl+D      delete the char under the cursor (empty line: quit)");
         self.push(Kind::Notice, "  (Ctrl+<letter> works on every terminal. Alt+<letter> is the fragile");
         self.push(Kind::Notice, "   one: on Haiku it is Terminal's menu key (Alt+F = Find) and needs");
