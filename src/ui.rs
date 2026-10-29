@@ -155,6 +155,9 @@ pub struct App {
     esc_deadline: Option<Instant>,
     /// Time of last Ctrl+C with empty input; used for double-press-to-quit.
     last_ctrl_c: Option<Instant>,
+    /// Text cut by Ctrl+K/U/W, put back by Ctrl+Y — readline's kill ring
+    /// (a single slot: the last kill).
+    kill_ring: String,
     /// Cached slash-command usage counts (command → times used). Rebuilt when
     /// history grows so we don't scan full history per keystroke.
     cmd_uses: HashMap<String, usize>,
@@ -303,6 +306,7 @@ impl App {
             should_quit: false,
             esc_deadline: None,
             last_ctrl_c: None,
+            kill_ring: String::new(),
             cmd_uses: HashMap::new(),
             force_clear: false,
             single_width: cfg.ascii
