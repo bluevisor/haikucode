@@ -1493,8 +1493,10 @@ impl App {
         match key.code {
             KeyCode::Char('a') if ctrl => self.cursor = self.line_bounds().0,
             KeyCode::Char('e') if ctrl => self.cursor = self.line_bounds().1,
-            KeyCode::Char('b') if ctrl || alt => self.cursor = self.prev_word(),
-            KeyCode::Char('f') if ctrl || alt => self.cursor = self.next_word(),
+            KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Char('f') if ctrl => self.cursor = (self.cursor + 1).min(self.char_len()),
+            KeyCode::Char('b') if alt => self.cursor = self.prev_word(),
+            KeyCode::Char('f') if alt => self.cursor = self.next_word(),
             KeyCode::Char('h') if ctrl => self.on_key_edit(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
             KeyCode::Char('d') if ctrl => self.delete_forward(),
             KeyCode::Char('d') if alt => {
