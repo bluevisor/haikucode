@@ -961,6 +961,12 @@ pub fn bump_cargo_version(dir: &Path) -> Option<String> {
 /// when there was nothing to commit / not a repo. Best-effort: never surfaces an
 /// error.
 pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
+    git_autocommit_with(dir, paths, message, auto_bump_version())
+}
+
+/// `git_autocommit` with the version-bump choice made by the caller (tests
+/// pin it, so they don't depend on the settings of the repo they run in).
+fn git_autocommit_with(dir: &Path, paths: &[String], message: &str, bump: bool) -> String {
     if paths.is_empty() || !in_git_repo(dir) {
         return String::new();
     }
@@ -998,7 +1004,7 @@ pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
 
     // Bump Cargo.toml version if opted in, and add it to the commit.
     let cargo_toml = dir.join("Cargo.toml");
-    let version_bumped = if cargo_toml.exists() && auto_bump_version() {
+    let version_bumped = if cargo_toml.exists() && bump {
         bump_cargo_version(dir)
     } else {
         None
@@ -2519,7 +2525,7 @@ mod tests {
         // Now edit a file and autocommit.
         let f = dir.join("x.txt");
         std::fs::write(&f, "hi\n").unwrap();
-        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt");
+        let note = git_autocommit_with(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt", true);
         assert!(note.contains("committed"), "got: {note:?}");
         assert!(note.contains("version → 0.1.1"), "got: {note:?}");
         let content = std::fs::read_to_string(&toml).unwrap();
