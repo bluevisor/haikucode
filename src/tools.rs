@@ -961,6 +961,12 @@ pub fn bump_cargo_version(dir: &Path) -> Option<String> {
 /// when there was nothing to commit / not a repo. Best-effort: never surfaces an
 /// error.
 pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
+    git_autocommit_with(dir, paths, message, auto_bump_version())
+}
+
+/// `git_autocommit` with the version-bump choice made by the caller (tests
+/// pin it, so they don't depend on the settings of the repo they run in).
+fn git_autocommit_with(dir: &Path, paths: &[String], message: &str, bump: bool) -> String {
     if paths.is_empty() || !in_git_repo(dir) {
         return String::new();
     }
@@ -998,7 +1004,7 @@ pub fn git_autocommit(dir: &Path, paths: &[String], message: &str) -> String {
 
     // Bump Cargo.toml version if opted in, and add it to the commit.
     let cargo_toml = dir.join("Cargo.toml");
-    let version_bumped = if cargo_toml.exists() && auto_bump_version() {
+    let version_bumped = if cargo_toml.exists() && bump {
         bump_cargo_version(dir)
     } else {
         None
@@ -1552,15 +1558,17 @@ fn decode_entities(s: &str) -> String {
 // ----------------------------------------------------------- web_search -----
 
 /// Where web_search goes. `"web_search"` in config/settings picks one
-/// (`searxng` / `brave` / `tavily` / `duckduckgo`); unset or `"auto"` takes the
-/// first that's configured — a `web_search_url` (SearXNG), TAVILY_API_KEY,
-/// BRAVE_API_KEY — and otherwise keyless DuckDuckGo. `web_search_key`
-/// stands in for the env key.
+/// (`searxng` / `brave` / `tavily` / `deepseek` / `duckduckgo`); unset or
+/// `"auto"` takes the first that's configured — a `web_search_url` (SearXNG),
+/// TAVILY_API_KEY, BRAVE_API_KEY — and otherwise keyless DuckDuckGo.
+/// `web_search_key` stands in for the env key. DeepSeek's Search API (billed
+/// per request) is opt-in only; its key falls back to the DeepSeek chat key.
 #[derive(Debug, PartialEq)]
 enum SearchBackend {
     Searxng(String),
     Brave(String),
     Tavily(String),
+    DeepSeek(String),
     DuckDuckGo,
 }
 
@@ -1577,6 +1585,10 @@ fn search_backend(
         "tavily" => {
             Ok(SearchBackend::Tavily(need("tavily but TAVILY_API_KEY isn't set", key.or_else(|| env("TAVILY_API_KEY")))?))
         }
+        "deepseek" => Ok(SearchBackend::DeepSeek(need(
+            "deepseek but there's no DeepSeek API key",
+            key.or_else(|| env("DEEPSEEK_API_KEY")),
+        )?)),
         "duckduckgo" | "ddg" => Ok(SearchBackend::DuckDuckGo),
         _ => Ok(if let Some(u) = url {
             SearchBackend::Searxng(u)
@@ -1596,7 +1608,15 @@ pub fn web_search(http: &ureq::Agent, query: &str) -> String {
         return "ERROR: empty query".into();
     }
     let s = |k: &str| crate::config::setting(k).and_then(|v| v.as_str().map(str::to_string)).filter(|v| !v.trim().is_empty());
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let env = |k: &str| {
+        std::env::var(k).ok().filter(|v| !v.trim().is_empty()).or_else(|| {
+            // DeepSeek search reuses the chat key when DeepSeek is the provider.
+            (k == "DEEPSEEK_API_KEY")
+                .then(crate::config::Config::load)
+                .filter(|c| c.provider == "deepseek" && !c.api_key.trim().is_empty())
+                .map(|c| c.api_key)
+        })
+    };
     let backend = match search_backend(s("web_search").as_deref(), s("web_search_url"), s("web_search_key"), env) {
         Ok(b) => b,
         Err(e) => return e,
@@ -1622,6 +1642,14 @@ pub fn web_search(http: &ureq::Agent, query: &str) -> String {
                 .set("Content-Type", "application/json")
                 .send_string(&serde_json::json!({ "query": query, "max_results": 8 }).to_string()),
         ),
+        SearchBackend::DeepSeek(key) => (
+            "DeepSeek",
+            http.post("https://api.deepseek.com/v1/tools/search")
+                .timeout(Duration::from_secs(30))
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Content-Type", "application/json")
+                .send_string(&serde_json::json!({ "query": deepseek_query(query), "count": 8 }).to_string()),
+        ),
         SearchBackend::DuckDuckGo => ("DuckDuckGo", get(&format!("https://html.duckduckgo.com/html/?q={q}")).call()),
     };
     let resp = match resp {
@@ -1629,6 +1657,7 @@ pub fn web_search(http: &ureq::Agent, query: &str) -> String {
         Err(ureq::Error::Status(code, r)) => {
             let hint = match (code, &backend) {
                 (403, SearchBackend::Searxng(_)) => " (enable the json format in the instance's settings.yml)",
+                (402, SearchBackend::DeepSeek(_)) => " (insufficient DeepSeek balance)",
                 (401 | 403, _) => " (check the API key)",
                 (429, _) => " (rate limited; try again shortly)",
                 _ => "",
@@ -1649,7 +1678,14 @@ pub fn web_search(http: &ureq::Agent, query: &str) -> String {
         SearchBackend::Searxng(_) => format_hits(name, parse_json_hits(&body, "/results", "content")),
         SearchBackend::Tavily(_) => format_hits(name, parse_json_hits(&body, "/results", "content")),
         SearchBackend::Brave(_) => format_hits(name, parse_json_hits(&body, "/web/results", "description")),
+        SearchBackend::DeepSeek(_) => format_hits(name, parse_json_hits(&body, "/results", "summary")),
     }
+}
+
+/// DeepSeek's Search API takes 1-128 characters; trim longer queries on a
+/// char boundary rather than have the request rejected.
+fn deepseek_query(query: &str) -> String {
+    query.trim().chars().take(128).collect()
 }
 
 const DDG_BLOCKED: &str = "ERROR: DuckDuckGo is rate-limiting this connection with a bot check, so there are no \
@@ -2355,10 +2391,24 @@ mod tests {
         assert!(search_backend(Some("brave"), None, None, none).unwrap_err().contains("BRAVE_API_KEY"));
         assert!(search_backend(Some("searxng"), None, None, none).unwrap_err().contains("web_search_url"));
         assert_eq!(search_backend(Some("ddg"), None, None, tavily), Ok(SearchBackend::DuckDuckGo));
+        // DeepSeek is opt-in (billed per request), never picked by auto.
+        let ds = |k: &str| (k == "DEEPSEEK_API_KEY").then(|| "dk".to_string());
+        assert_eq!(search_backend(None, None, None, ds), Ok(SearchBackend::DuckDuckGo));
+        assert_eq!(search_backend(Some("deepseek"), None, None, ds), Ok(SearchBackend::DeepSeek("dk".into())));
+        assert!(search_backend(Some("deepseek"), None, None, none).unwrap_err().contains("DeepSeek API key"));
+        assert_eq!(deepseek_query(&"é".repeat(200)).chars().count(), 128);
     }
 
     #[test]
     fn search_responses_parse_per_backend() {
+        // The example from DeepSeek's Search API reference: `summary` is the
+        // model-facing text (`snippet` is a shorter one for UIs).
+        let ds = r#"{"results":[{"rerank_score":2.4,"title":"DeepSeek V4 model released","url":"https://example.com/deepseek-v4","snippet":"short","summary":"DeepSeek has released the V4 model.","content":"","site_name":"Example News","site_icon":null,"date":"2026-06-01T00:00:00+00:00","authority":3}]}"#;
+        assert_eq!(
+            format_hits("DeepSeek", parse_json_hits(ds, "/results", "summary")),
+            "1. DeepSeek V4 model released\n   https://example.com/deepseek-v4\n   DeepSeek has released the V4 model.\n"
+        );
+        assert_eq!(format_hits("DeepSeek", parse_json_hits(r#"{"results":[]}"#, "/results", "summary")), "(no results from DeepSeek)");
         let searx = r#"{"query":"rust","results":[{"title":"The Rust Book","url":"https://doc.rust-lang.org/book/","content":"Learn Rust."},{"title":"no url"}]}"#;
         let out = format_hits("SearXNG", parse_json_hits(searx, "/results", "content"));
         assert_eq!(out, "1. The Rust Book\n   https://doc.rust-lang.org/book/\n   Learn Rust.\n");
@@ -2475,7 +2525,7 @@ mod tests {
         // Now edit a file and autocommit.
         let f = dir.join("x.txt");
         std::fs::write(&f, "hi\n").unwrap();
-        let note = git_autocommit(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt");
+        let note = git_autocommit_with(&dir, &[f.to_string_lossy().into()], "haikucode: write x.txt", true);
         assert!(note.contains("committed"), "got: {note:?}");
         assert!(note.contains("version → 0.1.1"), "got: {note:?}");
         let content = std::fs::read_to_string(&toml).unwrap();

@@ -53,7 +53,7 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
 
 - Tools: bash (timeout, or `background` jobs + bash_output/bash_kill),
   read/write/edit/list, multi_edit (batch edits across files), grep (regex),
-  glob, web_fetch (URL → readable text), web_search (DuckDuckGo), todo (visible
+  glob, web_fetch (URL → readable text), web_search (DuckDuckGo, or SearXNG / Brave / Tavily / DeepSeek), todo (visible
   plan), ask_user, task (sub-agent), view_image, remember/recall — plus any MCP tools.
 - Git auto-checkpoint: every successful edit is committed to the working-dir
   repo (`auto_commit`, on by default; no-op outside a repo). Recent git history

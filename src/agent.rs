@@ -1023,8 +1023,11 @@ impl Worker {
                 new.extend_from_slice(&self.messages[tail_start..]);
                 // A client-side summary rewrites the history that signed
                 // thinking was bound to: replay the kept turns without it.
+                // (Plain chat reasoning stays — DeepSeek wants it back.)
                 for m in &mut new {
-                    m.native = None;
+                    if m.native.as_ref().is_some_and(api::native_is_history_bound) {
+                        m.native = None;
+                    }
                 }
                 self.messages = new;
                 // Rough size estimate so the UI's ctx bar drops right away.
@@ -1246,7 +1249,9 @@ impl Worker {
                         images: Vec::new(),
                         tool_calls: None,
                         tool_call_id: None,
-                        native: None,
+                        // Partial chat reasoning still has to go back to
+                        // DeepSeek; a half-signed native turn must not.
+                        native: native.filter(|n| !api::native_is_history_bound(n)),
                     });
                 }
                 let _ = self.ui.send(UiEvent::Notice("(interrupted)".into()));
