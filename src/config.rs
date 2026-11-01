@@ -200,7 +200,7 @@ fn default_max_tool_calls() -> u32 {
 /// Provider presets: (name, base_url, default model) — the single source for
 /// the first-run wizard and the `/config` panel's provider row.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
-    ("deepseek", "https://api.deepseek.com", "deepseek-v4-flash"),
+    ("deepseek", "https://api.deepseek.com", "deepseek-flash"),
     ("openai", "https://api.openai.com/v1", "gpt-4o-mini"),
     ("anthropic", "https://api.anthropic.com/v1", "claude-opus-5-5"),
     ("groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
@@ -252,8 +252,9 @@ fn default_ctx() -> u32 {
 }
 
 /// Best-known context window (in tokens) for a model id, used when the
-/// provider's `/models` endpoint doesn't advertise one — DeepSeek's, for
-/// instance, returns only `id`/`object`/`owned_by`. Matched by substring so
+/// provider's `/models` endpoint doesn't advertise one (DeepSeek's now does,
+/// as `context_window: 1048576`; older deployments and most OpenAI-compatible
+/// servers return only `id`/`object`/`owned_by`). Matched by substring so
 /// version suffixes need no enumerating. Conservative 128k fallback.
 pub fn known_context_window(model: &str) -> u32 {
     let m = model.to_ascii_lowercase();
@@ -282,15 +283,19 @@ pub fn known_context_window(model: &str) -> u32 {
         128_000
     }
 }
+// DeepSeek Flash (`deepseek-flash`, V4.1) off-peak list, USD per 1M tokens.
+// Since 2026-08-16 DeepSeek charges double during peak hours (01:00-04:00 and
+// 06:00-10:00 UTC, weekdays); the flat readout uses the off-peak price, which
+// covers about four in five hours.
 fn default_price_in() -> f64 {
-    0.14
+    0.15
 }
 fn default_price_out() -> f64 {
-    0.28
+    0.6
 }
-/// DeepSeek V4 Flash's cache-hit input price (USD per 1M), next to the default
-/// 0.14 miss / 0.28 output list.
-const DEEPSEEK_CACHE_HIT_PRICE: f64 = 0.0028;
+/// DeepSeek Flash's off-peak cache-hit input price (USD per 1M), next to the
+/// default 0.15 miss / 0.6 output list.
+const DEEPSEEK_CACHE_HIT_PRICE: f64 = 0.003;
 
 /// The reasoning settings, in `/config` cycling order.
 /// `xhigh` and `max` go out as-is where the provider has them (current Claude
@@ -334,7 +339,7 @@ impl Default for Config {
         Config {
             provider: "deepseek".into(),
             base_url: "https://api.deepseek.com".into(),
-            model: "deepseek-v4-flash".into(),
+            model: "deepseek-flash".into(),
             api_key: String::new(),
             api_keys: BTreeMap::new(),
             oauth: BTreeMap::new(),
@@ -866,9 +871,14 @@ impl Config {
     }
 
     /// Does this provider accept OpenAI-style `image_url` content parts?
-    /// DeepSeek is text-only and rejects the variant; most others accept it.
+    /// DeepSeek Flash (V4.1) takes images; V4 Pro and Zhipu are text-only and
+    /// reject the variant. Most others accept it.
     pub fn supports_images(&self) -> bool {
-        !matches!(self.provider.as_str(), "deepseek" | "zai")
+        match self.provider.as_str() {
+            "deepseek" => self.model.to_ascii_lowercase().contains("flash"),
+            "zai" => false,
+            _ => true,
+        }
     }
 
     /// Persist only the show-thinking toggle, preserving the rest of the file.
@@ -1060,6 +1070,18 @@ mod tests {
         assert_eq!(load(serde_json::json!({"provider": "splash", "thinking": true})), default_reasoning());
         // An explicit setting always wins.
         assert_eq!(load(serde_json::json!({"provider": "splash", "thinking": true, "reasoning": "high"})), "high");
+    }
+
+    #[test]
+    fn deepseek_flash_takes_images_but_pro_does_not() {
+        let mut c = Config::default();
+        assert_eq!(c.model, "deepseek-flash");
+        assert!(c.supports_images());
+        c.model = "deepseek-v4-pro".into();
+        assert!(!c.supports_images());
+        c.provider = "zai".into();
+        c.model = "glm-5.2".into();
+        assert!(!c.supports_images());
     }
 
     #[test]

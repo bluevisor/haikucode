@@ -122,8 +122,10 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Web search backends** — keyless DuckDuckGo by default; a bot-check page is
   reported as such instead of returning nothing. Set `"web_search_url"` to a
   SearXNG instance (with its JSON format enabled), or export `BRAVE_API_KEY` /
-  `TAVILY_API_KEY`. `"web_search": "searxng" | "brave" | "tavily" | "duckduckgo"`
-  pins one; `"web_search_key"` stands in for the env key.
+  `TAVILY_API_KEY`. `"web_search": "searxng" | "brave" | "tavily" | "deepseek" |
+  "duckduckgo"` pins one; `"web_search_key"` stands in for the env key.
+  `deepseek` uses DeepSeek's Search API with your DeepSeek key ($0.75 per 1,000
+  searches), so it is only used when you pick it.
 - **Hooks** — `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop` /
   `SessionStart` shell hooks (same JSON shape as Claude Code's) receive the
   event on stdin; exit `2` blocks the action and feeds stderr back to the model.
@@ -157,7 +159,8 @@ memory, sessions, skills) into `~/.config/haikucode`.
   `config.json` (`"temperature": 0.7`), so each model's recommended sampling
   applies; the DeepSeek preset keeps `0.2`.
 - **Reasoning effort** — `/effort auto|off|low|medium|high|xhigh|max` (or the `/config`
-  row) is translated per provider: DeepSeek/GLM `thinking`, OpenAI/Gemini/Groq
+  row) is translated per provider: DeepSeek `thinking` + `reasoning_effort`
+  (`low`/`high`/`max`), GLM `thinking`, OpenAI/Gemini/Groq
   `reasoning_effort`, OpenRouter `reasoning`, Anthropic adaptive thinking +
   `output_config.effort`, Responses `reasoning.effort`, and for self-hosted
   servers (Splash, vLLM, SGLang, llama.cpp) the chat template's
@@ -372,7 +375,9 @@ and feeds stderr to the model, anything else is a non-blocking warning.
 
 The status line shows the session cost and the account balance. The cost comes
 from `price_in` / `price_out` (per 1M tokens) and is quoted in
-`price_currency`, which defaults to `USD` — the unit of the built-in prices.
+`price_currency`, which defaults to `USD` — the unit of the built-in prices
+(DeepSeek Flash's off-peak list; DeepSeek charges double at weekday peak
+hours, 01:00–04:00 and 06:00–10:00 UTC).
 The balance comes from the provider and carries whatever currency the account
 is billed in: DeepSeek answers `CNY` for China-region accounts and `USD`
 elsewhere.
