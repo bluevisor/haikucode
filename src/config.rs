@@ -268,6 +268,9 @@ pub enum ConfigPatch {
     AddProvider(CustomProvider),
     /// Forget a custom provider (its saved key goes with it).
     RemoveProvider(String),
+    /// Save the API key for one provider, active or not (the `/provider`
+    /// wizard stores it before switching, so the switch finds it).
+    ProviderKey { provider: String, key: String },
     BaseUrl(String),
     ApiKey(String),
     /// `/effort` or the /config row: one of `REASONING_LEVELS`.
@@ -906,6 +909,12 @@ impl Config {
             .collect()
     }
 
+    /// Is there a key for `provider`, saved or in its environment variable?
+    pub fn has_key_for(&self, provider: &str) -> bool {
+        self.api_keys.get(provider).is_some_and(|k| !k.is_empty())
+            || key_env_vars(provider).iter().any(|v| std::env::var(v).is_ok_and(|k| !k.is_empty()))
+    }
+
     pub fn custom_provider(&self, name: &str) -> Option<&CustomProvider> {
         self.custom_providers.iter().find(|c| c.name == name)
     }
@@ -1011,6 +1020,13 @@ impl Config {
             ConfigPatch::AddProvider(cp) => {
                 self.custom_providers.retain(|c| c.name != cp.name);
                 self.custom_providers.push(cp.clone());
+            }
+            ConfigPatch::ProviderKey { provider, key } => {
+                self.api_keys.insert(provider.clone(), key.clone());
+                if &self.provider == provider {
+                    self.api_key = key.clone();
+                    self.key_from_env = false;
+                }
             }
             ConfigPatch::RemoveProvider(name) => {
                 self.custom_providers.retain(|c| &c.name != name);
