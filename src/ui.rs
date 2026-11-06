@@ -1302,21 +1302,15 @@ impl App {
         let edit_with = |s: String| Mode::Settings { cursor: cur, edit: Some(s) };
         match SETTING_ROWS[cur] {
             0 => {
-                let i = PROVIDERS
+                // The presets, then the user's own providers.
+                let choices = self.settings.provider_choices();
+                let i = choices
                     .iter()
                     .position(|(n, _, _)| *n == self.settings.provider)
-                    .map(|i| cycle(i, PROVIDERS.len()))
+                    .map(|i| cycle(i, choices.len()))
                     .unwrap_or(0);
-                let (p, b, m) = PROVIDERS[i];
-                self.settings.provider = p.to_string();
-                self.settings.base_url = b.to_string();
-                // Swap to the new provider's saved API key.
-                self.settings.resolve_key();
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider {
-                    provider: p.to_string(),
-                    base_url: b.to_string(),
-                    model: m.to_string(),
-                }));
+                let (p, b, m) = choices[i].clone();
+                self.switch_provider(p, b, m, h);
             }
             1 => self.mode = edit_with(self.settings.base_url.clone()),
             2 => self.mode = edit_with(self.settings.model.clone()),
@@ -2151,6 +2145,7 @@ impl App {
             "config" => {
                 self.mode = Mode::Settings { cursor: 0, edit: None };
             }
+            "provider" => self.provider_command(_arg, h),
             "effort" => match _arg {
                 Some(a) => {
                     let level = crate::config::normalize_reasoning(a);
@@ -2571,6 +2566,98 @@ impl App {
             _ => {
                 self.push(Kind::ErrorK, format!("/permissions {arg}: missing or unknown option"));
                 self.show_options("/permissions");
+            }
+        }
+    }
+
+    /// Make `provider` active with its address and model, and its saved key.
+    fn switch_provider(&mut self, provider: String, base_url: String, model: String, h: &Handles) {
+        self.settings.provider = provider.clone();
+        self.settings.base_url = base_url.clone();
+        self.settings.model = model.clone();
+        self.settings.resolve_key();
+        let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider { provider, base_url, model }));
+    }
+
+    /// Apply a settings change here and in the worker (which saves it).
+    fn patch(&mut self, p: ConfigPatch, h: &Handles) {
+        self.settings.apply_patch(&p);
+        let _ = h.cmd_tx.send(WorkerCmd::Patch(p));
+    }
+
+    /// `/provider`: list; `/provider <name>` switches; `/provider add <name>
+    /// <base_url> <model>` adds (or updates) an OpenAI-compatible provider and
+    /// switches to it; `/provider remove <name>` forgets one.
+    fn provider_command(&mut self, arg: Option<&str>, h: &Handles) {
+        use crate::config::{is_builtin_provider, valid_custom_name, CustomProvider};
+        let words: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
+        match words.as_slice() {
+            [] => {
+                self.push(Kind::Notice, String::from("providers (● active):"));
+                for (name, base, model) in self.settings.provider_choices() {
+                    let active = if name == self.settings.provider { "●" } else { " " };
+                    let kind = if is_builtin_provider(&name) { "" } else { " (custom)" };
+                    let key = if self.settings.api_keys.get(&name).is_some_and(|k| !k.is_empty()) {
+                        ""
+                    } else {
+                        " · no key saved"
+                    };
+                    self.push(Kind::Notice, format!("  {active} {name}{kind}  {base} · {model}{key}"));
+                }
+                self.push(Kind::Notice, String::from("  /provider <name> switches"));
+                self.show_options("/provider");
+            }
+            ["add", name, base, model] => {
+                if let Err(e) = valid_custom_name(name) {
+                    self.push(Kind::ErrorK, e);
+                    return;
+                }
+                if !(base.starts_with("http://") || base.starts_with("https://")) {
+                    self.push(Kind::ErrorK, format!("'{base}': the base URL must start with http:// or https://"));
+                    return;
+                }
+                let cp = CustomProvider {
+                    name: name.to_string(),
+                    base_url: base.trim_end_matches('/').to_string(),
+                    model: model.to_string(),
+                };
+                let (p, b, m) = (cp.name.clone(), cp.base_url.clone(), cp.model.clone());
+                let updated = self.settings.custom_provider(name).is_some();
+                self.patch(ConfigPatch::AddProvider(cp), h);
+                self.push(
+                    Kind::Notice,
+                    format!("{} provider {p}: {b} · {m}", if updated { "updated" } else { "added" }),
+                );
+                self.switch_provider(p, b, m, h);
+            }
+            ["add", ..] => {
+                self.push(Kind::ErrorK, String::from("usage: /provider add <name> <base_url> <model>"));
+            }
+            ["remove" | "rm", name] => {
+                if is_builtin_provider(name) {
+                    self.push(Kind::ErrorK, format!("'{name}' is built in and can't be removed"));
+                    return;
+                }
+                if self.settings.custom_provider(name).is_none() {
+                    self.push(Kind::ErrorK, format!("no custom provider named '{name}'"));
+                    return;
+                }
+                if self.settings.provider == *name {
+                    let (p, b, m) = PROVIDERS[0];
+                    self.switch_provider(p.into(), b.into(), m.into(), h);
+                }
+                self.patch(ConfigPatch::RemoveProvider(name.to_string()), h);
+                self.push(Kind::Notice, format!("removed provider {name} and its saved key"));
+            }
+            [name] => match self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) {
+                Some((p, b, m)) => self.switch_provider(p, b, m, h),
+                None => {
+                    self.push(Kind::ErrorK, format!("unknown provider '{name}' (/provider lists them)"));
+                }
+            },
+            _ => {
+                self.push(Kind::ErrorK, format!("/provider {}: unknown option", words.join(" ")));
+                self.show_options("/provider");
             }
         }
     }
@@ -3766,6 +3853,57 @@ mod tests {
         app.cursor = 5;
         app.submit(&h);
         assert!(app.transcript.iter().any(|l| l.kind == crate::ui::types::Kind::ErrorK && l.text.contains("unknown command")));
+    }
+
+    #[test]
+    fn provider_command_adds_switches_and_removes_custom_providers() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        let run = |app: &mut App, line: &str| {
+            app.mode = Mode::Idle;
+            app.input = line.to_string();
+            app.cursor = app.input.chars().count();
+            app.submit(&h);
+        };
+        let patches = |rx: &std::sync::mpsc::Receiver<WorkerCmd>| -> Vec<ConfigPatch> {
+            rx.try_iter()
+                .filter_map(|c| match c {
+                    WorkerCmd::Patch(p) => Some(p),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        run(&mut app, "/provider add box https://llm.example/v1/ some-model");
+        let sent = patches(&rx);
+        assert!(matches!(&sent[0], ConfigPatch::AddProvider(c)
+            if c.name == "box" && c.base_url == "https://llm.example/v1" && c.model == "some-model"));
+        assert!(matches!(&sent[1], ConfigPatch::Provider { provider, .. } if provider == "box"));
+        assert_eq!(app.settings.provider, "box");
+
+        // The /config provider row cycles through it too: box is last, so
+        // the next one wraps to the first preset.
+        app.activate_setting(0, 1, &h);
+        assert_eq!(app.settings.provider, crate::config::PROVIDERS[0].0);
+        run(&mut app, "/provider box");
+        assert_eq!((app.settings.provider.as_str(), app.settings.model.as_str()), ("box", "some-model"));
+        let _ = patches(&rx);
+
+        // Presets can't be added over or removed; bad input is refused.
+        run(&mut app, "/provider add openai https://x/v1 m");
+        run(&mut app, "/provider remove deepseek");
+        run(&mut app, "/provider add bad name! https://x/v1");
+        run(&mut app, "/provider add box2 ftp://x m");
+        assert!(patches(&rx).is_empty(), "no patch for refused input");
+
+        // Removing the active custom provider falls back to the first preset.
+        run(&mut app, "/provider remove box");
+        let sent = patches(&rx);
+        assert!(matches!(&sent[0], ConfigPatch::Provider { provider, .. } if provider == crate::config::PROVIDERS[0].0));
+        assert!(matches!(&sent[1], ConfigPatch::RemoveProvider(n) if n == "box"));
+        assert!(app.settings.custom_provider("box").is_none());
+        run(&mut app, "/provider box");
+        assert!(app.transcript.iter().any(|l| l.kind == crate::ui::types::Kind::ErrorK && l.text.contains("unknown provider")));
     }
 
     #[test]

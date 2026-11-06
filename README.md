@@ -217,6 +217,13 @@ memory, sessions, skills) into `~/.config/haikucode`.
   auth mode, reasoning effort, default permission mode, auto-commit, theme, context
   window, max tool calls, and price currency, edited in-TUI; changes apply live
   and persist to `config.json`.
+- **Custom providers** (`/provider`) — any OpenAI-compatible endpoint (a
+  LiteLLM or other gateway, a local server) alongside the presets:
+  `/provider add <name> <base_url> <model>` adds one and switches to it,
+  `/provider <name>` switches, `/provider remove <name>` forgets it and its key,
+  and `/provider` lists them all. Each keeps its own API key (the `/config`
+  key row) and remembers its model; the `/config` provider row cycles through
+  them too. A provider made by the setup wizard's "custom" choice joins the list.
 - **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
   and blue desktop), `Rainbow` (picoder's original Apple-rainbow look),
   `Apple ][` (green phosphor), `MSDOS`, `macOS`, `SUN`, `NeXT`, and `SGI`.

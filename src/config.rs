@@ -177,10 +177,43 @@ pub struct Config {
     /// persist it then.
     #[serde(skip)]
     pub key_from_env: bool,
+    /// Providers the user added (any OpenAI-compatible endpoint), switchable
+    /// like the presets. Their keys live in `api_keys` under their name.
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProvider>,
     /// Settings blocks haikucode doesn't model as fields (`permissions`, `hooks`)
     /// carried through verbatim so a model/theme rewrite can't drop them.
     #[serde(skip)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A user-added provider: a name, an OpenAI-compatible base URL and the model
+/// to use there (kept up to date as the model changes while it's active).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CustomProvider {
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+/// Is `name` one of the built-in presets in `PROVIDERS`?
+pub fn is_builtin_provider(name: &str) -> bool {
+    PROVIDERS.iter().any(|(n, _, _)| *n == name)
+}
+
+/// Can `name` name a custom provider? Short, lowercase-ish, no spaces, not a
+/// preset's name (those keep their own key env vars and API quirks).
+pub fn valid_custom_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 32 {
+        return Err("a provider name is 1 to 32 characters".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(format!("'{name}': use letters, digits, '-', '_' or '.'"));
+    }
+    if is_builtin_provider(name) {
+        return Err(format!("'{name}' is a built-in provider"));
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -228,8 +261,13 @@ fn key_env_vars(provider: &str) -> &'static [&'static str] {
 
 /// One settings change from the `/config` panel. The worker applies it to its
 /// live config and mirrors it to disk (each variant maps onto one field).
+#[derive(Clone)]
 pub enum ConfigPatch {
     Provider { provider: String, base_url: String, model: String },
+    /// Add a custom provider, or replace the one with the same name.
+    AddProvider(CustomProvider),
+    /// Forget a custom provider (its saved key goes with it).
+    RemoveProvider(String),
     BaseUrl(String),
     ApiKey(String),
     /// `/effort` or the /config row: one of `REASONING_LEVELS`.
@@ -361,6 +399,7 @@ impl Default for Config {
             api: None,
             price_cached_in: None,
             key_from_env: false,
+            custom_providers: Vec::new(),
             extra: BTreeMap::new(),
         }
     }
@@ -641,6 +680,18 @@ impl Config {
         if let Some(p) = v.get("price_cached_in").and_then(|x| x.as_f64()) {
             cfg.price_cached_in = Some(p);
         }
+        if let Some(list) = v.get("custom_providers").and_then(|x| x.as_array()) {
+            for item in list {
+                match serde_json::from_value::<CustomProvider>(item.clone()) {
+                    Ok(cp) if valid_custom_name(&cp.name).is_ok() && cp.base_url.starts_with("http") => {
+                        cfg.custom_providers.retain(|c| c.name != cp.name);
+                        cfg.custom_providers.push(cp);
+                    }
+                    _ => eprintln!("config: a custom_providers entry is malformed and was skipped"),
+                }
+            }
+        }
+        cfg.adopt_active_custom();
         for key in [
             "permissions",
             "hooks",
@@ -790,6 +841,9 @@ impl Config {
         if let Some(p) = on_disk.price_cached_in {
             json["price_cached_in"] = serde_json::json!(p);
         }
+        if !on_disk.custom_providers.is_empty() {
+            json["custom_providers"] = serde_json::to_value(&on_disk.custom_providers).unwrap_or_default();
+        }
         for (k, v) in &on_disk.extra {
             json[k.as_str()] = v.clone();
         }
@@ -838,7 +892,50 @@ impl Config {
     pub fn persist_model(&self) {
         let mut disk = Config::load_disk();
         disk.model = self.model.clone();
+        disk.sync_active_custom();
         let _ = disk.save();
+    }
+
+    /// Every provider to choose from: the presets, then the custom ones, as
+    /// (name, base_url, model) with each custom provider's saved model.
+    pub fn provider_choices(&self) -> Vec<(String, String, String)> {
+        PROVIDERS
+            .iter()
+            .map(|(n, b, m)| (n.to_string(), b.to_string(), m.to_string()))
+            .chain(self.custom_providers.iter().map(|c| (c.name.clone(), c.base_url.clone(), c.model.clone())))
+            .collect()
+    }
+
+    pub fn custom_provider(&self, name: &str) -> Option<&CustomProvider> {
+        self.custom_providers.iter().find(|c| c.name == name)
+    }
+
+    /// A provider set up before custom providers were a list (the setup
+    /// wizard's "custom" choice, or a hand-edited file) joins the list, so
+    /// switching away from it doesn't lose its address.
+    fn adopt_active_custom(&mut self) {
+        if is_builtin_provider(&self.provider)
+            || self.custom_provider(&self.provider).is_some()
+            || valid_custom_name(&self.provider).is_err()
+            || !self.base_url.starts_with("http")
+        {
+            return;
+        }
+        self.custom_providers.push(CustomProvider {
+            name: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+        });
+    }
+
+    /// Mirror the active base URL and model into the active custom
+    /// provider's entry, so switching away and back keeps them.
+    pub fn sync_active_custom(&mut self) {
+        let (base_url, model) = (self.base_url.clone(), self.model.clone());
+        if let Some(c) = self.custom_providers.iter_mut().find(|c| c.name == self.provider) {
+            c.base_url = base_url;
+            c.model = model;
+        }
     }
 
     /// Persist one provider's subscription-login token, preserving the rest of
@@ -911,7 +1008,19 @@ impl Config {
                 // Swap to the new provider's saved key (or empty).
                 self.resolve_key();
             }
-            ConfigPatch::BaseUrl(u) => self.base_url = u.clone(),
+            ConfigPatch::AddProvider(cp) => {
+                self.custom_providers.retain(|c| c.name != cp.name);
+                self.custom_providers.push(cp.clone());
+            }
+            ConfigPatch::RemoveProvider(name) => {
+                self.custom_providers.retain(|c| &c.name != name);
+                self.api_keys.remove(name);
+                self.oauth.remove(name);
+            }
+            ConfigPatch::BaseUrl(u) => {
+                self.base_url = u.clone();
+                self.sync_active_custom();
+            }
             ConfigPatch::ApiKey(k) => {
                 self.api_key = k.clone();
                 self.api_keys.insert(self.provider.clone(), k.clone());
@@ -993,6 +1102,62 @@ mod tests {
         assert_eq!(mode, 0o600, "rewrite must not widen permissions");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_providers_round_trip_and_keep_their_model() {
+        let mut c = Config::default();
+        c.apply_patch(&ConfigPatch::AddProvider(CustomProvider {
+            name: "gateway".into(),
+            base_url: "https://gw.example/v1".into(),
+            model: "m1".into(),
+        }));
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "gateway".into(),
+            base_url: "https://gw.example/v1".into(),
+            model: "m1".into(),
+        });
+        c.apply_patch(&ConfigPatch::ApiKey("k".into()));
+        // a model change while it's active is remembered in its entry
+        c.model = "m2".into();
+        c.sync_active_custom();
+        c.apply_patch(&ConfigPatch::BaseUrl("https://gw2.example/v1".into()));
+        let json = c.to_disk_json();
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        assert_eq!(
+            back.custom_provider("gateway"),
+            Some(&CustomProvider { name: "gateway".into(), base_url: "https://gw2.example/v1".into(), model: "m2".into() })
+        );
+        assert_eq!(back.api_keys.get("gateway").map(String::as_str), Some("k"));
+        let names: Vec<String> = back.provider_choices().into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(names.last().map(String::as_str), Some("gateway"), "presets first, then custom");
+        // removing forgets its key too
+        back.apply_patch(&ConfigPatch::RemoveProvider("gateway".into()));
+        assert!(back.custom_provider("gateway").is_none() && !back.api_keys.contains_key("gateway"));
+    }
+
+    #[test]
+    fn a_wizard_custom_provider_joins_the_list_on_load() {
+        // Written by the setup wizard before custom providers were a list.
+        let v = serde_json::json!({
+            "provider": "litellm",
+            "base_url": "https://llm.example/v1",
+            "model": "gemini-x",
+            "api_keys": {"litellm": "k", "deepseek": "d"}
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        assert_eq!(c.custom_provider("litellm").map(|p| p.model.as_str()), Some("gemini-x"));
+        // a preset never joins, and malformed entries are skipped
+        let v = serde_json::json!({
+            "provider": "deepseek",
+            "custom_providers": [{"name": "openai", "base_url": "https://x", "model": "m"}, {"name": "ok", "base_url": "https://y", "model": "m"}, 3]
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        let names: Vec<&str> = c.custom_providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["ok"]);
     }
 
     #[test]
@@ -1199,8 +1364,14 @@ pub fn run_setup() -> Result<Config> {
     let n = choice.trim().parse::<usize>().unwrap_or(1);
     let custom = n == custom_n;
     let (prov, base, model): (String, String, String) = if custom {
-        let p = prompt("provider name: ")?;
-        let p = if p.trim().is_empty() { "custom".to_string() } else { p.trim().to_string() };
+        let p = loop {
+            let p = prompt("provider name [custom]: ")?;
+            let p = if p.trim().is_empty() { "custom".to_string() } else { p.trim().to_string() };
+            match valid_custom_name(&p) {
+                Ok(()) => break p,
+                Err(e) => println!("\x1b[31m  {e}\x1b[0m"),
+            }
+        };
         let b = loop {
             let b = prompt("base_url (OpenAI-compatible): ")?;
             let b = b.trim().to_string();
@@ -1232,6 +1403,14 @@ pub fn run_setup() -> Result<Config> {
     cfg.provider = prov;
     cfg.base_url = base;
     cfg.model = model;
+    if custom {
+        cfg.custom_providers.retain(|c| c.name != cfg.provider);
+        cfg.custom_providers.push(CustomProvider {
+            name: cfg.provider.clone(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+        });
+    }
     if !key.is_empty() {
         cfg.api_key = key.clone();
         cfg.api_keys.insert(cfg.provider.clone(), key);
