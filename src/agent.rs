@@ -398,6 +398,7 @@ pub fn spawn(
                 }
                 WorkerCmd::SetModel(m) => {
                     w.cfg.model = m.clone();
+                    w.cfg.sync_active_custom();
                     w.cfg.persist_model();
                     w.refresh_context_window(); // new model may have a different window
                     let _ = w.ui.send(UiEvent::ModelChanged(m.clone()));

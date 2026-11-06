@@ -106,7 +106,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "pick a model from the provider's list"),
     ("/new", "start a new session (the current one stays saved)"),
     ("/config", "settings: provider, model, key, reasoning, …"),
-    ("/provider", "list or switch providers; add/remove your own OpenAI-compatible one"),
+    ("/provider", "pick a provider, or add your own OpenAI-compatible one, step by step"),
     ("/compact", "summarize older turns to free context"),
     ("/effort", "reasoning effort: auto, off, low, medium, high, xhigh, max"),
     ("/reset", "clear conversation context"),
@@ -146,6 +146,7 @@ pub const DOUBLE_PRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// run bare); an entry ending in a space still needs an argument, so picking
 /// it fills the line instead of running it.
 pub const SLASH_OPTIONS: &[(&str, &str)] = &[
+    ("/provider list", "list every provider and whether it has a key"),
     ("/provider add ", "add one: /provider add <name> <base_url> <model>"),
     ("/provider remove ", "forget a custom provider and its saved key: /provider remove <name>"),
     ("/effort auto", "send nothing: the model's own default"),
@@ -250,6 +251,31 @@ pub enum Mode {
     /// A generic selection list (state lives in `App::picker`): cursor +
     /// type-to-filter, used by `/model` for the fetched model list.
     Select,
+    /// A typed answer in the `/provider` wizard (state in `App::wizard`).
+    ProviderInput { step: ProviderStep },
+}
+
+/// The `/provider` wizard's typed steps, in order for a new provider; a
+/// preset or saved provider without a key only asks for the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderStep {
+    Name,
+    BaseUrl,
+    ApiKey,
+    Model,
+}
+
+/// What the `/provider` wizard has collected so far.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDraft {
+    /// True while adding a new provider; false when only a key is missing.
+    pub adding: bool,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Why the last answer was refused, shown under the prompt.
+    pub error: Option<String>,
 }
 
 /// What committing a `Select` picker entry does.
@@ -261,6 +287,8 @@ pub enum PickAction {
     Rewind,
     /// Switch to the chosen session ("id  label · …").
     Resume,
+    /// `/provider`: switch to the chosen provider, or start adding one.
+    Provider,
 }
 
 /// State for `Mode::Select`: a filterable, scrollable list of choices.

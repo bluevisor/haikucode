@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use types::{
     caps_char, ctrl_c_or_d, is_16color_terminal, picker_step_for_key, BannerColor, CursorKind,
-    Glyphs, Kind, Mode, PickAction, Picker, TLine, DOUBLE_PRESS_TIMEOUT, GLYPHS_A, GLYPHS_U,
+    Glyphs, Kind, Mode, PickAction, Picker, ProviderDraft, ProviderStep, TLine, DOUBLE_PRESS_TIMEOUT, GLYPHS_A, GLYPHS_U,
     MAX_SUGGEST, MAX_TRANSCRIPT, PICKER_VISIBLE, SETTING_LABELS, SETTING_ROWS, SLASH_COMMANDS, SPIN_A, SPIN_U,
 };
 
@@ -145,6 +145,9 @@ pub struct App {
     pw_reply: Option<std::sync::mpsc::Sender<Option<String>>>,
     /// Buffer + reply channel for an in-flight ask_user question.
     q_input: String,
+    /// The `/provider` wizard's answers so far, and the line being typed.
+    wizard: Option<ProviderDraft>,
+    wiz_input: String,
     q_reply: Option<std::sync::mpsc::Sender<Option<String>>>,
     follow: bool,
     /// True while the view is pinned above the live end: shows the scroll
@@ -303,6 +306,8 @@ impl App {
             pw_input: String::new(),
             pw_reply: None,
             q_input: String::new(),
+            wizard: None,
+            wiz_input: String::new(),
             q_reply: None,
             follow: true,
             scrolled_up: false,
@@ -581,6 +586,8 @@ impl App {
                 self.mode = Mode::Select;
             }
             UiEvent::ModelChanged(m) => {
+                self.settings.model = m.clone();
+                self.settings.sync_active_custom();
                 self.model_info = m;
             }
             UiEvent::Usage(s) => {
@@ -716,6 +723,7 @@ impl App {
         match &mut self.mode {
             Mode::Password { .. } => self.pw_input.extend(one_line()),
             Mode::Question { .. } => self.q_input.extend(one_line()),
+            Mode::ProviderInput { .. } => self.wiz_input.extend(one_line()),
             Mode::Select => {
                 if let Some(p) = self.picker.as_mut() {
                     p.filter.extend(one_line());
@@ -1068,7 +1076,7 @@ impl App {
         // through to the composer's Tab autocomplete. The Pi's framebuffer
         // console can't report Shift+Tab at all (its keymap has no shift
         // binding for Tab), so Ctrl+P is the console-safe alias.
-        if !matches!(self.mode, Mode::Password { .. } | Mode::Question { .. }) {
+        if !matches!(self.mode, Mode::Password { .. } | Mode::Question { .. } | Mode::ProviderInput { .. }) {
             let shift_tab = key.code == KeyCode::BackTab
                 || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT));
             let ctrl_p = matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
@@ -1081,7 +1089,7 @@ impl App {
         // Ctrl+T: full thinking/tool output vs brief summaries.
         if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(self.mode, Mode::Password { .. } | Mode::Question { .. })
+            && !matches!(self.mode, Mode::Password { .. } | Mode::Question { .. } | Mode::ProviderInput { .. })
         {
             self.toggle_thinking();
             return;
@@ -1101,6 +1109,7 @@ impl App {
             Mode::Approval(_) => self.on_key_approval(key, h),
             Mode::Settings { .. } => self.on_key_settings(key, h),
             Mode::Select => self.on_key_select(key, h),
+            Mode::ProviderInput { step } => self.on_key_provider_input(step, key, h),
             Mode::ThemeSelect { .. } => self.on_key_themeselect(key, h),
             Mode::Busy => self.on_key_busy(key, h),
             Mode::Idle => self.on_key_idle(key, h),
@@ -1111,6 +1120,7 @@ impl App {
         match self.mode {
             Mode::Password { .. } => self.cancel_password(),
             Mode::Question { .. } => self.cancel_question(),
+            Mode::ProviderInput { .. } => self.cancel_wizard(),
             Mode::Approval(_) => {
                 let _ = h.appr_tx.send(ApprovalResponse::No);
                 self.interrupt(h);
@@ -1425,9 +1435,11 @@ impl App {
             }
             KeyCode::Enter => {
                 let filtered = picker.filtered();
+                let mut provider_pick = None;
                 if let Some(&idx) = filtered.get(picker.cursor) {
                     let item = picker.items[idx].clone();
                     match picker.action {
+                        PickAction::Provider => provider_pick = Some(item),
                         PickAction::Model => {
                             let _ = h.cmd_tx.send(WorkerCmd::SetModel(item));
                         }
@@ -1446,6 +1458,9 @@ impl App {
                 }
                 self.mode = Mode::Idle;
                 self.picker = None;
+                if let Some(item) = provider_pick {
+                    self.provider_picked(&item, h);
+                }
             }
             KeyCode::Backspace => {
                 picker.filter.pop();
@@ -2570,6 +2585,231 @@ impl App {
         }
     }
 
+    /// The label the `/provider` picker shows for adding a provider.
+    const ADD_PROVIDER: &'static str = "+ Add a custom provider (any OpenAI-compatible URL)";
+
+    /// `/provider` with no argument: an arrow-key list of every provider,
+    /// then "+ Add" at the bottom.
+    fn open_provider_picker(&mut self) {
+        let choices = self.settings.provider_choices();
+        let width = choices.iter().map(|(n, _, _)| n.chars().count()).max().unwrap_or(8);
+        let mut items: Vec<String> = choices
+            .iter()
+            .map(|(name, base, model)| {
+                let custom = if crate::config::is_builtin_provider(name) { "" } else { " (custom)" };
+                let key = if self.settings.has_key_for(name) { "" } else { " · no key yet" };
+                let model = if model.is_empty() { "no model yet" } else { model.as_str() };
+                format!("{name:<width$}  {base} · {model}{custom}{key}")
+            })
+            .collect();
+        items.push(Self::ADD_PROVIDER.to_string());
+        let current = choices.iter().position(|(n, _, _)| *n == self.settings.provider);
+        let mut picker = Picker {
+            title: "Pick a provider".into(),
+            items,
+            current,
+            filter: String::new(),
+            cursor: current.unwrap_or(0),
+            scroll: 0,
+            action: PickAction::Provider,
+        };
+        let len = picker.items.len();
+        picker.clamp(len);
+        self.picker = Some(picker);
+        self.mode = Mode::Select;
+    }
+
+    /// The provider picker's choice: start adding one, ask for a missing
+    /// key, or switch and go on to pick a model.
+    fn provider_picked(&mut self, item: &str, h: &Handles) {
+        if item == Self::ADD_PROVIDER {
+            self.wizard = Some(ProviderDraft { adding: true, ..Default::default() });
+            self.ask(ProviderStep::Name);
+            return;
+        }
+        let name = item.split_whitespace().next().unwrap_or_default();
+        let Some((p, b, m)) = self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) else {
+            return;
+        };
+        if self.settings.has_key_for(&p) {
+            self.switch_provider(p, b, m, h);
+            self.pick_model(h);
+        } else {
+            self.wizard = Some(ProviderDraft { name: p, base_url: b, model: m, ..Default::default() });
+            self.ask(ProviderStep::ApiKey);
+        }
+    }
+
+    /// Open the model list for the active provider (as `/model` does).
+    fn pick_model(&mut self, h: &Handles) {
+        let _ = h.cmd_tx.send(WorkerCmd::ListModels);
+        self.mode = Mode::Select;
+    }
+
+    fn ask(&mut self, step: ProviderStep) {
+        self.wiz_input.clear();
+        self.mode = Mode::ProviderInput { step };
+    }
+
+    fn cancel_wizard(&mut self) {
+        self.wizard = None;
+        self.wiz_input.clear();
+        self.mode = Mode::Idle;
+        self.push(Kind::Notice, String::from("provider setup cancelled"));
+    }
+
+    /// The prompt and hint for a wizard step: (title, hint).
+    fn wizard_prompt(&self, step: ProviderStep) -> (String, String) {
+        let d = self.wizard.clone().unwrap_or_default();
+        let (n, total) = match step {
+            ProviderStep::Name => (1, 4),
+            ProviderStep::BaseUrl => (2, 4),
+            ProviderStep::ApiKey => (3, 4),
+            ProviderStep::Model => (4, 4),
+        };
+        let lead = if d.adding { format!("Add provider · step {n} of {total} · ") } else { format!("{} · ", d.name) };
+        match step {
+            ProviderStep::Name => (
+                format!("{lead}Name"),
+                "a short name, e.g. litellm or local (letters, digits, - _ .)".into(),
+            ),
+            ProviderStep::BaseUrl => (
+                format!("{lead}Base URL"),
+                "the OpenAI-compatible endpoint, e.g. https://gateway.example/v1".into(),
+            ),
+            ProviderStep::ApiKey => (
+                format!("{lead}API key"),
+                if d.adding {
+                    "hidden as you type; paste works · Enter with nothing skips (servers without keys)".into()
+                } else {
+                    format!("{} has no key saved · hidden as you type; paste works", d.name)
+                },
+            ),
+            ProviderStep::Model => (
+                format!("{lead}Model"),
+                "the model id · Enter with nothing picks from the server's list".into(),
+            ),
+        }
+    }
+
+    fn on_key_provider_input(&mut self, step: ProviderStep, key: KeyEvent, h: &Handles) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.cancel_wizard(),
+            KeyCode::Enter => {
+                let val = self.wiz_input.trim().to_string();
+                self.wizard_answer(step, val, h);
+            }
+            KeyCode::Backspace => {
+                self.wiz_input.pop();
+            }
+            KeyCode::Char('u') if ctrl => self.wiz_input.clear(),
+            KeyCode::Char(c) if !ctrl => self.wiz_input.push(caps_char(&key, c)),
+            _ => {}
+        }
+    }
+
+    /// Check one typed answer, then go on to the next step or finish.
+    fn wizard_answer(&mut self, step: ProviderStep, val: String, h: &Handles) {
+        use crate::config::valid_custom_name;
+        let Some(mut d) = self.wizard.take() else {
+            self.mode = Mode::Idle;
+            return;
+        };
+        d.error = None;
+        let next = match step {
+            ProviderStep::Name => match valid_custom_name(&val) {
+                Ok(()) => {
+                    d.name = val;
+                    // Re-adding a saved one starts from its address and model.
+                    if let Some(c) = self.settings.custom_provider(&d.name) {
+                        d.base_url = c.base_url.clone();
+                        d.model = c.model.clone();
+                    }
+                    Some(ProviderStep::BaseUrl)
+                }
+                Err(e) => {
+                    d.error = Some(e);
+                    Some(ProviderStep::Name)
+                }
+            },
+            ProviderStep::BaseUrl => {
+                let val = if val.is_empty() { d.base_url.clone() } else { val };
+                if val.starts_with("http://") || val.starts_with("https://") {
+                    d.base_url = val.trim_end_matches('/').to_string();
+                    Some(ProviderStep::ApiKey)
+                } else {
+                    d.error = Some("the URL must start with http:// or https://".into());
+                    Some(ProviderStep::BaseUrl)
+                }
+            }
+            ProviderStep::ApiKey => {
+                d.api_key = val;
+                if d.adding {
+                    Some(ProviderStep::Model)
+                } else {
+                    None
+                }
+            }
+            ProviderStep::Model => {
+                if !val.is_empty() {
+                    d.model = val;
+                } else {
+                    d.model.clear();
+                }
+                None
+            }
+        };
+        match next {
+            Some(step) => {
+                // The same step again keeps what was typed, to fix it.
+                let retry = d.error.is_some();
+                self.wizard = Some(d);
+                if retry {
+                    self.mode = Mode::ProviderInput { step };
+                } else {
+                    self.ask(step);
+                }
+            }
+            None => {
+                self.wiz_input.clear();
+                self.finish_wizard(d, h);
+            }
+        }
+    }
+
+    /// Save what the wizard collected, switch to it, and pick a model when
+    /// none was typed.
+    fn finish_wizard(&mut self, d: ProviderDraft, h: &Handles) {
+        use crate::config::CustomProvider;
+        if d.adding {
+            let updated = self.settings.custom_provider(&d.name).is_some();
+            self.patch(
+                ConfigPatch::AddProvider(CustomProvider {
+                    name: d.name.clone(),
+                    base_url: d.base_url.clone(),
+                    model: d.model.clone(),
+                }),
+                h,
+            );
+            self.push(
+                Kind::Notice,
+                format!("{} provider {}: {}", if updated { "updated" } else { "added" }, d.name, d.base_url),
+            );
+        }
+        if !d.api_key.is_empty() {
+            self.patch(ConfigPatch::ProviderKey { provider: d.name.clone(), key: d.api_key.clone() }, h);
+            self.push(Kind::Notice, format!("API key saved for {}", d.name));
+        }
+        self.switch_provider(d.name.clone(), d.base_url.clone(), d.model.clone(), h);
+        if d.model.is_empty() || !d.adding {
+            // Pick (or confirm) the model from what the server offers.
+            self.pick_model(h);
+        } else {
+            self.mode = Mode::Idle;
+        }
+    }
+
     /// Make `provider` active with its address and model, and its saved key.
     fn switch_provider(&mut self, provider: String, base_url: String, model: String, h: &Handles) {
         self.settings.provider = provider.clone();
@@ -2592,7 +2832,8 @@ impl App {
         use crate::config::{is_builtin_provider, valid_custom_name, CustomProvider};
         let words: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
         match words.as_slice() {
-            [] => {
+            [] => self.open_provider_picker(),
+            ["list"] => {
                 self.push(Kind::Notice, String::from("providers (● active):"));
                 for (name, base, model) in self.settings.provider_choices() {
                     let active = if name == self.settings.provider { "●" } else { " " };
@@ -2989,6 +3230,7 @@ impl App {
                 n.clamp(1, PICKER_VISIBLE) as u16 + 1
             }
             Mode::Password { .. } => 2,
+            Mode::ProviderInput { .. } => 3,
             Mode::Question { prompt } => {
                 let rows = helpers::question_lines(
                     prompt,
@@ -3275,6 +3517,29 @@ impl App {
                         }
                     }
                 }
+                f.render_widget(Paragraph::new(lines), area);
+            }
+            Mode::ProviderInput { step } => {
+                let (title, hint) = self.wizard_prompt(*step);
+                let error = self.wizard.as_ref().and_then(|d| d.error.clone());
+                let shown: String = if *step == ProviderStep::ApiKey {
+                    self.wiz_input.chars().map(|_| '*').collect()
+                } else {
+                    self.wiz_input.clone()
+                };
+                let hint_line = match error {
+                    Some(e) => Span::styled(e, Style::default().fg(Color::Red)),
+                    None => Span::styled(hint, Style::default().fg(self.dim_text())),
+                };
+                let lines = vec![
+                    Line::from(vec![Span::styled(title, Style::default().fg(self.palette.accent))]),
+                    Line::from(vec![hint_line]),
+                    Line::from(vec![
+                        Span::styled("› ", Style::default().fg(Color::Yellow)),
+                        Span::styled(shown, Style::default().fg(self.palette.accent)),
+                        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+                    ]),
+                ];
                 f.render_widget(Paragraph::new(lines), area);
             }
             Mode::Password { prompt } => {
@@ -3904,6 +4169,88 @@ mod tests {
         assert!(app.settings.custom_provider("box").is_none());
         run(&mut app, "/provider box");
         assert!(app.transcript.iter().any(|l| l.kind == crate::ui::types::Kind::ErrorK && l.text.contains("unknown provider")));
+    }
+
+    #[test]
+    fn provider_wizard_adds_a_provider_step_by_step() {
+        use crate::ui::types::{PickAction, ProviderStep};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        let typed = |app: &mut App, text: &str| {
+            app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &h);
+            for c in text.chars() {
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &h);
+            }
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        };
+        app.mode = Mode::Idle;
+        app.input = "/provider".into();
+        app.cursor = app.input.chars().count();
+        app.submit(&h);
+        assert!(matches!(app.mode, Mode::Select));
+        let p = app.picker.as_mut().expect("provider picker");
+        assert!(matches!(p.action, PickAction::Provider));
+        assert_eq!(p.items.last().map(String::as_str), Some(App::ADD_PROVIDER));
+        p.cursor = p.items.len() - 1;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::Name }));
+
+        // Each step refuses a bad answer and stays put.
+        typed(&mut app, "bad name");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::Name }));
+        assert!(app.wizard.as_ref().unwrap().error.is_some());
+        typed(&mut app, "box");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::BaseUrl }));
+        typed(&mut app, "ftp://x");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::BaseUrl }));
+        typed(&mut app, "https://llm.example/v1/");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
+        typed(&mut app, "secret");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::Model }));
+        typed(&mut app, ""); // pick from the server's list
+
+        let sent: Vec<WorkerCmd> = rx.try_iter().collect();
+        let kinds: Vec<String> = sent
+            .iter()
+            .map(|c| match c {
+                WorkerCmd::Patch(ConfigPatch::AddProvider(c)) => format!("add {} {} [{}]", c.name, c.base_url, c.model),
+                WorkerCmd::Patch(ConfigPatch::Provider { provider, .. }) => format!("switch {provider}"),
+                WorkerCmd::Patch(ConfigPatch::ProviderKey { provider, key }) => format!("key {provider} {key}"),
+                WorkerCmd::ListModels => "models".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(kinds, ["add box https://llm.example/v1 []", "key box secret", "switch box", "models"]);
+        assert!(matches!(app.mode, Mode::Select), "the model list opens next");
+        assert!(app.wizard.is_none());
+    }
+
+    #[test]
+    fn provider_wizard_asks_only_for_a_missing_key_then_the_model() {
+        use crate::ui::types::{PickAction, ProviderStep};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.settings.api_keys.insert("deepseek".into(), "k".into());
+        app.open_provider_picker();
+        // A preset with a key switches at once and lists models.
+        let p = app.picker.as_mut().unwrap();
+        p.cursor = p.items.iter().position(|i| i.starts_with("deepseek")).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        let sent: Vec<WorkerCmd> = rx.try_iter().collect();
+        assert!(matches!(&sent[0], WorkerCmd::Patch(ConfigPatch::Provider { provider, .. }) if provider == "deepseek"));
+        assert!(matches!(sent[1], WorkerCmd::ListModels));
+
+        // One without a key asks for it first (masked), and Esc cancels.
+        app.mode = Mode::Idle;
+        app.open_provider_picker();
+        let p = app.picker.as_mut().unwrap();
+        let no_key = p.items.iter().position(|i| i.contains("no key yet")).unwrap();
+        p.cursor = no_key;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
+        assert!(matches!(app.mode, Mode::Idle));
+        assert!(rx.try_iter().next().is_none(), "cancel sends nothing");
     }
 
     #[test]

@@ -217,11 +217,13 @@ memory, sessions, skills) into `~/.config/haikucode`.
   auth mode, reasoning effort, default permission mode, auto-commit, theme, context
   window, max tool calls, and price currency, edited in-TUI; changes apply live
   and persist to `config.json`.
-- **Custom providers** (`/provider`) — any OpenAI-compatible endpoint (a
-  LiteLLM or other gateway, a local server) alongside the presets:
-  `/provider add <name> <base_url> <model>` adds one and switches to it,
-  `/provider <name>` switches, `/provider remove <name>` forgets it and its key,
-  and `/provider` lists them all. Each keeps its own API key (the `/config`
+- **Providers** (`/provider`) — a step-by-step picker: choose a provider with
+  the arrow keys (it asks for the API key if none is saved, masked, paste
+  works), then its model from the server's list. "+ Add a custom provider"
+  walks through name, base URL, API key and model for any OpenAI-compatible
+  endpoint (a LiteLLM or other gateway, a local server). Shortcuts:
+  `/provider <name>` switches, `/provider add <name> <base_url> <model>`,
+  `/provider remove <name>` forgets one and its key, `/provider list`. Each keeps its own API key (the `/config`
   key row) and remembers its model; the `/config` provider row cycles through
   them too. A provider made by the setup wizard's "custom" choice joins the list.
 - **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
