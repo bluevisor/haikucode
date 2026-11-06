@@ -3488,10 +3488,27 @@ impl App {
             Mode::Select => {
                 let mut lines: Vec<Line> = Vec::new();
                 if let Some(ref picker) = self.picker {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{}", picker.title), Style::default().fg(Color::Yellow)),
-                        Span::styled(" (type to filter, Enter to select, Esc to cancel)", Style::default().fg(self.dim_text())),
-                    ]));
+                    let mut header =
+                        vec![Span::styled(picker.title.to_string(), Style::default().fg(Color::Yellow))];
+                    if picker.filter.is_empty() {
+                        header.push(Span::styled(
+                            " (type to filter, Enter to select, Esc to cancel)",
+                            Style::default().fg(self.dim_text()),
+                        ));
+                    } else {
+                        // What's been typed, so the filter isn't invisible.
+                        let caret = if self.ascii { "_" } else { "▏" };
+                        header.push(Span::styled("  filter: ", Style::default().fg(self.dim_text())));
+                        header.push(Span::styled(
+                            format!("{}{caret}", picker.filter),
+                            Style::default().fg(self.palette.accent).add_modifier(Modifier::BOLD),
+                        ));
+                        header.push(Span::styled(
+                            "  (Backspace to edit, Enter to select, Esc to cancel)",
+                            Style::default().fg(self.dim_text()),
+                        ));
+                    }
+                    lines.push(Line::from(header));
                     let filtered = picker.filtered();
                     if filtered.is_empty() {
                         lines.push(Line::from(Span::styled(
@@ -5361,6 +5378,22 @@ mod tests {
         let p = app.picker.as_ref().unwrap();
         assert_eq!(p.filter, "kimi");
         assert_eq!(p.filtered(), vec![2], "'k' filtered instead of moving up");
+    }
+
+    /// What's typed into a picker shows on screen, not just in the filtering.
+    #[test]
+    fn picker_shows_what_was_typed() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut app, h, _rx) = select_app(&["deepseek-chat", "gpt-4o", "kimi-k2"]);
+        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        assert!(draw(&mut app, &mut term).contains("type to filter"));
+        for c in "kim".chars() {
+            app.on_key(key(KeyCode::Char(c)), &h);
+        }
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("filter: kim"), "{screen}");
+        assert!(!screen.contains("gpt-4o"), "{screen}");
     }
 
     /// A long, multi-line ask_user question must come out whole in the panel.
