@@ -21,13 +21,15 @@ echo ">> building + packaging on $host"
 pkg=$(ssh "$host" "cd $src && haiku/package.sh" | tail -1)
 
 echo ">> activating $pkg"
-# Packages in ~/config/packages activate (and deactivate) a moment after the
-# file lands (or goes). Wait out each step: swapping a same-version package in
-# one go races the package daemon and can leave the old contents mounted.
-ssh "$host" "rm -f ~/config/packages/haikucode-*.hpkg
-	for i in \$(seq 40); do [ -e ~/config/bin/haikucode ] || break; sleep 0.25; done
-	cp $src/$pkg ~/config/packages/
-	for i in \$(seq 40); do [ -e ~/config/bin/haikucode ] && break; sleep 0.25; done
+# Through pkgman, not by copying the file into ~/config/packages: a dropped-in
+# file mounts at once but may never reach administrative/activated-packages,
+# and after a reboot packagefs leaves it inactive (`haikucode: command not
+# found` with the .hpkg still sitting there). pkgman replaces the installed
+# version, older or newer, in one transaction.
+name=$(basename "$pkg")
+ssh "$host" "pkgman install -H -y $src/$pkg > /tmp/haikucode-pkgman.log 2>&1 || { cat /tmp/haikucode-pkgman.log >&2; exit 1; }
+	grep -qx '$name' ~/config/packages/administrative/activated-packages || { echo '!! $name is not in activated-packages' >&2; exit 1; }
+	for i in \$(seq 40); do cmp -s ~/config/bin/haikucode $src/target/release/haikucode && break; sleep 0.25; done
 	cmp -s ~/config/bin/haikucode $src/target/release/haikucode || { echo '!! installed binary differs from the build' >&2; exit 1; }
 	haikucode --version"
 

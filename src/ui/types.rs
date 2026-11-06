@@ -106,6 +106,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "pick a model from the provider's list"),
     ("/new", "start a new session (the current one stays saved)"),
     ("/config", "settings: provider, model, key, reasoning, …"),
+    ("/provider", "list or switch providers; add/remove your own OpenAI-compatible one"),
     ("/compact", "summarize older turns to free context"),
     ("/effort", "reasoning effort: auto, off, low, medium, high, xhigh, max"),
     ("/reset", "clear conversation context"),
@@ -145,6 +146,8 @@ pub const DOUBLE_PRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// run bare); an entry ending in a space still needs an argument, so picking
 /// it fills the line instead of running it.
 pub const SLASH_OPTIONS: &[(&str, &str)] = &[
+    ("/provider add ", "add one: /provider add <name> <base_url> <model>"),
+    ("/provider remove ", "forget a custom provider and its saved key: /provider remove <name>"),
     ("/effort auto", "send nothing: the model's own default"),
     ("/effort off", "no reasoning (or the provider's lowest)"),
     ("/effort low", "quick, light reasoning"),
