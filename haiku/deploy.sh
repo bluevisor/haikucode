@@ -27,7 +27,16 @@ echo ">> activating $pkg"
 # found` with the .hpkg still sitting there). pkgman replaces the installed
 # version, older or newer, in one transaction.
 name=$(basename "$pkg")
-ssh "$host" "pkgman install -H -y $src/$pkg > /tmp/haikucode-pkgman.log 2>&1 || { cat /tmp/haikucode-pkgman.log >&2; exit 1; }
+# pkgman can't replace a package with the same version ("Name in use"): skip
+# the install when that exact build is already active, else uninstall first.
+ssh "$host" "if grep -qx '$name' ~/config/packages/administrative/activated-packages && cmp -s ~/config/bin/haikucode $src/target/release/haikucode; then
+		echo '>> $name is already installed'
+	else
+		if grep -qx '$name' ~/config/packages/administrative/activated-packages; then
+			pkgman uninstall -H -y haikucode > /tmp/haikucode-pkgman.log 2>&1 || { cat /tmp/haikucode-pkgman.log >&2; exit 1; }
+		fi
+		pkgman install -H -y $src/$pkg > /tmp/haikucode-pkgman.log 2>&1 || { cat /tmp/haikucode-pkgman.log >&2; exit 1; }
+	fi
 	grep -qx '$name' ~/config/packages/administrative/activated-packages || { echo '!! $name is not in activated-packages' >&2; exit 1; }
 	for i in \$(seq 40); do cmp -s ~/config/bin/haikucode $src/target/release/haikucode && break; sleep 0.25; done
 	cmp -s ~/config/bin/haikucode $src/target/release/haikucode || { echo '!! installed binary differs from the build' >&2; exit 1; }
