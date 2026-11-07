@@ -502,6 +502,8 @@ struct StreamChoice {
 struct Delta {
     content: Option<String>,
     reasoning_content: Option<String>,
+    /// OpenRouter and Vercel's AI Gateway stream thinking under this name.
+    reasoning: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 #[derive(Deserialize)]
@@ -627,6 +629,9 @@ pub(crate) fn reasoning_fields(cfg: &Config) -> Vec<(&'static str, serde_json::V
         "openai" | "google" | "groq" => vec![("reasoning_effort", json!(effort))],
         // OpenRouter's scale ends at xhigh and maps it to each model's own.
         "openrouter" if top => vec![("reasoning", json!({"effort": "xhigh"}))],
+        // Vercel's AI Gateway takes the same object, up to max, and maps it
+        // to each provider's own setting.
+        "vercel" => vec![("reasoning", if off { json!({"enabled": false}) } else { json!({"effort": level}) })],
         "openrouter" => vec![("reasoning", if off { json!({"enabled": false}) } else { json!({"effort": level}) })],
         // Its own Messages API carries effort; the compat endpoint isn't mapped.
         "anthropic" => Vec::new(),
@@ -705,7 +710,7 @@ fn chat_completions(
         }
         let Some(choice) = chunk.choices.into_iter().next() else { return Ok(false) };
         let delta = choice.delta;
-        if let Some(r) = delta.reasoning_content.filter(|r| !r.is_empty()) {
+        if let Some(r) = delta.reasoning_content.or(delta.reasoning).filter(|r| !r.is_empty()) {
             on_reasoning(&r);
             guard.feed(&r)?;
             reasoning.push_str(&r);
@@ -993,6 +998,8 @@ mod balance_tests {
         assert_eq!(fields("google", "off"), j!({"reasoning_effort": "none"}));
         assert_eq!(fields("openrouter", "medium"), j!({"reasoning": {"effort": "medium"}}));
         assert_eq!(fields("openrouter", "off"), j!({"reasoning": {"enabled": false}}));
+        assert_eq!(fields("vercel", "max"), j!({"reasoning": {"effort": "max"}}));
+        assert_eq!(fields("vercel", "off"), j!({"reasoning": {"enabled": false}}));
         assert_eq!(fields("anthropic", "high"), j!({}));
         // xhigh/max: passed on where the dial has them, else capped at high.
         assert_eq!(fields("google", "max"), j!({"reasoning_effort": "high"}));

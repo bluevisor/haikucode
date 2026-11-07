@@ -161,7 +161,7 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Reasoning effort** — `/effort auto|off|low|medium|high|xhigh|max` (or the `/config`
   row) is translated per provider: DeepSeek `thinking` + `reasoning_effort`
   (`low`/`high`/`max`), GLM `thinking`, OpenAI/Gemini/Groq
-  `reasoning_effort`, OpenRouter `reasoning`, Anthropic adaptive thinking +
+  `reasoning_effort`, OpenRouter and Vercel AI Gateway `reasoning`, Anthropic adaptive thinking +
   `output_config.effort`, Responses `reasoning.effort`, and for self-hosted
   servers (Splash, vLLM, SGLang, llama.cpp) the chat template's
   `enable_thinking` — so `off` really stops a local Qwen from thinking. `auto`

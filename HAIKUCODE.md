@@ -168,7 +168,7 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   `--json` prints a final `{result, usage, cost, tool_calls, duration_ms, errors}` object,
   `--stream-json` prints JSON-lines events (`token`, `tool_start`, `tool_result`, `notice`,
   `error`, `diff`, `reasoning`, `result`).
-- `/config`: interactive settings panel — provider preset (deepseek/openai/anthropic/groq/openrouter/google),
+- `/config`: interactive settings panel — provider preset (deepseek/openai/anthropic/groq/openrouter/google/zai/vercel),
   base URL, model, API key (masked), reasoning (auto/off/low/medium/high/xhigh/max, sent
   in each provider's own field; also `/effort`), default
   permission mode (ask/yolo/plan — applies live and saves for new sessions),

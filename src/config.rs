@@ -240,6 +240,7 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
     ("google", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
     ("zai", "https://api.z.ai/api/paas/v4", "glm-5.2"),
+    ("vercel", "https://ai-gateway.vercel.sh/v1", "anthropic/claude-sonnet-5.5"),
 ];
 
 /// Env vars that may supply the API key for `provider`, highest priority
@@ -255,6 +256,7 @@ fn key_env_vars(provider: &str) -> &'static [&'static str] {
         "openrouter" => &["HAIKUCODE_API_KEY", "OPENROUTER_API_KEY"],
         "google" => &["HAIKUCODE_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
         "zai" => &["HAIKUCODE_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"],
+        "vercel" => &["HAIKUCODE_API_KEY", "AI_GATEWAY_API_KEY"],
         _ => &["HAIKUCODE_API_KEY"],
     }
 }
@@ -1306,7 +1308,8 @@ mod tests {
                 assert!(
                     v.starts_with(&prov_upper)
                         || (*name == "google" && v.starts_with("GEMINI"))
-                        || (*name == "zai" && (v.starts_with("ZAI") || v.starts_with("ZHIPUAI"))),
+                        || (*name == "zai" && (v.starts_with("ZAI") || v.starts_with("ZHIPUAI")))
+                        || (*name == "vercel" && *v == "AI_GATEWAY_API_KEY"),
                     "{name} must not read {v}"
                 );
             }
