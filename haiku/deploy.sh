@@ -40,6 +40,10 @@ ssh "$host" "if grep -qx '$name' ~/config/packages/administrative/activated-pack
 	grep -qx '$name' ~/config/packages/administrative/activated-packages || { echo '!! $name is not in activated-packages' >&2; exit 1; }
 	for i in \$(seq 40); do cmp -s ~/config/bin/haikucode $src/target/release/haikucode && break; sleep 0.25; done
 	cmp -s ~/config/bin/haikucode $src/target/release/haikucode || { echo '!! installed binary differs from the build' >&2; exit 1; }
+	# Flush to disk: BFS journals only metadata, so if the VM stops before the
+	# data is written back, the .hpkg keeps its size but reads as all zeros and
+	# packagefs skips it (\`haikucode: command not found\` after the restart).
+	sync
 	haikucode --version"
 
 if [[ "${1:-}" == "fetch" ]]; then
