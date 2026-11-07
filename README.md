@@ -239,6 +239,13 @@ memory, sessions, skills) into `~/.config/haikucode`.
 [latest release](https://github.com/bluevisor/haikucode/releases/latest) and
 copy it into `~/config/packages` (it activates at once, no reboot).
 
+**macOS:** download `haikucode-<version>-macos-arm64.dmg` (Apple Silicon) or
+`-macos-x86_64.dmg` (Intel) from the
+[latest release](https://github.com/bluevisor/haikucode/releases/latest), open
+it and double-click **Install Haiku Code**: it copies `haikucode` to
+`~/.local/bin` and adds that to your PATH if needed. The DMGs are signed and
+notarized. Or use the script below.
+
 **macOS and Linux:**
 
 ```sh

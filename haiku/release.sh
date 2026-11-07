@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Publish a GitHub release for Cargo.toml's version, carrying the Haiku packages
-# that `haikucode update` / `/update` installs. Publishing it starts
-# .github/workflows/release.yml, which adds the macOS and Linux tarballs. main is protected, so land the
+# that `haikucode update` / `/update` installs and the signed, notarized macOS
+# DMGs (macos/dmg.sh, so run this on a Mac with the Developer ID). Publishing
+# it starts .github/workflows/release.yml, which adds the macOS and Linux
+# tarballs that install.sh and updates use. main is protected, so land the
 # version bump through a PR first, then run this from an up-to-date main:
 #   haiku/release.sh
 # Builds arm64 on the Haiku guest via deploy.sh (HAIKU_HOST, default haiku-dbg)
@@ -25,9 +27,13 @@ fi
 haiku/deploy.sh fetch
 haiku/cross.sh x86_64
 haiku/cross.sh x86
+macos/dmg.sh
 pkgs=()
 for a in arm64 x86_64 x86_gcc2; do
 	pkgs+=("$(ls -t dist/haikucode-"$version"-*-"$a".hpkg | head -1)")
+done
+for a in arm64 x86_64; do
+	pkgs+=("dist/haikucode-$version-macos-$a.dmg")
 done
 notes=$(git log -1 --format=%b | grep -v '^Co-Authored-By:')
 
