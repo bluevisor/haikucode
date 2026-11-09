@@ -8,6 +8,7 @@ mod beclip;
 mod brief;
 mod helpers;
 mod palette;
+mod statusline;
 mod types;
 
 pub use banner::banner_ansi;
@@ -237,6 +238,12 @@ pub struct App {
     /// edits/auto-commits change the dirty state mid-session.
     git_head: Option<(String, bool)>,
     git_checked_at: Option<Instant>,
+    /// The first status row's segments, in order (`/statusline`).
+    statusline: Vec<String>,
+    /// Minute last drawn by the `time` segment, so the clock redraws when it
+    /// turns even while nothing else changes; checked at most once a second.
+    clock_min: i32,
+    clock_checked: Option<Instant>,
 }
 
 /// Lines moved per arrow key / wheel notch. PgUp/PgDn move a full viewport.
@@ -285,6 +292,7 @@ fn palette_for(theme: &str) -> Palette {
 impl App {
     pub fn new(cfg: UiConfig, history: Vec<String>) -> App {
         let hist_idx = history.len();
+        let segments = statusline::effective(&cfg.settings.statusline);
         let mut app = App {
             transcript: Vec::new(),
             banner_status: Vec::new(),
@@ -353,6 +361,9 @@ impl App {
             cwd_label: cwd_label(),
             git_head: None,
             git_checked_at: None,
+            statusline: segments,
+            clock_min: -1,
+            clock_checked: None,
             appr_rule: None,
             session_rev: std::env::current_dir().ok().and_then(|d| crate::tools::git_rev(&d)),
             custom_cmds: Vec::new(),
@@ -732,7 +743,10 @@ impl App {
                 }
             }
             Mode::Settings { edit: Some(buf), .. } => buf.extend(one_line()),
-            Mode::Settings { edit: None, .. } | Mode::Approval(_) | Mode::ThemeSelect { .. } => {}
+            Mode::Settings { edit: None, .. }
+            | Mode::Approval(_)
+            | Mode::ThemeSelect { .. }
+            | Mode::StatuslineSelect { .. } => {}
             Mode::Idle | Mode::Busy => {
                 // An empty paste is what some terminals send for Cmd+V when
                 // the clipboard holds only an image: fetch the image instead.
@@ -1111,6 +1125,7 @@ impl App {
             Mode::Select => self.on_key_select(key, h),
             Mode::ProviderInput { step } => self.on_key_provider_input(step, key, h),
             Mode::ThemeSelect { .. } => self.on_key_themeselect(key, h),
+            Mode::StatuslineSelect { .. } => self.on_key_statusline(key),
             Mode::Busy => self.on_key_busy(key, h),
             Mode::Idle => self.on_key_idle(key, h),
         }
@@ -1129,6 +1144,7 @@ impl App {
                 self.clear_busy();
                 self.picker = None;
             }
+            Mode::StatuslineSelect { .. } => self.cancel_statusline(),
             Mode::Busy => self.interrupt(h),
             Mode::Idle => {
                 self.busy_since = None;
@@ -1498,6 +1514,83 @@ impl App {
             KeyCode::Enter => self.commit_theme(cursor),
             _ => {}
         }
+    }
+
+    /// `/statusline` with no argument: the picker, starting from what's shown.
+    fn open_statusline_picker(&mut self) {
+        self.mode = Mode::StatuslineSelect {
+            cursor: 0,
+            items: statusline::picker_items(&self.statusline),
+            prev: self.statusline.clone(),
+        };
+    }
+
+    /// Save `segments` (the default row when they equal it) and show them.
+    fn set_statusline(&mut self, segments: Vec<String>) {
+        let default = segments.iter().map(String::as_str).eq(statusline::DEFAULT.iter().copied());
+        let saved = if default { Vec::new() } else { segments.clone() };
+        crate::config::Config::persist_statusline(&saved);
+        self.settings.statusline = saved;
+        self.statusline = segments;
+        self.clock_min = -1;
+        self.push(Kind::Notice, format!("status bar: {}", self.statusline.join(" ")));
+    }
+
+    fn cancel_statusline(&mut self) {
+        if let Mode::StatuslineSelect { prev, .. } = std::mem::replace(&mut self.mode, Mode::Idle) {
+            self.statusline = prev;
+        }
+    }
+
+    /// Up/down move, Space toggles, Shift or Alt+Up/Down (or [ ]) move the
+    /// row, Enter saves, Esc restores. The row previews every change.
+    fn on_key_statusline(&mut self, key: KeyEvent) {
+        let Mode::StatuslineSelect { cursor, items, .. } = &mut self.mode else { return };
+        let n = items.len();
+        let shift = key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if shift => {
+                if *cursor > 0 {
+                    items.swap(*cursor, *cursor - 1);
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if shift => {
+                if *cursor + 1 < n {
+                    items.swap(*cursor, *cursor + 1);
+                    *cursor += 1;
+                }
+            }
+            KeyCode::Char('[') if *cursor > 0 => {
+                items.swap(*cursor, *cursor - 1);
+                *cursor -= 1;
+            }
+            KeyCode::Char(']') if *cursor + 1 < n => {
+                items.swap(*cursor, *cursor + 1);
+                *cursor += 1;
+            }
+            KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *cursor = (*cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Char(' ') => {
+                let on = !items[*cursor].1;
+                // Keep at least one item: an empty row would read as the default.
+                if on || items.iter().filter(|(_, o)| *o).count() > 1 {
+                    items[*cursor].1 = on;
+                }
+            }
+            KeyCode::Enter => {
+                let chosen: Vec<String> = items.iter().filter(|(_, on)| *on).map(|(s, _)| s.clone()).collect();
+                self.mode = Mode::Idle;
+                self.set_statusline(chosen);
+                return;
+            }
+            KeyCode::Esc => {
+                self.cancel_statusline();
+                return;
+            }
+            _ => return,
+        }
+        self.statusline = items.iter().filter(|(_, on)| *on).map(|(s, _)| s.clone()).collect();
     }
 
     fn on_key_busy(&mut self, key: KeyEvent, h: &Handles) {
@@ -2309,6 +2402,19 @@ impl App {
                     self.preview_theme(current, self.palette.name.to_string());
                 }
             }
+            "statusline" => match _arg.map(str::trim).filter(|a| !a.is_empty()) {
+                None => self.open_statusline_picker(),
+                Some(a) if a.eq_ignore_ascii_case("reset") || a.eq_ignore_ascii_case("default") => {
+                    self.set_statusline(statusline::DEFAULT.iter().map(|s| s.to_string()).collect())
+                }
+                Some(a) => match statusline::parse(a) {
+                    Ok(list) => self.set_statusline(list),
+                    Err(e) => {
+                        self.push(Kind::ErrorK, format!("/statusline: {e}"));
+                        self.show_options("/statusline");
+                    }
+                },
+            },
             "init" => {
                 self.set_busy();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -3224,6 +3330,7 @@ impl App {
             }
             Mode::Approval(_) => 2,
             Mode::ThemeSelect { .. } => THEMES.len() as u16 + 1,
+            Mode::StatuslineSelect { items, .. } => items.len() as u16 + 1,
             Mode::Settings { .. } => SETTING_ROWS.len() as u16 + 1,
             Mode::Select => {
                 let n = self.picker.as_ref().map(|p| p.filtered().len()).unwrap_or(0);
@@ -3443,6 +3550,35 @@ impl App {
                     };
                     lines.push(Line::from(vec![
                         Span::styled(format!("{lead}{t}"), style),
+                    ]));
+                }
+                f.render_widget(Paragraph::new(lines), area);
+            }
+            Mode::StatuslineSelect { cursor, items, .. } => {
+                let mut lines: Vec<Line> = vec![Line::from(vec![
+                    Span::styled("status bar ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        "(Space show/hide, Shift+up/down or [ ] to move, Enter to keep, Esc to cancel)",
+                        Style::default().fg(self.dim_text()),
+                    ),
+                ])];
+                let marker = if self.ascii { ">" } else { "▸" };
+                let (on_box, off_box) = if self.ascii { ("[x]", "[ ]") } else { ("[✓]", "[ ]") };
+                for (i, (id, on)) in items.iter().enumerate() {
+                    let sel = i == *cursor;
+                    let style = if sel {
+                        Style::default().fg(self.palette.accent).add_modifier(Modifier::BOLD)
+                    } else if *on {
+                        Style::default().fg(self.palette.assistant)
+                    } else {
+                        Style::default().fg(self.dim_text())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{}{} {:<9}", if sel { marker } else { " " }, if *on { on_box } else { off_box }, id),
+                            style,
+                        ),
+                        Span::styled(format!(" {}", statusline::describe(id)), Style::default().fg(self.dim_text())),
                     ]));
                 }
                 f.render_widget(Paragraph::new(lines), area);
@@ -3699,19 +3835,33 @@ impl App {
         }
     }
 
-    /// Status line 1: model · session usage/cost · context bar · balance.
+    /// Status line 1: the `/statusline` segments, in order (by default model ·
+    /// effort · session cost/tokens · context bar · balance). A segment with
+    /// nothing to say (no tokens yet, effort auto, no balance, not in a repo)
+    /// is left out along with its separator.
     fn render_status1(&self, f: &mut Frame, area: Rect) {
         let gray = Style::default().fg(self.dim_text());
-        let sep = || Span::styled(if self.ascii { "  |  " } else { "  │  " }, Style::default().fg(self.palette.chrome));
-        let mut spans = vec![Span::styled(
-            self.model_info.clone(),
-            Style::default().fg(self.palette.accent).add_modifier(Modifier::BOLD),
-        )];
-        if self.settings.reasoning != "auto" {
-            spans.push(Span::styled(format!(" effort:{}", self.settings.reasoning), gray));
+        let sep = Span::styled(if self.ascii { "  |  " } else { "  │  " }, Style::default().fg(self.palette.chrome));
+        let mut spans: Vec<Span> = Vec::new();
+        let mut prev: Option<&str> = None;
+        for id in &self.statusline {
+            let seg = self.status_segment(id, gray);
+            if seg.is_empty() {
+                continue;
+            }
+            match prev.and_then(|p| statusline::glue(id, p)) {
+                Some(j) => spans.push(Span::styled(j, gray)),
+                None if prev.is_some() => spans.push(sep.clone()),
+                None => {}
+            }
+            spans.extend(seg);
+            prev = Some(id);
         }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 
-        let tokens = self.sess_prompt + self.sess_completion;
+    /// One status segment's spans; empty when it has nothing to show.
+    fn status_segment(&self, id: &str, gray: Style) -> Vec<Span<'static>> {
         // The cost is quoted in the configured price currency; the balance is
         // whatever the provider bills the account in. They can legitimately
         // differ (a CNY account using the USD price list), so when they do both
@@ -3722,32 +3872,67 @@ impl App {
             .as_ref()
             .map(|b| b.currency == self.price_currency)
             .unwrap_or(true);
-        if tokens > 0 {
-            let cost = self.session_cost();
-            let cost = if aligned {
-                money::fmt_cost(cost, &self.price_currency)
-            } else {
-                money::fmt_cost_tagged(cost, &self.price_currency)
-            };
-            spans.push(sep());
-            spans.push(Span::styled(format!("{cost} · {} tok", humanize(tokens)), gray));
+        let tokens = self.sess_prompt + self.sess_completion;
+        match id {
+            "model" => vec![Span::styled(
+                self.model_info.clone(),
+                Style::default().fg(self.palette.accent).add_modifier(Modifier::BOLD),
+            )],
+            "effort" if self.settings.reasoning != "auto" => {
+                vec![Span::styled(format!("effort:{}", self.settings.reasoning), gray)]
+            }
+            "cost" if tokens > 0 => {
+                let cost = self.session_cost();
+                let cost = if aligned {
+                    money::fmt_cost(cost, &self.price_currency)
+                } else {
+                    money::fmt_cost_tagged(cost, &self.price_currency)
+                };
+                vec![Span::styled(cost, gray)]
+            }
+            "tokens" if tokens > 0 => vec![Span::styled(format!("{} tok", humanize(tokens)), gray)],
+            "ctx" => {
+                let frac = self.last_prompt_tokens as f64 / self.ctx_limit as f64;
+                let mut v = vec![Span::styled("ctx ", gray)];
+                v.extend(bar(frac, 8, self.palette.accent));
+                v.push(Span::styled(format!(" {}%", (frac.clamp(0.0, 1.0) * 100.0).round() as u32), gray));
+                v
+            }
+            "balance" => match &self.balance {
+                Some(b) => {
+                    let bal = if aligned { b.render() } else { b.render_tagged() };
+                    vec![Span::styled(format!("bal {bal}"), gray)]
+                }
+                None => Vec::new(),
+            },
+            "git" => match &self.git_head {
+                Some((branch, dirty)) => {
+                    vec![Span::styled(format!("{branch}{}", if *dirty { "*" } else { "" }), gray)]
+                }
+                None => Vec::new(),
+            },
+            "cwd" => vec![Span::styled(self.cwd_label.clone(), gray)],
+            "time" => vec![Span::styled(statusline::local_hhmm(), gray)],
+            "version" => vec![Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), gray)],
+            _ => Vec::new(),
         }
+    }
 
-        spans.push(sep());
-        spans.push(Span::styled("ctx ", gray));
-        let frac = self.last_prompt_tokens as f64 / self.ctx_limit as f64;
-        spans.extend(bar(frac, 8, self.palette.accent));
-        spans.push(Span::styled(
-            format!(" {}%", (frac.clamp(0.0, 1.0) * 100.0).round() as u32),
-            gray,
-        ));
-
-        if let Some(b) = &self.balance {
-            spans.push(sep());
-            let bal = if aligned { b.render() } else { b.render_tagged() };
-            spans.push(Span::styled(format!("bal {bal}"), gray));
+    /// True when the `time` segment is shown and the minute has turned since
+    /// it was last drawn: the idle loop only redraws on events otherwise.
+    pub fn clock_due(&mut self) -> bool {
+        if !self.statusline.iter().any(|s| s == "time")
+            || self.clock_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return false;
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        self.clock_checked = Some(Instant::now());
+        let m = statusline::local_hm().1;
+        if m == self.clock_min {
+            return false;
+        }
+        self.clock_min = m;
+        true
     }
 
     /// Status line 2: permission mode + hint.
@@ -5042,6 +5227,74 @@ mod tests {
         assert_eq!(app.settings.permission, "yolo", "Shift+Tab is recorded too");
     }
 
+    #[test]
+    fn statusline_command_sets_resets_and_rejects_unknown_segments() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.cwd_label = "~/proj".into();
+        app.run_command("statusline cwd version model", &h);
+        assert_eq!(app.statusline, ["cwd", "version", "model"]);
+        assert_eq!(app.settings.statusline, ["cwd", "version", "model"]);
+        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let screen = draw(&mut app, &mut term);
+        let row = screen.lines().find(|l| l.contains("~/proj") && l.contains("v0.")).unwrap_or("");
+        let (c, v, m) = (row.find("~/proj"), row.find(&format!("v{}", env!("CARGO_PKG_VERSION"))), row.find(&app.model_info));
+        assert!(c < v && v < m && m.is_some(), "segments drawn in order:\n{screen}");
+        assert!(!row.contains("ctx"), "ctx was left out:\n{screen}");
+
+        app.run_command("statusline model gti", &h);
+        assert_eq!(app.statusline, ["cwd", "version", "model"], "a typo changes nothing");
+
+        app.run_command("statusline reset", &h);
+        assert_eq!(app.statusline, super::statusline::DEFAULT);
+        assert!(app.settings.statusline.is_empty(), "the default isn't written out");
+    }
+
+    #[test]
+    fn the_statusline_picker_toggles_reorders_previews_and_cancels() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.run_command("statusline", &h);
+        assert!(matches!(app.mode, Mode::StatuslineSelect { .. }));
+        // Row 0 is model: hide it, and the row previews without it.
+        app.on_key(key(KeyCode::Char(' ')), &h);
+        assert!(!app.statusline.contains(&"model".to_string()));
+        // Move to ctx (row 4) and lift it to the top.
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down), &h);
+        }
+        for _ in 0..4 {
+            app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT), &h);
+        }
+        assert_eq!(app.statusline[0], "ctx");
+        app.do_esc(&h);
+        assert_eq!(app.statusline, super::statusline::DEFAULT, "Esc puts it back");
+        assert!(matches!(app.mode, Mode::Idle));
+
+        // Again, and keep it this time.
+        app.run_command("statusline", &h);
+        for _ in 0..7 {
+            app.on_key(key(KeyCode::Down), &h);
+        }
+        app.on_key(key(KeyCode::Char(' ')), &h); // row 7 is cwd (hidden by default)
+        app.on_key(key(KeyCode::Enter), &h);
+        assert!(matches!(app.mode, Mode::Idle));
+        assert_eq!(app.statusline.last().map(String::as_str), Some("cwd"));
+        assert_eq!(app.settings.statusline, app.statusline);
+    }
+
+    #[test]
+    fn the_last_shown_statusline_item_cannot_be_hidden() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.run_command("statusline git", &h);
+        app.run_command("statusline", &h);
+        app.on_key(key(KeyCode::Char(' ')), &h);
+        assert_eq!(app.statusline, ["git"]);
+    }
+
     /// Esc clears the line too (as the README promises) and must never quit.
     #[test]
     fn esc_clears_a_draft_line_without_quitting() {
@@ -5514,6 +5767,9 @@ pub fn run<B: ratatui::backend::Backend>(
             }
         }
         if app.busy() && app.tick_spinner() {
+            dirty = true;
+        }
+        if app.clock_due() {
             dirty = true;
         }
         if app.force_clear {
