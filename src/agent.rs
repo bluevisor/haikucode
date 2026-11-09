@@ -1605,12 +1605,22 @@ impl Worker {
             }
             "view_image" => {
                 let path = s("path");
-                let r = match tools::image_data_uri(path) {
+                // Queueing an image for a text-only model would be dropped on
+                // the wire while the model believes it saw it; say so instead.
+                let r = if !api::takes_images(&self.cfg) {
+                    format!(
+                        "ERROR: the current model ({}) can't see images. Check the result another \
+                         way (text output, logs, file contents) or ask the user to look.",
+                        self.cfg.model
+                    )
+                } else {
+                    match tools::image_data_uri(path) {
                     Ok(uri) => {
                         self.pending_images.push(uri);
                         format!("Loaded image {path} into context.")
                     }
                     Err(e) => e,
+                    }
                 };
                 self.result_event(&r);
                 r

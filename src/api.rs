@@ -91,6 +91,49 @@ fn retry_delay(err: &anyhow::Error, attempt: u32) -> Option<Duration> {
     Some(base + Duration::from_millis(nanos % (base.as_millis() as u64 / 2 + 1)))
 }
 
+/// Models that answered a request carrying images with "text only" this run,
+/// keyed `provider/model`. A static list can't know every gateway model (Vercel
+/// routes to hundreds), so the provider's own 400 is the source of truth.
+static NO_IMAGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn image_key(cfg: &Config) -> String {
+    format!("{}/{}", cfg.provider, cfg.model)
+}
+
+/// Can the active model see images? False for the providers known to be
+/// text-only and for any model that has rejected an image this run.
+pub fn takes_images(cfg: &Config) -> bool {
+    cfg.supports_images() && !NO_IMAGES.lock().map(|l| l.contains(&image_key(cfg))).unwrap_or(false)
+}
+
+fn mark_text_only(cfg: &Config) {
+    if let Ok(mut l) = NO_IMAGES.lock() {
+        let k = image_key(cfg);
+        if !l.contains(&k) {
+            l.push(k);
+        }
+    }
+}
+
+/// A 4xx that blames the images in the request (e.g. Vercel's "This API
+/// supports text input only. This conversation contains an image.").
+fn rejects_images(err: &anyhow::Error) -> bool {
+    let Some(s) = err.downcast_ref::<HttpStatus>() else { return false };
+    let d = s.detail.to_ascii_lowercase();
+    matches!(s.code, 400 | 415 | 422)
+        && ["image", "vision", "multimodal", "text input only"].iter().any(|w| d.contains(w))
+}
+
+/// On an image rejection with images in play: remember the model is text-only
+/// and say so, so the caller resends at once (the next send strips them).
+fn retry_without_images(cfg: &Config, messages: &[Message], err: &anyhow::Error) -> Option<String> {
+    if !rejects_images(err) || !takes_images(cfg) || messages.iter().all(|m| m.images.is_empty()) {
+        return None;
+    }
+    mark_text_only(cfg);
+    Some(format!("{} doesn't take images — resending without them", cfg.model))
+}
+
 /// Sleep for `d`, waking early on cancel. Returns false when cancelled.
 fn sleep_unless_cancelled(d: Duration, cancel: &AtomicBool) -> bool {
     let deadline = std::time::Instant::now() + d;
@@ -656,6 +699,13 @@ fn chat_stream(
     on_content: impl FnMut(&str),
     on_reasoning: impl FnMut(&str),
 ) -> Result<Streamed> {
+    let stripped: Vec<Message>;
+    let messages = if !takes_images(cfg) && messages.iter().any(|m| !m.images.is_empty()) {
+        stripped = messages.iter().cloned().map(|mut m| { m.images.clear(); m }).collect();
+        &stripped[..]
+    } else {
+        messages
+    };
     match cfg.api_kind() {
         ApiKind::Chat => chat_completions(http, cfg, messages, tools, cancel, on_content, on_reasoning),
         ApiKind::Messages => crate::native::anthropic_stream(http, cfg, messages, tools, cancel, on_content, on_reasoning),
@@ -765,6 +815,10 @@ pub fn chat_resilient(
         }
         match chat_stream(http, cfg, messages, Some(tools), cancel, &mut on_content, &mut on_reasoning) {
             Err(e) => {
+                if let Some(note) = retry_without_images(cfg, messages, &e) {
+                    on_retry(&note);
+                    continue;
+                }
                 let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries) else {
                     return Err(e);
                 };
@@ -815,6 +869,9 @@ pub fn chat_plain(
                 return Ok((content, usage));
             }
             Err(e) => {
+                if retry_without_images(cfg, messages, &e).is_some() {
+                    continue;
+                }
                 let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries) else {
                     return Err(e);
                 };
@@ -1013,6 +1070,27 @@ mod balance_tests {
             j!({"chat_template_kwargs": {"enable_thinking": false}, "reasoning_effort": "none"}),
             "self-hosted servers get the template switch"
         );
+    }
+
+    #[test]
+    fn a_text_only_rejection_marks_the_model_and_strips_images() {
+        let mut cfg = Config::default();
+        cfg.provider = "vercel".into();
+        cfg.model = "reflection/beam-free-test".into();
+        let with_img = [Message::user_with_images("look", vec!["data:image/png;base64,AAAA".into()])];
+        let err = |code, detail: &str| anyhow::Error::from(HttpStatus { code, retry_after: None, detail: detail.into() });
+        let vercel = r#"{"error":{"message":"This API supports text input only. This conversation contains an image."}}"#;
+        // Unrelated 400s and image-free requests don't flip the model.
+        assert!(retry_without_images(&cfg, &with_img, &err(400, "bad tool schema")).is_none());
+        assert!(retry_without_images(&cfg, &[Message::user("hi")], &err(400, vercel)).is_none());
+        assert!(retry_without_images(&cfg, &with_img, &err(500, vercel)).is_none());
+        assert!(takes_images(&cfg));
+        assert!(retry_without_images(&cfg, &with_img, &err(400, vercel)).is_some());
+        assert!(!takes_images(&cfg), "remembered for the rest of the run");
+        // Only once: a second rejection is a real failure, not another retry.
+        assert!(retry_without_images(&cfg, &with_img, &err(400, vercel)).is_none());
+        let other = Config { model: "anthropic/claude-sonnet-5.5".into(), ..cfg.clone() };
+        assert!(takes_images(&other), "other models keep images");
     }
 
     #[test]
