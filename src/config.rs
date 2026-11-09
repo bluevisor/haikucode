@@ -142,6 +142,10 @@ pub struct Config {
     /// brief summary; Ctrl+T or `/thinking` flips it.
     #[serde(default)]
     pub show_thinking: bool,
+    /// The first status row's segments, in order (`/statusline`). Empty means
+    /// the default row; see `ui::statusline`.
+    #[serde(default)]
+    pub statusline: Vec<String>,
     /// Look for a newer GitHub release at launch (at most daily). `/update`
     /// installs it either way.
     #[serde(default = "default_true")]
@@ -396,6 +400,7 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             auto_commit: true,
             show_thinking: false,
+            statusline: Vec::new(),
             update_check: true,
             permission: default_permission(),
             max_tool_calls: default_max_tool_calls(),
@@ -654,6 +659,9 @@ impl Config {
         if let Some(b) = v.get("auto_commit").and_then(|x| x.as_bool()) {
             cfg.auto_commit = b;
         }
+        if let Some(list) = v.get("statusline").and_then(|x| x.as_array()) {
+            cfg.statusline = list.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+        }
         // The old `thinking` switch only ever reached DeepSeek and GLM
         // (as their `thinking` field); every other provider ignored it.
         // Keep that: "medium" there, nothing sent elsewhere — mapping it
@@ -807,6 +815,9 @@ impl Config {
         }
         if on_disk.show_thinking {
             json["show_thinking"] = serde_json::json!(true);
+        }
+        if !on_disk.statusline.is_empty() {
+            json["statusline"] = serde_json::json!(on_disk.statusline);
         }
         if !on_disk.auto_commit {
             json["auto_commit"] = serde_json::json!(false);
@@ -993,6 +1004,14 @@ impl Config {
     pub fn persist_show_thinking(on: bool) {
         let mut disk = Config::load_disk();
         disk.show_thinking = on;
+        let _ = disk.save();
+    }
+
+    /// Persist only the status-row segments (empty = default), preserving the
+    /// rest of the file.
+    pub fn persist_statusline(segments: &[String]) {
+        let mut disk = Config::load_disk();
+        disk.statusline = segments.to_vec();
         let _ = disk.save();
     }
 
@@ -1253,6 +1272,18 @@ mod tests {
         assert_eq!(load(serde_json::json!({"provider": "splash", "thinking": true})), default_reasoning());
         // An explicit setting always wins.
         assert_eq!(load(serde_json::json!({"provider": "splash", "thinking": true, "reasoning": "high"})), "high");
+    }
+
+    #[test]
+    fn statusline_round_trips_and_stays_out_of_the_file_when_default() {
+        let mut c = Config::default();
+        assert!(c.to_disk_json().get("statusline").is_none());
+        c.statusline = vec!["git".into(), "ctx".into()];
+        let json = c.to_disk_json();
+        assert_eq!(json["statusline"], serde_json::json!(["git", "ctx"]));
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        assert_eq!(back.statusline, ["git", "ctx"]);
     }
 
     #[test]

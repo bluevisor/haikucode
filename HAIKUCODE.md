@@ -137,10 +137,16 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   `MSDOS` (gray, `C:\>`), `macOS` (dark mode system colors, `~ `),
   `SUN` (amber/gold, `sun% `), `NeXT` (platinum monochrome, `NeXT>`),
   `SGI` (indigo/teal IRIX, `irix# `); persisted in config. Theme sets colors, prompt, cursor.
+- `/statusline` (`ui/statusline.rs`): the first status row is a list of segments
+  (`model effort cost tokens ctx balance git cwd time version`), saved as
+  `statusline` in config.json (unset = the default row). Bare command opens a
+  picker that previews live; `effort` and `tokens` glue to `model`/`cost` when
+  they follow them. No segment spawns a process per frame: `git` reuses the
+  title's 5s-throttled probe, `time` redraws once a minute.
 - `/model` opens an interactive picker over the provider's model list —
   type to filter (handy for OpenRouter's hundreds), ↑/↓ + Enter to select;
   `/model <id|number>` still sets directly.
-- Slash commands: `/model /auto /reset /compact [focus] /config /mcp /memory /theme /init /new
+- Slash commands: `/model /auto /reset /compact [focus] /config /mcp /memory /theme /statusline /init /new
   /diff /undo /rewind /review /status /cost /permissions /hooks /commands /clear /help /exit`, plus any
   custom command from `.haikucode/commands/<name>.md` (`$ARGUMENTS`). `!cmd` runs a shell
   command directly and records the output in the conversation.

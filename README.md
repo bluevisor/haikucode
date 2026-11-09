@@ -229,6 +229,12 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
   and blue desktop), `Rainbow` (picoder's original Apple-rainbow look),
   `Apple ][` (green phosphor), `MSDOS`, `macOS`, `SUN`, `NeXT`, and `SGI`.
+- **Status bar** (`/statusline`) — choose which readouts the bottom row shows
+  and in what order: `model`, `effort`, `cost`, `tokens`, `ctx`, `balance`,
+  `git`, `cwd`, `time`, `version`. Bare `/statusline` opens a picker (Space
+  shows/hides, Shift+↑/↓ or `[` `]` moves, the row previews live);
+  `/statusline git ctx time` sets it directly, `/statusline reset` restores the
+  default. Saved in `config.json` as `statusline`.
 - **Launch banner** — a live SYSTEM panel with the Haiku release, cores,
   memory and IP; ASCII fallback under `TERM=linux` or `HAIKUCODE_ASCII=1`.
 
@@ -480,6 +486,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `/mcp approve\|deny\|login\|logout <server>` | allow a project server, sign in to an HTTP one, … |
 | `/memory` | show the persistent memory this directory sees |
 | `/theme [n]` | open the theme picker, or switch directly |
+| `/statusline [items…\|reset]` | choose and order the status bar's items (picker, or set directly) |
 | `/init` | summarize this project into `HAIKUCODE.md` |
 | `/clear` | clear the screen transcript |
 | `/update [--force]` | install the latest release from GitHub |

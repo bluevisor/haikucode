@@ -114,6 +114,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "MCP servers: state, tools, prompts · /mcp approve|deny|login|logout <server>"),
     ("/memory", "show persistent memory"),
     ("/theme", "open the theme picker"),
+    ("/statusline", "choose and order the status bar's items"),
     ("/init", "summarize this project into HAIKUCODE.md"),
     ("/diff", "show what changed since this session started"),
     ("/undo", "revert the last haikucode checkpoint commit"),
@@ -163,6 +164,8 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/permissions reload", "re-read the settings files"),
     ("/yolo on", "approve everything"),
     ("/yolo off", "back to asking before edits"),
+    ("/statusline reset", "back to the default status bar"),
+    ("/statusline ", "<items…> set them in order, e.g. model git ctx time"),
     ("/thinking full", "show reasoning, tool output and diffs"),
     ("/thinking brief", "one-line summaries of each stretch of work"),
     ("/mcp approve ", "<server> trust a project's MCP server"),
@@ -240,6 +243,10 @@ pub enum Mode {
     /// Interactive theme picker (`/theme` with no argument). `cursor` is the
     /// highlighted theme index; `prev` is the theme to restore if cancelled.
     ThemeSelect { cursor: usize, prev: String },
+    /// The `/statusline` picker: every segment with whether it's shown, in
+    /// display order. The status row previews it live; `prev` is restored on
+    /// Esc.
+    StatuslineSelect { cursor: usize, items: Vec<(String, bool)>, prev: Vec<String> },
     /// Masked sudo password entry, requested by the askpass helper. `prompt` is
     /// the text sudo asked with (e.g. "[sudo] password for user:").
     Password { prompt: String },
