@@ -2191,6 +2191,7 @@ impl App {
     /// Forget the selection (the view scrolled, or the user typed).
     pub fn select_clear(&mut self) {
         self.select = None;
+        self.screen = None;
     }
 
     fn clamped_cell(&self, col: u16, row: u16) -> Option<(u16, u16)> {
