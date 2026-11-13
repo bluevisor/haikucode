@@ -28,7 +28,7 @@ use helpers::{
 use palette::{Palette, palette_by_name};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -5471,6 +5471,56 @@ mod tests {
         // Unrecognised value: fall back to the terminal-based default.
         assert!(!want_mouse_capture("WarpTerminal", Some("maybe")));
         assert!(want_mouse_capture("iTerm.app", Some("maybe")));
+    }
+
+    /// A drag is a range of screen cells in the output box: it can't start
+    /// outside it, and dragging past an edge stops at the edge (otherwise the
+    /// composer would get selected too).
+    #[test]
+    fn a_drag_selection_stays_inside_the_transcript_and_reads_forwards() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(2, 1, 20, 4);
+
+        assert!(!app.select_begin(0, 0), "a press outside the box selects nothing");
+        assert!(app.selection().is_none());
+
+        assert!(app.select_begin(10, 3));
+        assert!(app.select_drag(99, 99), "dragging past the corner still extends");
+        assert_eq!(app.selection(), Some(((10, 3), (21, 4))), "clamped to the box's last cell");
+
+        // Anchored at the bottom right, the same drag still reads top-left first.
+        app.select_clear();
+        assert!(app.select_begin(21, 4));
+        assert!(app.select_drag(4, 1));
+        assert_eq!(app.selection(), Some(((4, 1), (21, 4))));
+
+        // A key gives the selection up.
+        app.select_drag(4, 2);
+        app.select_clear();
+        assert!(app.selection().is_none());
+    }
+
+    /// A plain click is not a selection: it must not copy a stray character,
+    /// and must not claim it copied anything.
+    #[test]
+    fn a_click_copies_nothing() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(0, 0, 10, 3);
+        let buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
+
+        assert!(app.select_begin(3, 1));
+        app.copy_selection(&buf);
+        assert!(app.selection().is_none(), "the selection is let go");
+        assert!(app.flash.is_none(), "and no note claims a copy");
+
+        // A drag over blank cells does report, rather than copying whitespace.
+        assert!(app.select_begin(1, 0));
+        assert!(app.select_drag(6, 2));
+        app.copy_selection(&buf);
+        assert_eq!(
+            app.flash.as_ref().map(|(note, _)| note.as_str()),
+            Some("nothing to copy")
+        );
     }
 
     /// A balance in another currency is shown as-is (tagged on the status
