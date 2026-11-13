@@ -160,13 +160,15 @@ pub struct App {
     scroll: usize,
     max_top: usize,
     view_h: usize,
-    /// A mouse drag across the transcript: where it started and where it is now,
-    /// in screen cells, both clamped to the output box. Released, it is copied
-    /// and cleared.
-    select: Option<((u16, u16), (u16, u16))>,
+    /// A mouse drag: what it is over and its two corners, in screen cells,
+    /// clamped to that box. Released, it is copied and cleared.
+    select: Option<Select>,
     /// Where the output box was last drawn, so a drag that runs past it can't
     /// grab the composer or the status bar.
     output_area: Rect,
+    /// The same for the composer's text, and zero when no composer is on
+    /// screen (an approval prompt, say).
+    composer_area: Rect,
     /// A short note the status bar shows for a moment ("copied 214 chars"), for
     /// actions that shouldn't write a line into the transcript.
     flash: Option<(String, Instant)>,
@@ -267,6 +269,40 @@ const SCROLL_STEP: isize = 3;
 /// How long a status-bar flash note ("copied 214 chars") stays up.
 const FLASH_TIME: Duration = Duration::from_millis(2200);
 
+/// Which pane of the UI a drag is over: the two select differently, because
+/// the transcript is copied from the cells that were drawn and the composer
+/// from the input text itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectKind {
+    /// The transcript.
+    Output,
+    /// The composer's text.
+    Composer,
+}
+
+/// A drag in progress: what it is over, how far it may reach, and its two
+/// corners — where the button went down and where it is now.
+#[derive(Clone, Copy, Debug)]
+struct Select {
+    kind: SelectKind,
+    /// The rect the drag is confined to (the transcript's inner box, or the
+    /// composer).
+    area: Rect,
+    /// Leftmost column a cell may be in: the composer's text starts past its
+    /// prompt, and the prompt is not selectable.
+    left: u16,
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+}
+
+impl Select {
+    /// The corners in reading order, top-left first.
+    fn corners(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, b) = (self.anchor, self.cursor);
+        if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
+    }
+}
+
 /// What a mouse event asks the event loop to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MouseAction {
@@ -276,7 +312,7 @@ pub enum MouseAction {
     Redraw,
     /// Copy this range of cells (top-left first) out of the frame just drawn,
     /// and repaint. The selection itself is already gone.
-    Copy((u16, u16), (u16, u16)),
+    Copy(SelectKind, (u16, u16), (u16, u16)),
 }
 
 /// Whether a blank separator line should precede an entry of kind `next` given
@@ -355,6 +391,7 @@ impl App {
             view_h: 0,
             select: None,
             output_area: Rect::new(0, 0, 0, 0),
+            composer_area: Rect::new(0, 0, 0, 0),
             flash: None,
             screen: None,
             spinner: 0,
