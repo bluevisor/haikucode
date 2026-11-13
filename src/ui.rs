@@ -267,6 +267,17 @@ const SCROLL_STEP: isize = 3;
 /// How long a status-bar flash note ("copied 214 chars") stays up.
 const FLASH_TIME: Duration = Duration::from_millis(2200);
 
+/// What a mouse event asks the event loop to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseAction {
+    /// Nothing changed: no repaint.
+    None,
+    /// Repaint (the wheel scrolled, or the selection moved).
+    Redraw,
+    /// Repaint, and copy the released selection out of the frame just drawn.
+    Copy,
+}
+
 /// Whether a blank separator line should precede an entry of kind `next` given
 /// the previous entry's kind. The transcript is made of distinct blocks — a
 /// turn's prose, its tool activity, and the next prompt — and without a gap they
@@ -2098,6 +2109,35 @@ impl App {
             self.scroll_lines(-SCROLL_STEP);
         } else {
             self.scroll_lines(SCROLL_STEP);
+        }
+    }
+
+    /// Handle a mouse event and say what the loop should do about it: the
+    /// wheel scrolls (dropping any selection), a left drag selects, and letting
+    /// go asks for a copy. Kept apart from the event loop so the mapping is
+    /// tested; reading the drawn frame and repainting stay the loop's job.
+    pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> MouseAction {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.select_clear();
+                self.mouse_scroll(true);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_clear();
+                self.mouse_scroll(false);
+                MouseAction::Redraw
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.select_begin(col, row) { MouseAction::Redraw } else { MouseAction::None }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.select_drag(col, row) { MouseAction::Redraw } else { MouseAction::None }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection().is_some() { MouseAction::Copy } else { MouseAction::None }
+            }
+            _ => MouseAction::None,
         }
     }
 
@@ -5525,16 +5565,18 @@ mod tests {
         let mut app = App::new(test_ui_config(), Vec::new());
         app.output_area = Rect::new(0, 0, 10, 3);
         let buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
+        app.capture_frame(&buf);
 
         assert!(app.select_begin(3, 1));
-        app.copy_selection(&buf);
+        app.copy_selection();
         assert!(app.selection().is_none(), "the selection is let go");
         assert!(app.flash.is_none(), "and no note claims a copy");
 
         // A drag over blank cells does report, rather than copying whitespace.
         assert!(app.select_begin(1, 0));
         assert!(app.select_drag(6, 2));
-        app.copy_selection(&buf);
+        app.capture_frame(&buf);
+        app.copy_selection();
         assert_eq!(
             app.flash.as_ref().map(|(note, _)| note.as_str()),
             Some("nothing to copy")
@@ -5730,8 +5772,10 @@ mod tests {
 
         let row = screen.lines().position(|l| l.contains("quick brown")).unwrap() as u16;
         let line = screen.lines().nth(row as usize).unwrap();
-        let from = line.find("quick").unwrap() as u16;
-        let to = (line.find("brown").unwrap() + "brown".len() - 1) as u16;
+        // Byte offsets are not columns: the assistant's glyph is multibyte.
+        let col = |byte: usize| line[..byte].chars().count() as u16;
+        let from = col(line.find("quick").unwrap());
+        let to = col(line.find("brown").unwrap() + "brown".len() - 1);
 
         assert!(app.select_begin(from, row), "the press lands in the transcript");
         assert!(app.select_drag(to, row));
@@ -5739,6 +5783,7 @@ mod tests {
         draw(&mut app, &mut term);
 
         let buf = term.backend().buffer();
+        assert_eq!(helpers::selected_text(buf, (from, row), (to, row)), "quick brown");
         for col in from..=to {
             let cell = buf.cell((col, row)).unwrap();
             assert!(
@@ -5747,7 +5792,6 @@ mod tests {
                 cell.modifier
             );
         }
-        assert_eq!(helpers::selected_text(buf, (from, row), (to, row)), "quick brown");
     }
 
     #[test]
