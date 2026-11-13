@@ -85,7 +85,8 @@ memory, sessions, skills) into `~/.config/haikucode`.
   attach instead of pasting as bare paths.
 - **Streaming TUI** — a Claude-style composer with a reverse-block cursor,
   live token streaming, and colored unified diffs previewed before every
-  write/edit.
+  write/edit. Drag across the output to select it: releasing copies the cells
+  you covered to the clipboard and the status bar says how much went.
 - **Context compaction** — `/compact [focus]` summarizes older turns to free
   the window (the optional focus tells the summary what to preserve); triggers
   automatically at 80% full, including mid-turn during long tool loops. The
