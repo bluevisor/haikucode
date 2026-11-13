@@ -5726,7 +5726,7 @@ mod tests {
         for col in from..=to {
             let cell = buf.cell((col, row)).unwrap();
             assert!(
-                cell.style().add_modifier.is_empty() || cell.modifier.contains(Modifier::REVERSED),
+                cell.modifier.contains(Modifier::REVERSED),
                 "column {col} is not highlighted: {:?}",
                 cell.modifier
             );
