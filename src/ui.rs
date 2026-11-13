@@ -2088,6 +2088,101 @@ impl App {
         }
     }
 
+    /// Start a drag-selection at a screen cell, if that cell is in the
+    /// transcript. Returns whether one started (so the caller repaints).
+    pub fn select_begin(&mut self, col: u16, row: u16) -> bool {
+        if !self.output_area.contains(Position::new(col, row)) {
+            return false;
+        }
+        let Some(at) = self.clamped_cell(col, row) else {
+            return false;
+        };
+        self.select = Some((at, at));
+        true
+    }
+
+    /// Extend the drag to a screen cell: past the box's edge the selection
+    /// stops at the edge rather than running into the composer.
+    pub fn select_drag(&mut self, col: u16, row: u16) -> bool {
+        let Some(at) = self.clamped_cell(col, row) else {
+            return false;
+        };
+        match self.select.as_mut() {
+            Some((_, end)) => {
+                *end = at;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The selection in reading order — top-left cell first — for the copy and
+    /// the highlight alike.
+    pub fn selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        self.select
+            .map(|(a, b)| if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) })
+    }
+
+    /// Forget the selection (the view scrolled, or the user typed).
+    pub fn select_clear(&mut self) {
+        self.select = None;
+    }
+
+    fn clamped_cell(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.output_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        Some((
+            col.clamp(area.x, area.right() - 1),
+            row.clamp(area.y, area.bottom() - 1),
+        ))
+    }
+
+    /// Copy a released selection out of the frame that was drawn and put it on
+    /// the system clipboard, then let the selection go. A cell read back from
+    /// the buffer is exactly what the user saw, so wrapped paragraphs, diffs
+    /// and tool output all copy as written on screen — the renderer's layout
+    /// never has to be reconstructed.
+    pub fn copy_selection(&mut self, buf: &ratatui::buffer::Buffer) {
+        let Some((start, end)) = self.selection() else {
+            return;
+        };
+        self.select = None;
+        // A plain click selects nothing: don't copy one character for it.
+        if start == end {
+            return;
+        }
+        let text = helpers::selected_text(buf, start, end);
+        if text.trim().is_empty() {
+            self.flash_note("nothing to copy".to_string());
+            return;
+        }
+        match helpers::copy_to_clipboard(&text) {
+            Ok(()) => {
+                let chars = text.chars().count();
+                let lines = text.lines().count().max(1);
+                let what = if lines > 1 { format!("{chars} chars, {lines} lines") } else { format!("{chars} chars") };
+                self.flash_note(format!("copied {what}"));
+            }
+            Err(e) => self.flash_note(format!("copy failed: {e}")),
+        }
+    }
+
+    /// A one-line note in the status bar, in place for a moment.
+    fn flash_note(&mut self, text: String) {
+        self.flash = Some((text, Instant::now()));
+    }
+
+    /// Drop an expired flash note; true when it went, so the loop repaints.
+    pub fn flash_due(&mut self) -> bool {
+        if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() > FLASH_TIME) {
+            self.flash = None;
+            return true;
+        }
+        false
+    }
+
     /// Scroll the transcript by `n` lines (negative scrolls up). Scrolling up
     /// pins the view (`follow = false`); coming back to the bottom resumes
     /// following the live end.
