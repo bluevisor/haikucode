@@ -136,6 +136,14 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   skips mouse capture (below) and would otherwise have no way to scroll.
 - Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) so click-drag
   text selection keeps working; `HAIKUCODE_MOUSE=1`/`0` overrides either way.
+- Selecting output: drag across the transcript and the cells under the drag are
+  reversed as you go; letting go copies them. The copy is read back out of the
+  frame ratatui just drew (`helpers::selected_text`), so it is exactly what was
+  on screen — wrapped where it wrapped, diffs and tool output included, wide
+  characters once — with no second model of the layout to keep in sync. It goes
+  to `pbcopy` (macOS), `clipboard -i` (Haiku), `wl-copy`/`xclip`/`xsel` (Linux),
+  or OSC 52 where the terminal has no such tool, and the status bar flashes how
+  much went. A click, or a drag over blanks, copies nothing.
 - ASCII fallback + clear-on-exit for the Pi's framebuffer console (`TERM=linux`),
   whose 16-color palette can't show a theme's RGB shades: the palette is snapped
   to the nearest ANSI color there (`palette::for_16color`), since the console
