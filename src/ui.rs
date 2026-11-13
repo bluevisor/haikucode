@@ -274,8 +274,9 @@ pub enum MouseAction {
     None,
     /// Repaint (the wheel scrolled, or the selection moved).
     Redraw,
-    /// Repaint, and copy the released selection out of the frame just drawn.
-    Copy,
+    /// Copy this range of cells (top-left first) out of the frame just drawn,
+    /// and repaint. The selection itself is already gone.
+    Copy((u16, u16), (u16, u16)),
 }
 
 /// Whether a blank separator line should precede an entry of kind `next` given
@@ -2135,7 +2136,18 @@ impl App {
                 if self.select_drag(col, row) { MouseAction::Redraw } else { MouseAction::None }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if self.selection().is_some() { MouseAction::Copy } else { MouseAction::None }
+                // Letting go ends the selection either way; a click that never
+                // moved copies nothing.
+                let Some((start, end)) = self.select.take().map(|(a, b)| {
+                    if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
+                }) else {
+                    return MouseAction::None;
+                };
+                if start == end {
+                    MouseAction::None
+                } else {
+                    MouseAction::Copy(start, end)
+                }
             }
             _ => MouseAction::None,
         }
@@ -2192,24 +2204,15 @@ impl App {
         ))
     }
 
-    /// Copy a released selection out of the frame that was drawn and put it on
-    /// the system clipboard, then let the selection go. A cell read back from
-    /// the buffer is exactly what the user saw, so wrapped paragraphs, diffs
-    /// and tool output all copy as written on screen — the renderer's layout
-    /// never has to be reconstructed.
-    pub fn copy_selection(&mut self) {
-        let Some((start, end)) = self.selection() else {
-            return;
-        };
-        self.select = None;
+    /// Copy a range of screen cells out of the frame that was drawn and put it
+    /// on the system clipboard. A cell read back from the buffer is exactly what
+    /// the user saw, so wrapped paragraphs, diffs and tool output all copy as
+    /// written on screen — the renderer's layout never has to be reconstructed.
+    pub fn copy_range(&mut self, start: (u16, u16), end: (u16, u16)) {
         let Some(buf) = self.screen.take() else {
             return;
         };
-        // A plain click selects nothing: don't copy one character for it.
-        if start == end {
-            return;
-        }
-        let text = helpers::selected_text(&buf, start, end);
+        let text = helpers::selected_text(&buf, self.output_area, start, end);
         if text.trim().is_empty() {
             self.flash_note("nothing to copy".to_string());
             return;
@@ -3221,6 +3224,7 @@ impl App {
         self.push(Kind::Notice, "   and tmux/screen keep Ctrl+B/Ctrl+A for themselves)");
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
         self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  scroll the output 3 lines");
+        self.push(Kind::Notice, "  drag        select output text (releasing copies it)");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
         self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / YOLO / plan; remembered)"));
         self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A YOLO (approve everything)"));
@@ -4189,7 +4193,8 @@ mod tests {
     use super::palette::palette_by_name;
     use super::{
         echo_excerpt, palette_for, want_mouse_capture, App, ConfigPatch, Handles, KeyCode, KeyEvent,
-        KeyModifiers, Mode, ECHO_LINES, TAB_W, THEMES, UiConfig, UiEvent, WorkerCmd,
+        KeyModifiers, Mode, MouseAction, MouseButton, MouseEventKind, ECHO_LINES, TAB_W, THEMES,
+        UiConfig, UiEvent, WorkerCmd,
     };
 
     #[test]
@@ -5556,6 +5561,48 @@ mod tests {
         assert!(app.selection().is_none());
     }
 
+    /// The loop's mouse arms: the wheel scrolls and drops a selection, a left
+    /// drag selects, letting go asks for the copy, and stray motion does
+    /// nothing.
+    #[test]
+    fn mouse_events_map_to_the_loop_actions() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(1, 1, 20, 5);
+
+        assert_eq!(app.on_mouse(MouseEventKind::Moved, 5, 3), MouseAction::None);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 5, 3),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Drag(MouseButton::Left), 9, 3),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
+            MouseAction::Copy((5, 3), (9, 3))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
+            MouseAction::None,
+            "the selection is gone once it has been taken"
+        );
+
+        // The wheel scrolls, and a selection doesn't survive it.
+        assert!(app.select_begin(5, 3));
+        assert!(app.select_drag(9, 3));
+        assert_eq!(app.on_mouse(MouseEventKind::ScrollUp, 0, 0), MouseAction::Redraw);
+        assert!(app.selection().is_none());
+
+        // A press outside the transcript is not a selection.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 40, 20),
+            MouseAction::None
+        );
+    }
+
     /// A plain click is not a selection: it must not copy a stray character,
     /// and must not claim it copied anything.
     #[test]
@@ -5565,18 +5612,21 @@ mod tests {
         let mut app = App::new(test_ui_config(), Vec::new());
         app.output_area = Rect::new(0, 0, 10, 3);
         let buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
-        app.capture_frame(&buf);
 
         assert!(app.select_begin(3, 1));
-        app.copy_selection();
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 3, 1),
+            MouseAction::None,
+            "a press and release on one cell is a click, not a selection"
+        );
         assert!(app.selection().is_none(), "the selection is let go");
         assert!(app.flash.is_none(), "and no note claims a copy");
 
-        // A drag over blank cells does report, rather than copying whitespace.
+        // A drag over blank cells says so, rather than copying whitespace.
         assert!(app.select_begin(1, 0));
         assert!(app.select_drag(6, 2));
         app.capture_frame(&buf);
-        app.copy_selection();
+        app.copy_range((1, 0), (6, 2));
         assert_eq!(
             app.flash.as_ref().map(|(note, _)| note.as_str()),
             Some("nothing to copy")
@@ -5783,7 +5833,7 @@ mod tests {
         draw(&mut app, &mut term);
 
         let buf = term.backend().buffer();
-        assert_eq!(helpers::selected_text(buf, (from, row), (to, row)), "quick brown");
+        assert_eq!(helpers::selected_text(buf, app.output_area, (from, row), (to, row)), "quick brown");
         for col in from..=to {
             let cell = buf.cell((col, row)).unwrap();
             assert!(
@@ -6048,8 +6098,8 @@ pub fn run<B: ratatui::backend::Backend>(
                 Event::Mouse(m) => match app.on_mouse(m.kind, m.column, m.row) {
                     MouseAction::None => {}
                     MouseAction::Redraw => dirty = true,
-                    MouseAction::Copy => {
-                        app.copy_selection();
+                    MouseAction::Copy(start, end) => {
+                        app.copy_range(start, end);
                         dirty = true;
                     }
                 },
