@@ -6045,35 +6045,13 @@ pub fn run<B: ratatui::backend::Backend>(
                     app.on_paste(s);
                     dirty = true;
                 }
-                Event::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.select_clear();
-                        app.mouse_scroll(true);
+                Event::Mouse(m) => match app.on_mouse(m.kind, m.column, m.row) {
+                    MouseAction::None => {}
+                    MouseAction::Redraw => dirty = true,
+                    MouseAction::Copy => {
+                        app.copy_selection();
                         dirty = true;
                     }
-                    MouseEventKind::ScrollDown => {
-                        app.select_clear();
-                        app.mouse_scroll(false);
-                        dirty = true;
-                    }
-                    // Drag to select text in the transcript; releasing copies it.
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if app.select_begin(m.column, m.row) {
-                            dirty = true;
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if app.select_drag(m.column, m.row) {
-                            dirty = true;
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if app.selection().is_some() {
-                            app.copy_selection();
-                            dirty = true;
-                        }
-                    }
-                    _ => {}
                 },
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
