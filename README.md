@@ -503,6 +503,7 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `Home` / `End` | start / end of the composer line |
 | `PgUp` / `PgDn` | scroll the output a page |
 | mouse wheel | scroll the output (when mouse capture is on) |
+| drag | select output text; letting go copies it to the clipboard |
 | `Ctrl` / `Alt + ↑` / `↓` | scroll the output (3 lines) |
 | `Alt`/`Ctrl`/`Cmd + ←/→` | word / line motion |
 | `Option`/`Alt + Backspace` | delete word backward |
@@ -520,9 +521,13 @@ Without it, some terminals (e.g. Warp in full-screen mode) flatten
 
 Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) because it grabs
 click-drag text selection with no modifier to bypass it — Warp users scroll with
-`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn` instead. Set `HAIKUCODE_MOUSE=1` to force capture on
-(wheel scrolling, at the cost of native selection), or `HAIKUCODE_MOUSE=0` to turn
-it off everywhere.
+`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn`, and select with Warp's own drag. Elsewhere,
+because haikucode holds the mouse for the wheel, it does the selecting itself:
+drag across the transcript and the text under the drag is copied when you let
+go (and the status bar says how much), to `pbcopy`, Haiku's `clipboard`, or
+`wl-copy`/`xclip`/`xsel`, falling back to OSC 52 where the terminal offers no
+such tool. Set `HAIKUCODE_MOUSE=0` to turn capture off and let the terminal
+handle the mouse. `HAIKUCODE_MOUSE=1` forces capture on.
 
 ## Architecture
 
