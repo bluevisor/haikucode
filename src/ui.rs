@@ -1098,6 +1098,10 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, h: &Handles) {
+        // Any key gives up a mouse selection: it is a momentary view of the
+        // text, and keeping the highlight after the user moves on only
+        // confuses the next frame.
+        self.select = None;
         // Cycle the permission mode in any state, except while a masked prompt
         // or an ask_user question is capturing every key. Shift+Tab is the
         // primary binding: it arrives as BackTab on ANSI terminals, or as
@@ -4108,7 +4112,17 @@ impl App {
             Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(text, Style::default().fg(color)),
         ];
-        spans.extend(hint);
+        // A flash ("copied 214 chars") takes the hint's place for a moment, so
+        // the line never grows a second one.
+        match &self.flash {
+            Some((note, _)) => spans.push(Span::styled(
+                format!("  {note}"),
+                Style::default()
+                    .fg(self.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None => spans.extend(hint),
+        }
         spans.push(Span::styled("  (shift+tab/ctrl+p to cycle)", Style::default().fg(self.dim_text())));
         spans.push(Span::styled(format!("   Haiku Code v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(self.dim_text())));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -5882,12 +5896,33 @@ pub fn run<B: ratatui::backend::Backend>(
                 }
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::ScrollUp => {
+                        app.select_clear();
                         app.mouse_scroll(true);
                         dirty = true;
                     }
                     MouseEventKind::ScrollDown => {
+                        app.select_clear();
                         app.mouse_scroll(false);
                         dirty = true;
+                    }
+                    // Drag to select text in the transcript; releasing copies it.
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if app.select_begin(m.column, m.row) {
+                            dirty = true;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if app.select_drag(m.column, m.row) {
+                            dirty = true;
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if app.selection().is_some() {
+                            // The last frame drawn is what the user is looking at:
+                            // read the selection straight out of it.
+                            app.copy_selection(terminal.current_buffer_mut());
+                            dirty = true;
+                        }
                     }
                     _ => {}
                 },
@@ -5907,6 +5942,9 @@ pub fn run<B: ratatui::backend::Backend>(
             dirty = true;
         }
         if app.clock_due() {
+            dirty = true;
+        }
+        if app.flash_due() {
             dirty = true;
         }
         if app.force_clear {
