@@ -5478,6 +5478,8 @@ mod tests {
     /// composer would get selected too).
     #[test]
     fn a_drag_selection_stays_inside_the_transcript_and_reads_forwards() {
+        use ratatui::layout::Rect;
+
         let mut app = App::new(test_ui_config(), Vec::new());
         app.output_area = Rect::new(2, 1, 20, 4);
 
@@ -5504,6 +5506,8 @@ mod tests {
     /// and must not claim it copied anything.
     #[test]
     fn a_click_copies_nothing() {
+        use ratatui::layout::Rect;
+
         let mut app = App::new(test_ui_config(), Vec::new());
         app.output_area = Rect::new(0, 0, 10, 3);
         let buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
