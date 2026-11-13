@@ -170,6 +170,11 @@ pub struct App {
     /// A short note the status bar shows for a moment ("copied 214 chars"), for
     /// actions that shouldn't write a line into the transcript.
     flash: Option<(String, Instant)>,
+    /// The cells of the frame drawn last while a selection is up, so releasing
+    /// it can read them back. Kept only while selecting: after `draw` returns,
+    /// ratatui's own buffers have already been swapped, so the frame that was
+    /// drawn is the one it hands back, not the one `current_buffer_mut` holds.
+    screen: Option<ratatui::buffer::Buffer>,
     spinner: usize,
     spin_counter: usize,
     /// Clock time when the agent last entered Busy; used to show an elapsed timer.
@@ -339,6 +344,7 @@ impl App {
             select: None,
             output_area: Rect::new(0, 0, 0, 0),
             flash: None,
+            screen: None,
             spinner: 0,
             spin_counter: 0,
             busy_since: None,
@@ -2151,16 +2157,19 @@ impl App {
     /// the buffer is exactly what the user saw, so wrapped paragraphs, diffs
     /// and tool output all copy as written on screen — the renderer's layout
     /// never has to be reconstructed.
-    pub fn copy_selection(&mut self, buf: &ratatui::buffer::Buffer) {
+    pub fn copy_selection(&mut self) {
         let Some((start, end)) = self.selection() else {
             return;
         };
         self.select = None;
+        let Some(buf) = self.screen.take() else {
+            return;
+        };
         // A plain click selects nothing: don't copy one character for it.
         if start == end {
             return;
         }
-        let text = helpers::selected_text(buf, start, end);
+        let text = helpers::selected_text(&buf, start, end);
         if text.trim().is_empty() {
             self.flash_note("nothing to copy".to_string());
             return;
@@ -2174,6 +2183,11 @@ impl App {
             }
             Err(e) => self.flash_note(format!("copy failed: {e}")),
         }
+    }
+
+    /// Keep the frame just drawn, for the copy a release will make.
+    pub fn capture_frame(&mut self, buf: &ratatui::buffer::Buffer) {
+        self.screen = Some(buf.clone());
     }
 
     /// A one-line note in the status bar, in place for a moment.
@@ -5702,7 +5716,9 @@ mod tests {
     /// disagree about what was selected, because both come from the frame.
     #[test]
     fn a_drag_highlights_the_cells_it_covers_and_copies_them() {
+        use crate::ui::helpers;
         use crate::ui::types::Kind;
+        use ratatui::style::Modifier;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -5722,7 +5738,7 @@ mod tests {
         // Redraw with the selection up, then read the frame back.
         draw(&mut app, &mut term);
 
-        let buf = term.current_buffer_mut();
+        let buf = term.backend().buffer();
         for col in from..=to {
             let cell = buf.cell((col, row)).unwrap();
             assert!(
@@ -6009,9 +6025,7 @@ pub fn run<B: ratatui::backend::Backend>(
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         if app.selection().is_some() {
-                            // The last frame drawn is what the user is looking at:
-                            // read the selection straight out of it.
-                            app.copy_selection(terminal.current_buffer_mut());
+                            app.copy_selection();
                             dirty = true;
                         }
                     }
@@ -6044,7 +6058,11 @@ pub fn run<B: ratatui::backend::Backend>(
             dirty = true;
         }
         if dirty {
-            terminal.draw(|f| app.render(f))?;
+            let frame = terminal.draw(|f| app.render(f))?;
+            // The frame just drawn is only borrowable here (see `screen`).
+            if app.selection().is_some() {
+                app.capture_frame(frame.buffer);
+            }
         }
     }
     Ok(())
