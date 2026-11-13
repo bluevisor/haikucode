@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="304" height="260" viewBox="104 126 304 260">
+  <title>Haiku Code (one color, for tinting)</title>
+  <path d="M140 162 L254 254 L140 346" fill="none" stroke="#ffffff" stroke-width="72"
+    stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="312" y="276" width="96" height="110" rx="26" fill="#ffffff"/>
+</svg>

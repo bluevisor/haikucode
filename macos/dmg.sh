@@ -52,7 +52,24 @@ SCRIPT
 	cp LICENSE "$stage/LICENSE.txt"
 
 	dmg="dist/haikucode-$version-macos-$arch.dmg"
-	hdiutil create -quiet -ov -volname "Haiku Code $version" -srcfolder "$stage" -format UDZO "$dmg"
+	# A read-write pass first: the icon Finder shows for the mounted image is a
+	# .VolumeIcon.icns on it plus the volume's custom-icon bit, and a UDZO image
+	# is read-only, so the icon has to be in place before the final conversion.
+	rw="$(mktemp -d)/HaikuCode.dmg"
+	hdiutil create -quiet -ov -volname "Haiku Code $version" -srcfolder "$stage" -format UDRW "$rw"
+	if command -v SetFile >/dev/null; then
+		mnt=$(hdiutil attach -readwrite -noverify -noautoopen "$rw" | grep -o '/Volumes/.*' | tail -1)
+		cp assets/haikucode.icns "$mnt/.VolumeIcon.icns"
+		SetFile -a V "$mnt/.VolumeIcon.icns"
+		SetFile -a C "$mnt"
+		sync
+		# Spotlight can still be indexing the fresh volume: give it a moment.
+		hdiutil detach -quiet "$mnt" || { sleep 2; hdiutil detach -quiet "$mnt"; }
+	else
+		echo "   (no SetFile: the disk image gets no icon)" >&2
+	fi
+	hdiutil convert "$rw" -ov -format UDZO -o "$dmg"
+	rm -rf "$(dirname "$rw")"
 	rm -rf "${stage:?}"
 	codesign --force --timestamp -s "$sign" "$dmg"
 	if [ "$notary" != none ]; then

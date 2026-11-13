@@ -15,12 +15,23 @@ with `cargo build --release` — see "Building" below.
 ```
 Cargo.toml            deps + release profile; Haiku-only crossterm use-dev-tty feature
 haiku/package.sh      on Haiku: build + wrap dist/haikucode-<ver>-<rev>-<arch>.hpkg
+haiku/mkicon.py       assets/icon.svg → haiku/haikucode.hvif (Haiku vector icon; package.sh
+                      sets it as BEOS:ICON on the launcher and the binary)
+haiku/hvifpng.cpp     on Haiku: renders an HVIF, or a file's BEOS:ICON, to a PNG the way
+                      Tracker does — the check that the icon is valid
 haiku/deploy.sh       on the Mac: sync source to $HAIKU_HOST, build + package there, activate
 haiku/launcher.sh     "apps/Haiku Code": Deskbar entry that opens haikucode in Terminal
 haiku/PackageInfo.in  .PackageInfo template (version/revision/arch filled in)
 haiku/release.sh      publish v<version> with the three Haiku packages
 .github/workflows/release.yml  on publish: attach macOS + Linux (musl) tarballs
 install.sh            curl | sh installer for macOS/Linux (→ ~/.local/bin)
+macos/dmg.sh          macOS disk images per arch: sign, volume icon, notarize, staple
+assets/icon.svg       the app icon: a prompt chevron in Haiku's leaf colors and a
+                      peach cursor on the dark desktop blue. assets/render.py renders
+                      the PNGs and haikucode.icns from it (macos/dmg.sh gives a DMG
+                      that as its volume icon); icon-mono.svg (-mono-64.png) is the
+                      mark alone in one color, for tinting — Temino's pane banner
+                      draws it
 src/
   main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
   config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
