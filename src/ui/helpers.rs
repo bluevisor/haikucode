@@ -996,22 +996,34 @@ pub fn parse_max_tool_calls(s: &str) -> u32 {
 /// layout. A wide character's second cell carries an empty symbol and is
 /// skipped, so CJK text isn't doubled.
 pub fn selected_text(buf: &ratatui::buffer::Buffer, a: (u16, u16), b: (u16, u16)) -> String {
+    use unicode_width::UnicodeWidthStr;
+
     let (start, end) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
     let area = buf.area;
     let last_col = area.right().saturating_sub(1);
-    let mut out = String::new();
     let mut rows = Vec::new();
     for row in start.1..=end.1.min(area.bottom().saturating_sub(1)) {
         let from = if row == start.1 { start.0 } else { area.x }.min(last_col);
         let to = if row == end.1 { end.0 } else { last_col }.min(last_col);
         let mut line = String::new();
+        // Cells covered by the second half of a wide character keep a blank
+        // symbol of their own: stepping over them is what keeps 世界 from
+        // copying as "世 界".
+        let mut skip = 0;
         for col in from..=to {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
             if let Some(cell) = buf.cell((col, row)) {
-                line.push_str(cell.symbol());
+                let symbol = cell.symbol();
+                line.push_str(symbol);
+                skip = symbol.width().saturating_sub(1);
             }
         }
         rows.push(line.trim_end().to_string());
     }
+    let mut out = String::new();
     for (i, line) in rows.iter().enumerate() {
         if i > 0 {
             out.push('\n');
