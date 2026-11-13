@@ -1090,6 +1090,39 @@ fn base64(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A selection copies the cells that were drawn: wide characters once
+    /// (their second cell is empty), trailing blanks trimmed, rows in reading
+    /// order whichever end the drag started from.
+    #[test]
+    fn selected_text_is_exactly_what_was_drawn() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 14, 3));
+        Paragraph::new("hello 世界").render(Rect::new(0, 0, 14, 1), &mut buf);
+        Paragraph::new("  indent  ").render(Rect::new(0, 1, 14, 1), &mut buf);
+
+        assert_eq!(selected_text(&buf, (0, 0), (13, 1)), "hello 世界\n  indent");
+        // Bottom-right to top-left is the same selection.
+        assert_eq!(selected_text(&buf, (13, 1), (0, 0)), "hello 世界\n  indent");
+        // Partial rows, from either end of the drag.
+        assert_eq!(selected_text(&buf, (7, 1), (2, 0)), "llo 世界\n  indent");
+        assert_eq!(selected_text(&buf, (2, 0), (7, 1)), "llo 世界\n  indent");
+        // A blank row copies nothing at all, not a run of spaces.
+        assert_eq!(selected_text(&buf, (0, 2), (13, 2)), "");
+    }
+
+    /// OSC 52 carries the clipboard text as standard base64.
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64("hé".as_bytes()), "aMOp");
+    }
+
     /// Haiku Terminal drew `█` wider than a cell and smeared the logo, so cell
     /// rows reach the screen as background-colored spaces.
     #[test]
