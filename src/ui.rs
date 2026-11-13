@@ -259,6 +259,9 @@ pub struct App {
 /// Lines moved per arrow key / wheel notch. PgUp/PgDn move a full viewport.
 const SCROLL_STEP: isize = 3;
 
+/// How long a status-bar flash note ("copied 214 chars") stays up.
+const FLASH_TIME: Duration = Duration::from_millis(2200);
+
 /// Whether a blank separator line should precede an entry of kind `next` given
 /// the previous entry's kind. The transcript is made of distinct blocks — a
 /// turn's prose, its tool activity, and the next prompt — and without a gap they
@@ -3351,6 +3354,29 @@ impl App {
         self.render_rule(f, chunks[3]);
         self.render_status1(f, pad1(chunks[4]));
         self.render_status2(f, pad1(chunks[5]));
+        self.render_selection(f);
+    }
+
+    /// Tint the cells a drag covers, whatever they hold — prose, a diff, a
+    /// wrapped long line. Reversing them keeps each cell's own color readable
+    /// on any theme, and it needs nothing from the renderer but the box.
+    fn render_selection(&self, f: &mut Frame) {
+        let Some((start, end)) = self.selection() else {
+            return;
+        };
+        let area = self.output_area;
+        let right = area.right().saturating_sub(1);
+        let buf = f.buffer_mut();
+        for row in start.1..=end.1 {
+            let from = if row == start.1 { start.0 } else { area.x };
+            let to = if row == end.1 { end.0 } else { right };
+            for col in from.min(right)..=to.min(right) {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    let style = cell.style().add_modifier(Modifier::REVERSED);
+                    cell.set_style(style);
+                }
+            }
+        }
     }
 
     /// Display value for one `/config` row.
@@ -3493,6 +3519,9 @@ impl App {
             .title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
+        // Remembered for drag-selections: a selection is a range of screen
+        // cells in this box, and nothing outside it.
+        self.output_area = inner;
 
         let width = inner.width as usize;
         self.ensure_display_cache(width);
