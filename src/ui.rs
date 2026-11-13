@@ -160,6 +160,16 @@ pub struct App {
     scroll: usize,
     max_top: usize,
     view_h: usize,
+    /// A mouse drag across the transcript: where it started and where it is now,
+    /// in screen cells, both clamped to the output box. Released, it is copied
+    /// and cleared.
+    select: Option<((u16, u16), (u16, u16))>,
+    /// Where the output box was last drawn, so a drag that runs past it can't
+    /// grab the composer or the status bar.
+    output_area: Rect,
+    /// A short note the status bar shows for a moment ("copied 214 chars"), for
+    /// actions that shouldn't write a line into the transcript.
+    flash: Option<(String, Instant)>,
     spinner: usize,
     spin_counter: usize,
     /// Clock time when the agent last entered Busy; used to show an elapsed timer.
@@ -323,6 +333,9 @@ impl App {
             scroll: 0,
             max_top: 0,
             view_h: 0,
+            select: None,
+            output_area: Rect::new(0, 0, 0, 0),
+            flash: None,
             spinner: 0,
             spin_counter: 0,
             busy_since: None,
