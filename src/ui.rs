@@ -5697,6 +5697,43 @@ mod tests {
             .join("\n")
     }
 
+    /// A drag across the output lights up exactly the cells it covers, and the
+    /// copy reads those same cells back: the highlight and the clipboard can't
+    /// disagree about what was selected, because both come from the frame.
+    #[test]
+    fn a_drag_highlights_the_cells_it_covers_and_copies_them() {
+        use crate::ui::types::Kind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.transcript.clear();
+        app.push(Kind::Assistant, "the quick brown fox".to_string());
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let screen = draw(&mut app, &mut term);
+
+        let row = screen.lines().position(|l| l.contains("quick brown")).unwrap() as u16;
+        let line = screen.lines().nth(row as usize).unwrap();
+        let from = line.find("quick").unwrap() as u16;
+        let to = (line.find("brown").unwrap() + "brown".len() - 1) as u16;
+
+        assert!(app.select_begin(from, row), "the press lands in the transcript");
+        assert!(app.select_drag(to, row));
+        // Redraw with the selection up, then read the frame back.
+        draw(&mut app, &mut term);
+
+        let buf = term.current_buffer_mut();
+        for col in from..=to {
+            let cell = buf.cell((col, row)).unwrap();
+            assert!(
+                cell.style().add_modifier.is_empty() || cell.modifier.contains(Modifier::REVERSED),
+                "column {col} is not highlighted: {:?}",
+                cell.modifier
+            );
+        }
+        assert_eq!(helpers::selected_text(buf, (from, row), (to, row)), "quick brown");
+    }
+
     #[test]
     fn the_output_actually_moves_and_the_hint_shows_in_the_rendered_screen() {
         use ratatui::backend::TestBackend;
