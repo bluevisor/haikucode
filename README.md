@@ -67,6 +67,15 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Symlink-safe file tools** — `read_file` / `list_files` / `write_file` /
   `edit_file` all refuse symlinked paths, and paths are lexically normalized so
   the path you approve is the path that's used.
+- **Readable replies** — the model's Markdown is rendered, not shown raw:
+  headings, nested bullet / numbered / task lists (indentation kept, wrapped
+  lines hanging under the text), quotes, rules, fenced code with its
+  indentation intact, boxed tables with column alignment (shrunk and wrapped to
+  fit), and inline code, bold, italic, strikethrough and links.
+- **A prompt that shows what's happening** — the composer prompt's marker
+  changes with the agent's activity: `∴` thinking, `»` writing, `$` running a
+  command, `±` editing files, `◉` another tool, `?` waiting on you, then back to
+  the theme's own prompt (ASCII terminals get `~ = $ + * ?`).
 - **Sub-agents** — the `task` tool delegates a self-contained job to a fresh
   agent with its own context and the same tools; only its report comes back.
 - **MCP** — servers from `mcp_servers` in `config.json` and from a project
@@ -335,9 +344,10 @@ cargo test --bins         # unit tests (run on Haiku and on the Mac)
 cargo test -- --ignored   # also runs the live MCP / web tests
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite on Linux;
-Haiku itself is covered by running the suite on the VM, and macOS by running
-it on the Mac.
+GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite and
+clippy (`-D warnings`) on Linux; Haiku itself is covered by running the suite
+on the VM, and macOS by running it on the Mac. Contributor notes (adding a
+tool, the thread model, conventions) are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## Configuration
 

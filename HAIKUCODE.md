@@ -47,6 +47,8 @@ src/
   money.rs            Currency/Balance: keeps the cost and balance readouts in the
                       right units (DeepSeek bills CNY accounts in CNY, prices are USD)
   ui.rs               ratatui full-screen TUI: transcript, composer, status bar
+  ui/markdown.rs      renders the model's Markdown: lists, quotes, code, tables, inline styles
+  ui/activity.rs      the composer prompt's marker, following what the agent is doing
   diff.rs             unified diff for edit/write previews
   askpass.rs          sudo password support: askpass helper + in-TUI masked prompt
   sysinfo.rs          /proc & /sys probes: board model, WiFi SSID, IP, RAM, cores
@@ -155,7 +157,7 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   ignores an `ESC[38;2;…m` and leaves the cell in whatever color came before.
 - Launch banner: rainbow-color HAIKUCODE logo + live status (MEM, WiFi SSID + IP).
 - Themes (`/theme`, numbered picker): `HaikuOS` (default: tab-yellow accent and
-  logo on dark desktop blue, `~> `), `Rainbow` (picoder's original look: Apple-
+  logo on dark desktop blue, `> `), `Rainbow` (picoder's original look: Apple-
   rainbow logo, terminal background; configs saying `Default` get HaikuOS),
   `Apple ][` (green phosphor, `] ▒`),
   `MSDOS` (gray, `C:\>`), `macOS` (dark mode system colors, `~ `),
@@ -322,6 +324,8 @@ Each server is spawned over stdio at launch; its tools appear as
 
 ## CI
 
-`.github/workflows/ci.yml` runs `cargo test` on Linux (hard gate); GitHub has
-no Haiku runners, so run `cargo test --bins` on the VM before shipping. Clippy
-and `cargo fmt --check` run advisory-only until the tree is clean.
+`.github/workflows/ci.yml` runs build, `cargo test` and
+`cargo clippy --all-targets -- -D warnings` on Linux with a pinned Rust version
+(all hard gates); GitHub has no Haiku runners, so run `cargo test --bins` on the
+VM before shipping. `cargo fmt --check` is advisory until the tree is
+formatted. See [`DEVELOPMENT.md`](DEVELOPMENT.md).
