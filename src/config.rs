@@ -185,6 +185,11 @@ pub struct Config {
     /// like the presets. Their keys live in `api_keys` under their name.
     #[serde(default)]
     pub custom_providers: Vec<CustomProvider>,
+    /// User-set price lists, per provider (the cost counter follows the active
+    /// provider). Built-ins fall back to `PRICES`; a custom provider without
+    /// one has no known cost and its readout is hidden.
+    #[serde(default)]
+    pub prices: BTreeMap<String, PriceList>,
     /// Settings blocks haikucode doesn't model as fields (`permissions`, `hooks`)
     /// carried through verbatim so a model/theme rewrite can't drop them.
     #[serde(skip)]
