@@ -141,8 +141,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub auto_commit: bool,
     /// Show the model's full reasoning, tool output and diffs in the
-    /// transcript. Off (the default), each run of work is collapsed into a
-    /// brief summary; Ctrl+T or `/thinking` flips it.
+    /// transcript. Off (the default), thoughts stay as list entries and tool
+    /// activity appears only as a live status; Ctrl+T or `/thinking` flips it.
     #[serde(default)]
     pub show_thinking: bool,
     /// The first status row's segments, in order (`/statusline`). Empty means
@@ -385,10 +385,8 @@ pub fn known_context_window(model: &str) -> u32 {
         } else {
             128_000 // V3 / chat / reasoner
         }
-    } else if m.contains("glm-5") {
-        1_000_000 // GLM-5 / 5.1 / 5.2 all advertise 1M
-    } else if m.contains("glm-4-plus") {
-        1_000_000 // GLM-4-Plus advertises 1M
+    } else if m.contains("glm-5") || m.contains("glm-4-plus") {
+        1_000_000 // GLM-5 / 5.1 / 5.2 / 4-plus all advertise 1M
     } else if m.contains("glm") {
         128_000 // GLM-4-Flash / GLM-4-Air / etc.
     } else if m.contains("claude") {
