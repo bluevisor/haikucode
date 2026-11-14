@@ -282,6 +282,35 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("vercel", "https://ai-gateway.vercel.sh/v1", "anthropic/claude-sonnet-5.5"),
 ];
 
+/// Built-in price lists for the presets: (name, in, out, cached, currency),
+/// per 1M tokens, for each preset's default model. The cost counter follows
+/// the active provider, so each preset carries its own list; a custom
+/// provider without a user-set `prices` entry has no known price here and its
+/// cost readout is hidden.
+pub const PRICES: &[(&str, f64, f64, f64, &str)] = &[
+    ("deepseek", 0.15, 0.60, 0.003, "USD"),
+    ("openai", 0.15, 0.60, 0.075, "USD"),
+    ("anthropic", 15.0, 75.0, 1.50, "USD"),
+    ("groq", 0.59, 0.79, 0.059, "USD"),
+    ("openrouter", 0.15, 0.60, 0.075, "USD"),
+    ("google", 0.30, 2.50, 0.03, "USD"),
+    ("zai", 0.60, 2.20, 0.06, "USD"),
+    ("vercel", 3.00, 15.0, 0.30, "USD"),
+];
+
+/// The built-in price list for a preset name, if it has one.
+pub fn built_in_prices(name: &str) -> Option<PriceList> {
+    PRICES
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(_, i, o, c, cur)| PriceList {
+            price_in: *i,
+            price_out: *o,
+            price_cached_in: Some(*c),
+            price_currency: cur.to_string(),
+        })
+}
+
 /// Env vars that may supply the API key for `provider`, highest priority
 /// first — only the configured provider's key is ever picked up, so a machine
 /// with several providers' keys exported can't hand the wrong one to this
