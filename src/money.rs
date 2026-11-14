@@ -1,8 +1,9 @@
 //! Currency handling for the status line's two money readouts.
 //!
 //! The session cost and the account balance come from unrelated sources and can
-//! be denominated differently. `price_in`/`price_out` are the user's price list
-//! and are quoted in `price_currency` (USD by default, matching the built-in
+//! be denominated differently. `price_in`/`price_out` are the active provider's
+//! price list (per provider, see `config::PRICES` and the `prices` map) and are
+//! quoted in `price_currency` (USD by default, matching the built-in
 //! DeepSeek numbers), while the balance is whatever the provider says the
 //! account is billed in — DeepSeek answers CNY for China-region accounts
 //! (`balance_infos: [{currency: CNY, …}, {currency: USD, total_balance: 0}]`)
