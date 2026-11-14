@@ -1177,11 +1177,18 @@ impl Config {
             }
             ConfigPatch::PriceCurrency(c) => {
                 let c = c.trim().to_ascii_uppercase();
-                self.price_currency = if c.is_empty() {
+                let c = if c.is_empty() {
                     default_price_currency()
                 } else {
                     c
                 };
+                // The currency belongs to the active provider's list: the
+                // user-set one, else the built-in table, else a fresh list
+                // (a custom server whose currency was cycled in /config).
+                let mut list = self.price_list().unwrap_or_default();
+                list.price_currency = c;
+                self.prices.insert(self.provider.clone(), list);
+                self.sync_prices();
             }
         }
     }
