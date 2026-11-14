@@ -1460,13 +1460,13 @@ impl App {
             }
             9 => self.mode = edit_with(self.settings.context_window.to_string()),
             10 => self.mode = edit_with(setting_max_tool_calls(self.settings.max_tool_calls)),
-            // A pick-list, USD first. It names the currency price_in/price_out
-            // are quoted in: switching it relabels the cost, it doesn't convert.
+            // A pick-list, USD first. The currency belongs to the active
+            // provider's price list: cycling it relabels the cost, it doesn't
+            // convert, and it patches that provider's list (not a global one).
             11 => {
                 let code = money::cycle_code(&self.settings.price_currency, dir);
-                self.settings.price_currency = code.clone();
-                self.price_currency = money::Currency::parse(&code);
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::PriceCurrency(code)));
+                self.patch(ConfigPatch::PriceCurrency(code), h);
+                self.sync_prices();
             }
             _ => {}
         }
