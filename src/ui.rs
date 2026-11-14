@@ -156,6 +156,7 @@ pub struct App {
     /// The `/provider` wizard's answers so far, and the line being typed.
     wizard: Option<ProviderDraft>,
     wiz_input: String,
+    wiz_cursor: usize,
     q_reply: Option<std::sync::mpsc::Sender<Option<String>>>,
     follow: bool,
     /// True while the view is pinned above the live end: shows the scroll
@@ -228,7 +229,7 @@ pub struct App {
     disp_cache_tver: u64,
     /// (show_thinking, awaiting approval) the cache was built for.
     disp_cache_view: (bool, bool),
-    /// Full reasoning/tool output/diffs (true) or brief run summaries (false).
+    /// Full reasoning/tool output/diffs (true) or thinking summaries (false).
     show_thinking: bool,
     /// Bumped on every transcript-content or palette change to invalidate
     /// `disp_cache`. (`single_width`/`glyphs` are fixed at construction.)
@@ -403,6 +404,7 @@ impl App {
             q_input: String::new(),
             wizard: None,
             wiz_input: String::new(),
+            wiz_cursor: 0,
             q_reply: None,
             follow: true,
             scrolled_up: false,
@@ -599,14 +601,15 @@ impl App {
         match ev {
             UiEvent::Token(t) => {
                 if !t.is_empty() { self.awaiting_response = false; }
-                self.current_activity = Some("responding…".into());
                 self.tool_running = None;
+                self.current_activity = None;
                 self.live.push_str(&t);
                 self.dirty();
             }
             UiEvent::Reasoning(t) => {
                 if !t.is_empty() { self.awaiting_response = false; }
-                self.current_activity = Some("thinking…".into());
+                self.tool_running = None;
+                self.current_activity = None;
                 self.live_reasoning.push_str(&t);
                 self.dirty();
             }
@@ -629,8 +632,8 @@ impl App {
             UiEvent::ToolStart { name, summary } => {
                 self.awaiting_response = false;
                 self.tool_running = Some(name.clone());
+                self.current_activity = Some(brief::action(&name, &summary));
                 self.flush_live();
-                self.current_activity = Some(format!("{name} {summary}"));
                 self.push(Kind::Tool, format!("{name} {summary}"));
             }
             UiEvent::Diff(d) => {
@@ -650,8 +653,8 @@ impl App {
                 self.after_push();
             }
             UiEvent::ToolResult { ok, preview } => {
-                self.current_activity = None;
                 self.tool_running = None;
+                self.current_activity = None;
                 self.flush_live();
                 if preview.is_empty() {
                     return;
@@ -793,6 +796,7 @@ impl App {
             }
             UiEvent::TurnDone => {
                 self.awaiting_response = false;
+                self.tool_running = None;
                 self.current_activity = None;
                 self.flush_live();
                 // Keep an open picker alive: the worker sends TurnDone right
@@ -845,7 +849,12 @@ impl App {
         match &mut self.mode {
             Mode::Password { .. } => self.pw_input.extend(one_line()),
             Mode::Question { .. } => self.q_input.extend(one_line()),
-            Mode::ProviderInput { .. } => self.wiz_input.extend(one_line()),
+            Mode::ProviderInput { .. } => {
+                let pos = self.wiz_input.char_indices().nth(self.wiz_cursor).map_or(self.wiz_input.len(), |(i, _)| i);
+                let pasted: String = one_line().collect();
+                self.wiz_input.insert_str(pos, &pasted);
+                self.wiz_cursor += pasted.chars().count();
+            }
             Mode::Select => {
                 if let Some(p) = self.picker.as_mut() {
                     p.filter.extend(one_line());
@@ -1554,6 +1563,12 @@ impl App {
         // `Up` too, so plain arrow keys fell through to `_ => {}` and did
         // nothing. Bare j/k stay filter input (the list is type-to-filter).
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('e') && matches!(picker.action, PickAction::Provider) {
+            let name = picker.filtered().get(picker.cursor)
+                .and_then(|&i| picker.items[i].split_whitespace().next()).unwrap_or("").to_string();
+            self.edit_provider(&name);
+            return;
+        }
         if let Some(delta) = picker_step_for_key(&key) {
             picker.step(delta);
             return;
@@ -3033,6 +3048,7 @@ impl App {
 
     /// The label the `/provider` picker shows for adding a provider.
     const ADD_PROVIDER: &'static str = "+ Add a custom provider (any OpenAI-compatible URL)";
+    const WIZARD_CONTROLS: &'static str = "Enter next/save · Shift+Tab back · Esc cancel · Ctrl+U clear";
 
     /// `/provider` with no argument: an arrow-key list of every provider,
     /// then "+ Add" at the bottom.
@@ -3043,7 +3059,9 @@ impl App {
             .iter()
             .map(|(name, base, model)| {
                 let custom = if crate::config::is_builtin_provider(name) { "" } else { " (custom)" };
-                let key = if self.settings.has_key_for(name) { "" } else { " · no key yet" };
+                let key = if self.settings.has_key_for(name) { "" }
+                    else if crate::config::is_builtin_provider(name) { " · no key yet" }
+                    else { " · no saved key" };
                 let model = if model.is_empty() { "no model yet" } else { model.as_str() };
                 format!("{name:<width$}  {base} · {model}{custom}{key}")
             })
@@ -3051,7 +3069,7 @@ impl App {
         items.push(Self::ADD_PROVIDER.to_string());
         let current = choices.iter().position(|(n, _, _)| *n == self.settings.provider);
         let mut picker = Picker {
-            title: "Pick a provider".into(),
+            title: "Pick a provider · Ctrl+E edits a custom server".into(),
             items,
             current,
             filter: String::new(),
@@ -3077,7 +3095,7 @@ impl App {
         let Some((p, b, m)) = self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) else {
             return;
         };
-        if self.settings.has_key_for(&p) {
+        if self.settings.has_key_for(&p) || !crate::config::is_builtin_provider(&p) {
             self.switch_provider(p, b, m, h);
             self.pick_model(h);
         } else {
@@ -3093,13 +3111,58 @@ impl App {
     }
 
     fn ask(&mut self, step: ProviderStep) {
-        self.wiz_input.clear();
+        self.wiz_input = self.wizard.as_ref().map(|d| match step {
+            ProviderStep::Name => d.name.clone(),
+            ProviderStep::BaseUrl => d.base_url.clone(),
+            // Never prefill a saved secret, even in a masked field.
+            ProviderStep::ApiKey => if d.clear_key { "-".into() } else { d.api_key.clone() },
+            ProviderStep::Model => d.model.clone(),
+        }).unwrap_or_default();
+        self.wiz_cursor = self.wiz_input.chars().count();
         self.mode = Mode::ProviderInput { step };
+    }
+
+    fn edit_provider(&mut self, name: &str) {
+        let Some(c) = self.settings.custom_provider(name).cloned() else {
+            self.push(Kind::ErrorK, format!("'{name}' is not a custom provider · /provider lists your servers"));
+            return;
+        };
+        self.picker = None;
+        self.wizard = Some(ProviderDraft {
+            adding: true, editing: true, name: c.name, base_url: c.base_url, model: c.model,
+            ..Default::default()
+        });
+        self.ask(ProviderStep::BaseUrl);
+    }
+
+    fn wizard_back(&mut self, step: ProviderStep) {
+        let Some(d) = self.wizard.as_mut() else { return };
+        if !d.adding { return; }
+        let previous = match step {
+            ProviderStep::Name => return,
+            ProviderStep::BaseUrl if d.editing => return,
+            ProviderStep::BaseUrl => ProviderStep::Name,
+            ProviderStep::ApiKey => ProviderStep::BaseUrl,
+            ProviderStep::Model => ProviderStep::ApiKey,
+        };
+        // Keep unfinished text so going forward restores it, including new keys.
+        match step {
+            ProviderStep::Name => d.name = self.wiz_input.clone(),
+            ProviderStep::BaseUrl => d.base_url = self.wiz_input.clone(),
+            ProviderStep::ApiKey => {
+                d.clear_key = self.wiz_input.trim() == "-";
+                d.api_key = if d.clear_key { String::new() } else { self.wiz_input.trim().into() };
+            }
+            ProviderStep::Model => d.model = self.wiz_input.clone(),
+        }
+        d.error = None;
+        self.ask(previous);
     }
 
     fn cancel_wizard(&mut self) {
         self.wizard = None;
         self.wiz_input.clear();
+        self.wiz_cursor = 0;
         self.mode = Mode::Idle;
         self.push(Kind::Notice, String::from("provider setup cancelled"));
     }
@@ -3113,7 +3176,9 @@ impl App {
             ProviderStep::ApiKey => (3, 4),
             ProviderStep::Model => (4, 4),
         };
-        let lead = if d.adding { format!("Add provider · step {n} of {total} · ") } else { format!("{} · ", d.name) };
+        let lead = if d.editing {
+            format!("Edit {} · step {} of 3 · ", d.name, n - 1)
+        } else if d.adding { format!("Add provider · step {n} of {total} · ") } else { format!("{} · ", d.name) };
         match step {
             ProviderStep::Name => (
                 format!("{lead}Name"),
@@ -3121,19 +3186,23 @@ impl App {
             ),
             ProviderStep::BaseUrl => (
                 format!("{lead}Base URL"),
-                "the OpenAI-compatible endpoint, e.g. https://gateway.example/v1".into(),
+                "API base URL, e.g. http://localhost:1234/v1 · not /chat/completions".into(),
             ),
             ProviderStep::ApiKey => (
                 format!("{lead}API key"),
-                if d.adding {
-                    "hidden as you type; paste works · Enter with nothing skips (servers without keys)".into()
+                if self.settings.custom_provider(&d.name).is_some_and(|c| c.base_url != d.base_url) {
+                    "address changed · paste a key, or Enter to use no saved key".into()
+                } else if self.settings.has_key_for(&d.name) {
+                    "hidden · Enter keeps key · paste replaces · '-' clears saved key".into()
+                } else if d.adding {
+                    "optional · hidden; paste works · Enter skips for a local server".into()
                 } else {
                     format!("{} has no key saved · hidden as you type; paste works", d.name)
                 },
             ),
             ProviderStep::Model => (
                 format!("{lead}Model"),
-                "the model id · Enter with nothing picks from the server's list".into(),
+                "model ID · Enter keeps it · clear with Ctrl+U to browse server models".into(),
             ),
         }
     }
@@ -3142,15 +3211,33 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.cancel_wizard(),
+            KeyCode::BackTab => self.wizard_back(step),
             KeyCode::Enter => {
                 let val = self.wiz_input.trim().to_string();
                 self.wizard_answer(step, val, h);
             }
             KeyCode::Backspace => {
-                self.wiz_input.pop();
+                if self.wiz_cursor > 0 {
+                    self.wiz_cursor -= 1;
+                    let pos = self.wiz_input.char_indices().nth(self.wiz_cursor).map(|(i, _)| i).unwrap();
+                    self.wiz_input.remove(pos);
+                }
             }
-            KeyCode::Char('u') if ctrl => self.wiz_input.clear(),
-            KeyCode::Char(c) if !ctrl => self.wiz_input.push(caps_char(&key, c)),
+            KeyCode::Delete => {
+                if let Some((pos, _)) = self.wiz_input.char_indices().nth(self.wiz_cursor) {
+                    self.wiz_input.remove(pos);
+                }
+            }
+            KeyCode::Left => self.wiz_cursor = self.wiz_cursor.saturating_sub(1),
+            KeyCode::Right => self.wiz_cursor = (self.wiz_cursor + 1).min(self.wiz_input.chars().count()),
+            KeyCode::Home => self.wiz_cursor = 0,
+            KeyCode::End => self.wiz_cursor = self.wiz_input.chars().count(),
+            KeyCode::Char('u') if ctrl => { self.wiz_input.clear(); self.wiz_cursor = 0; }
+            KeyCode::Char(c) if !ctrl => {
+                let pos = self.wiz_input.char_indices().nth(self.wiz_cursor).map_or(self.wiz_input.len(), |(i, _)| i);
+                self.wiz_input.insert(pos, caps_char(&key, c));
+                self.wiz_cursor += 1;
+            }
             _ => {}
         }
     }
@@ -3166,11 +3253,13 @@ impl App {
         let next = match step {
             ProviderStep::Name => match valid_custom_name(&val) {
                 Ok(()) => {
+                    let changed = d.name != val;
                     d.name = val;
                     // Re-adding a saved one starts from its address and model.
-                    if let Some(c) = self.settings.custom_provider(&d.name) {
+                    if let Some(c) = self.settings.custom_provider(&d.name).filter(|_| changed) {
                         d.base_url = c.base_url.clone();
                         d.model = c.model.clone();
+                        d.editing = true;
                     }
                     Some(ProviderStep::BaseUrl)
                 }
@@ -3181,16 +3270,21 @@ impl App {
             },
             ProviderStep::BaseUrl => {
                 let val = if val.is_empty() { d.base_url.clone() } else { val };
-                if val.starts_with("http://") || val.starts_with("https://") {
-                    d.base_url = val.trim_end_matches('/').to_string();
-                    Some(ProviderStep::ApiKey)
-                } else {
-                    d.error = Some("the URL must start with http:// or https://".into());
-                    Some(ProviderStep::BaseUrl)
+                match crate::config::normalize_provider_url(&val) {
+                    Ok(url) => {
+                        d.base_url = url;
+                        Some(ProviderStep::ApiKey)
+                    }
+                    Err(e) => {
+                        d.error = Some(e);
+                        Some(ProviderStep::BaseUrl)
+                    }
                 }
             }
             ProviderStep::ApiKey => {
-                d.api_key = val;
+                d.clear_key = val == "-" || (val.is_empty()
+                    && self.settings.custom_provider(&d.name).is_some_and(|c| c.base_url != d.base_url));
+                d.api_key = if d.clear_key { String::new() } else { val };
                 if d.adding {
                     Some(ProviderStep::Model)
                 } else {
@@ -3243,9 +3337,14 @@ impl App {
                 format!("{} provider {}: {}", if updated { "updated" } else { "added" }, d.name, d.base_url),
             );
         }
-        if !d.api_key.is_empty() {
+        if !d.api_key.is_empty() || d.clear_key {
             self.patch(ConfigPatch::ProviderKey { provider: d.name.clone(), key: d.api_key.clone() }, h);
-            self.push(Kind::Notice, format!("API key saved for {}", d.name));
+            self.push(Kind::Notice, format!("API key {} for {}", if d.clear_key { "cleared" } else { "saved" }, d.name));
+        }
+        if d.editing && self.settings.provider != d.name && !d.model.is_empty() {
+            self.mode = Mode::Idle;
+            self.push(Kind::Notice, format!("saved · /provider {} switches to this server", d.name));
+            return;
         }
         self.switch_provider(d.name.clone(), d.base_url.clone(), d.model.clone(), h);
         if d.model.is_empty() || !d.adding {
@@ -3261,6 +3360,7 @@ impl App {
         self.settings.provider = provider.clone();
         self.settings.base_url = base_url.clone();
         self.settings.model = model.clone();
+        self.model_info = model.clone();
         self.settings.resolve_key();
         self.sync_prices(); // the cost counter follows the provider
         let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider { provider, base_url, model }));
@@ -3296,6 +3396,12 @@ impl App {
         let words: Vec<&str> = arg.unwrap_or("").split_whitespace().collect();
         match words.as_slice() {
             [] => self.open_provider_picker(),
+            ["add"] => {
+                self.wizard = Some(ProviderDraft { adding: true, ..Default::default() });
+                self.ask(ProviderStep::Name);
+            }
+            ["edit"] => self.edit_provider(&self.settings.provider.clone()),
+            ["edit", name] => self.edit_provider(name),
             ["list"] => {
                 self.push(Kind::Notice, String::from("providers (● active):"));
                 for (name, base, model) in self.settings.provider_choices() {
@@ -3316,18 +3422,23 @@ impl App {
                     self.push(Kind::ErrorK, e);
                     return;
                 }
-                if !(base.starts_with("http://") || base.starts_with("https://")) {
-                    self.push(Kind::ErrorK, format!("'{base}': the base URL must start with http:// or https://"));
-                    return;
-                }
+                let base = match crate::config::normalize_provider_url(base) {
+                    Ok(base) => base,
+                    Err(e) => { self.push(Kind::ErrorK, e); return; }
+                };
                 let cp = CustomProvider {
                     name: name.to_string(),
-                    base_url: base.trim_end_matches('/').to_string(),
+                    base_url: base,
                     model: model.to_string(),
                 };
                 let (p, b, m) = (cp.name.clone(), cp.base_url.clone(), cp.model.clone());
                 let updated = self.settings.custom_provider(name).is_some();
+                let changed_address = self.settings.custom_provider(name).is_some_and(|c| c.base_url != cp.base_url);
                 self.patch(ConfigPatch::AddProvider(cp), h);
+                if changed_address {
+                    self.patch(ConfigPatch::ProviderKey { provider: p.clone(), key: String::new() }, h);
+                    self.push(Kind::Notice, "address changed · saved key cleared; /provider edit to enter a key".to_string());
+                }
                 self.push(
                     Kind::Notice,
                     format!("{} provider {p}: {b} · {m}", if updated { "updated" } else { "added" }),
@@ -3468,7 +3579,7 @@ impl App {
         self.show_thinking = !self.show_thinking;
         self.settings.show_thinking = self.show_thinking;
         Config::persist_show_thinking(self.show_thinking);
-        let what = if self.show_thinking { "full thinking and tool output" } else { "thoughts and live status (ctrl+t for details)" };
+        let what = if self.show_thinking { "full thinking and tool output" } else { "thinking summaries and live activity (ctrl+t for details)" };
         self.push(Kind::Notice, format!("showing {what}"));
     }
 
@@ -3541,20 +3652,41 @@ impl App {
         }
     }
 
-    fn working_timer(&self) -> String {
-        match self.busy_since {
+    fn working_status(&self, width: usize) -> String {
+        let elapsed = match self.busy_since {
             Some(t) => {
                 let secs = t.elapsed().as_secs();
                 if secs < 60 {
-                    format!("working ({secs}s)… ")
+                    format!(" ({secs}s)")
                 } else {
                     let m = secs / 60;
                     let s = secs % 60;
-                    format!("working ({m}:{s:02})… ")
+                    format!(" ({m}:{s:02})")
                 }
             }
-            None => "working... ".to_string(),
-        }
+            None => String::new(),
+        };
+        let elapsed = if self.str_w(&elapsed) < width { elapsed } else { String::new() };
+        let action = self.current_activity.as_deref().unwrap_or({
+            if self.live.is_empty() { "Thinking…" } else { "Writing response…" }
+        });
+        let action = helpers::clean_text(action, self.single_width);
+        let action = action.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hint = if width >= 70 { " · Esc to interrupt · Enter queues" } else { "" };
+        let room = width.saturating_sub(self.str_w(&elapsed) + self.str_w(hint));
+        let action = if room == 0 {
+            String::new()
+        } else if self.str_w(&action) > room {
+            let mut used = 0;
+            let clipped: String = action.chars().take_while(|&c| {
+                used += self.cell_w(c);
+                used <= room.saturating_sub(1)
+            }).collect();
+            format!("{clipped}…")
+        } else {
+            action
+        };
+        format!("{action}{elapsed}{hint}")
     }
 
     fn border_type(&self) -> BorderType {
@@ -3738,7 +3870,14 @@ impl App {
                 n.clamp(1, PICKER_VISIBLE) as u16 + 1
             }
             Mode::Password { .. } => 2,
-            Mode::ProviderInput { .. } => 3,
+            Mode::ProviderInput { step } => {
+                let (title, hint) = self.wizard_prompt(*step);
+                let hint = self.wizard.as_ref().and_then(|d| d.error.as_deref()).unwrap_or(&hint);
+                let w = width.saturating_sub(2).max(1) as usize;
+                [title.as_str(), hint, Self::WIZARD_CONTROLS].iter()
+                    .map(|text| helpers::question_lines(text, w, self.single_width).len() as u16)
+                    .sum::<u16>() + 1
+            }
             Mode::Question { prompt } => {
                 let rows = helpers::question_lines(
                     prompt,
@@ -3900,20 +4039,10 @@ impl App {
         match &self.mode {
             Mode::Idle => self.render_composer(f, area),
             Mode::Busy => {
-                // The activity text shares its line with the spinner and this
-                // hint, so clip it to the room left: spinner glyph + space,
-                // the activity's own trailing space, and the hint.
-                const BUSY_HINT: &str = "(Esc to interrupt · Enter queues)";
-                let reserved = 3 + BUSY_HINT.chars().count();
+                // The status clips the action to leave room for its timer and controls.
                 let mut lines = vec![Line::from(vec![
                     Span::styled(format!("{} ", self.spin_frame()), Style::default().fg(self.palette.accent)),
-                    Span::styled(
-                        self.current_activity.as_deref().map(|s| {
-                            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-                            format!("{} ", brief::clip(&s, (area.width as usize).saturating_sub(reserved)))
-                        }).unwrap_or_else(|| self.working_timer()),
-                        Style::default().fg(self.dim_text())),
-                    Span::styled(BUSY_HINT, Style::default().fg(self.dim_text())),
+                    Span::styled(self.working_status(area.width.saturating_sub(2) as usize), Style::default().fg(self.dim_text())),
                 ])];
                 let mark = if self.ascii { "->" } else { "↳" };
                 for q in &self.queued {
@@ -4109,19 +4238,36 @@ impl App {
                 } else {
                     self.wiz_input.clone()
                 };
-                let hint_line = match error {
-                    Some(e) => Span::styled(e, Style::default().fg(Color::Red)),
-                    None => Span::styled(hint, Style::default().fg(self.dim_text())),
-                };
-                let lines = vec![
-                    Line::from(vec![Span::styled(title, Style::default().fg(self.palette.accent))]),
-                    Line::from(vec![hint_line]),
-                    Line::from(vec![
+                // Keep the insertion point visible when editing a long URL in
+                // a narrow terminal. Mask secrets before calculating the view.
+                let available = area.width.saturating_sub(3).max(1) as usize;
+                let mut start = self.wiz_cursor;
+                let mut used = 0;
+                for c in shown.chars().take(self.wiz_cursor).collect::<Vec<_>>().into_iter().rev() {
+                    let width = if self.single_width { 1 } else { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) };
+                    if used + width >= available { break; }
+                    used += width;
+                    start -= 1;
+                }
+                let before: String = shown.chars().skip(start).take(self.wiz_cursor - start).collect();
+                let cursor_char = shown.chars().nth(self.wiz_cursor).unwrap_or(' ').to_string();
+                let after: String = shown.chars().skip(self.wiz_cursor + 1).collect();
+                let w = area.width.max(1) as usize;
+                let mut lines: Vec<Line> = helpers::question_lines(&title, w, self.single_width).into_iter()
+                    .map(|s| Line::from(Span::styled(s, Style::default().fg(self.palette.accent)))).collect();
+                let hint_color = if error.is_some() { Color::Red } else { self.dim_text() };
+                for s in helpers::question_lines(error.as_deref().unwrap_or(&hint), w, self.single_width) {
+                    lines.push(Line::from(Span::styled(s, Style::default().fg(hint_color))));
+                }
+                lines.push(Line::from(vec![
                         Span::styled("› ", Style::default().fg(Color::Yellow)),
-                        Span::styled(shown, Style::default().fg(self.palette.accent)),
-                        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
-                    ]),
-                ];
+                        Span::styled(before, Style::default().fg(self.palette.accent)),
+                        Span::styled(cursor_char, Style::default().fg(self.palette.accent).add_modifier(Modifier::REVERSED)),
+                        Span::styled(after, Style::default().fg(self.palette.accent)),
+                    ]));
+                for s in helpers::question_lines(Self::WIZARD_CONTROLS, w, self.single_width) {
+                    lines.push(Line::from(Span::styled(s, Style::default().fg(self.dim_text()))));
+                }
                 f.render_widget(Paragraph::new(lines), area);
             }
             Mode::Password { prompt } => {
@@ -4431,7 +4577,7 @@ mod tests {
     use super::palette::palette_by_name;
     use super::{
         echo_excerpt, palette_for, want_mouse_capture, App, ConfigPatch, Handles, KeyCode, KeyEvent,
-        KeyModifiers, Mode, MouseAction, MouseButton, MouseEventKind, SelectKind, ECHO_LINES,
+        KeyModifiers, Mode, ProviderDraft, ProviderStep, MouseAction, MouseButton, MouseEventKind, SelectKind, ECHO_LINES,
         TAB_W, THEMES, UiConfig, UiEvent, WorkerCmd,
     };
 
@@ -4567,7 +4713,7 @@ mod tests {
         }
     }
 
-    /// Brief mode folds thinking + tool output into summary rows, keeps the
+    /// Brief mode keeps thinking summaries, hides completed tool activity, keeps the
     /// diff of a change awaiting approval visible, and Ctrl+T's flag brings the
     /// full output back.
     #[test]
@@ -4589,14 +4735,15 @@ mod tests {
         app.mode = Mode::Approval("edit src/ui.rs".into());
         let screen = draw(&mut app, &mut term);
         assert!(screen.contains("Check the config loader first."), "{screen}");
-        assert!(!screen.contains("explored") && !screen.contains("considered"), "{screen}");
+        assert!(!screen.contains("considered") && !screen.contains("explored"), "{screen}");
+        assert!(!screen.contains("read 1 file"), "{screen}");
         assert!(!screen.contains("SECRET_TOOL_OUTPUT"), "{screen}");
         assert!(screen.contains("added_line"), "pending edit's diff stays visible:\n{screen}");
 
         app.mode = Mode::Idle;
         app.push(Kind::ToolResult, "OK".to_string());
         let screen = draw(&mut app, &mut term);
-        assert!(!screen.contains("changed") && !screen.contains("read_file"), "{screen}");
+        assert!(!screen.contains("changed") && !screen.contains("src/ui.rs"), "{screen}");
         assert!(!screen.contains("added_line"), "{screen}");
 
         app.show_thinking = true;
@@ -4605,8 +4752,8 @@ mod tests {
     }
 
     /// Committing live thinking (and the answer streaming after it) must not
-    /// move anything: the brief thought stays on
-    /// the same screen line, and the answer keeps its line too.
+    /// move anything: the brief summary keeps the same text and screen line,
+    /// and the answer keeps its line too.
     #[test]
     fn committing_live_thinking_does_not_shift_the_screen() {
         use crate::ui::types::Kind;
@@ -4681,10 +4828,10 @@ mod tests {
         app.handle_event(UiEvent::Reasoning("Check the renderer first.".into()), &h);
         app.handle_event(UiEvent::ToolStart { name: "read_file".into(), summary: "src/ui.rs".into() }, &h);
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("Check the renderer first.") && screen.contains("read_file src/ui.rs"), "{screen}");
+        assert!(screen.contains("Check the renderer first.") && screen.contains("Reading src/ui.rs"), "{screen}");
         app.handle_event(UiEvent::Progress("Checking layout".into()), &h);
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("Checking layout") && !screen.contains("read_file src/ui.rs"), "{screen}");
+        assert!(screen.contains("Checking layout") && !screen.contains("Reading src/ui.rs"), "{screen}");
         app.handle_event(UiEvent::ToolResult { ok: true, preview: "ok".into() }, &h);
         let screen = draw(&mut app, &mut term);
         assert!(!screen.contains("Checking layout"), "{screen}");
@@ -4696,6 +4843,60 @@ mod tests {
         app.show_thinking = true;
         let screen = draw(&mut app, &mut term);
         assert!(screen.contains("read_file src/ui.rs") && screen.contains("bash cargo test"), "{screen}");
+    }
+
+    #[test]
+    fn brief_activity_updates_in_place_and_disappears_after_the_turn() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.transcript.clear();
+        app.show_thinking = false;
+        let (h, _rx) = test_handles();
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        app.set_busy();
+        app.handle_event(UiEvent::Reasoning("Check the configuration. Then test it.".into()), &h);
+        app.handle_event(UiEvent::ToolStart { name: "read_file".into(), summary: "src/config.rs".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the configuration.") && screen.contains("Reading src/config.rs"), "{screen}");
+        assert!(!screen.contains("considered") && !screen.contains("explored"), "{screen}");
+
+        app.handle_event(UiEvent::ToolResult { ok: true, preview: "PRIVATE_TOOL_OUTPUT".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("src/config.rs") && !screen.contains("PRIVATE_TOOL_OUTPUT"), "{screen}");
+        assert!(screen.contains("Thinking"), "{screen}");
+
+        app.handle_event(UiEvent::Progress("running 3 read-only calls in parallel…".into()), &h);
+        assert!(draw(&mut app, &mut term).contains("running 3 read-only calls"));
+        app.handle_event(UiEvent::Token("Done.".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("running 3 read-only calls") && screen.contains("Writing response"), "{screen}");
+
+        app.handle_event(UiEvent::ToolStart { name: "edit_file".into(), summary: "src/ui.rs".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Editing src/ui.rs") && !screen.contains("Reading src/config.rs"), "{screen}");
+        // Finishing (including an interrupted tool) clears the live action.
+        app.handle_event(UiEvent::TurnDone, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the configuration.") && screen.contains("Done."), "{screen}");
+        assert!(!screen.contains("Editing") && !screen.contains("src/ui.rs"), "{screen}");
+
+        app.show_thinking = true;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("PRIVATE_TOOL_OUTPUT") && screen.contains("Then test it."), "{screen}");
+    }
+
+    #[test]
+    fn current_activity_is_sanitized_and_fits_the_status_line() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.set_busy();
+        app.current_activity = Some(format!("Running \x1b[31mred\x1b[0m\n{}", "文件".repeat(60)));
+        for width in [0, 1, 4, 25, 60, 80, 120] {
+            let status = app.working_status(width);
+            assert!(!status.contains('\x1b') && !status.contains('\n'), "{status:?}");
+            assert!(app.str_w(&status) <= width, "{width}: {status}");
+        }
     }
 
     /// A tool result with newlines keeps its line structure. The transcript used
@@ -4877,6 +5078,152 @@ mod tests {
         assert!(app.settings.custom_provider("box").is_none());
         run(&mut app, "/provider box");
         assert!(app.transcript.iter().any(|l| l.kind == crate::ui::types::Kind::ErrorK && l.text.contains("unknown provider")));
+    }
+
+    #[test]
+    fn editing_a_server_prefills_values_and_keeps_the_key_and_active_provider() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.settings.custom_providers.push(crate::config::CustomProvider {
+            name: "local".into(), base_url: "http://localhost:1234/v1".into(), model: "saved-model".into(),
+        });
+        app.settings.api_keys.insert("local".into(), "saved-secret".into());
+        let active = app.settings.provider.clone();
+        app.provider_command(Some("edit local"), &h);
+        assert_eq!(app.wiz_input, "http://localhost:1234/v1");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert!(app.wiz_input.is_empty(), "a saved key is never prefilled");
+        assert!(app.wizard_prompt(ProviderStep::ApiKey).1.contains("Enter keeps key"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(app.wiz_input, "saved-model");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(app.settings.api_keys["local"], "saved-secret");
+        assert_eq!(app.settings.provider, active);
+        let sent: Vec<_> = rx.try_iter().collect();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(&sent[0], WorkerCmd::Patch(ConfigPatch::AddProvider(c)) if c.model == "saved-model"));
+    }
+
+    #[test]
+    fn server_edits_can_go_back_and_cancel_without_saving() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.provider_command(Some("add"), &h);
+        app.on_paste("local".into());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        app.on_paste("http://localhost:1234/v1".into());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        app.on_paste("unsaved-secret".into());
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &h);
+        assert_eq!(app.wiz_input, "http://localhost:1234/v1");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(app.wiz_input, "unsaved-secret");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("unsaved-secret"));
+        assert!(screen.contains("Shift+Tab back"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
+        assert!(rx.try_iter().next().is_none());
+        assert!(app.wizard.is_none());
+        assert!(app.wiz_input.is_empty());
+        assert!(app.settings.custom_provider("local").is_none());
+    }
+
+    #[test]
+    fn editing_server_addresses_never_reuses_a_saved_key_by_default() {
+        for (input_key, expected) in [("", ""), ("-", ""), ("replacement", "replacement")] {
+            let mut app = App::new(test_ui_config(), Vec::new());
+            let (h, rx) = test_handles();
+            let cp = crate::config::CustomProvider {
+                name: "local".into(), base_url: "http://localhost:1234/v1".into(), model: "m".into(),
+            };
+            app.settings.custom_providers.push(cp);
+            app.settings.api_keys.insert("local".into(), "old-secret".into());
+            app.provider_command(Some("edit local"), &h);
+            app.wizard_answer(ProviderStep::BaseUrl, "https://new.example/v1".into(), &h);
+            assert!(app.wizard_prompt(ProviderStep::ApiKey).1.contains("address changed"));
+            app.wizard_answer(ProviderStep::ApiKey, input_key.into(), &h);
+            app.wizard_answer(ProviderStep::Model, "m".into(), &h);
+            assert_eq!(app.settings.api_keys["local"], expected);
+            assert!(rx.try_iter().any(|cmd| matches!(cmd,
+                WorkerCmd::Patch(ConfigPatch::ProviderKey { key, .. }) if key == expected)));
+        }
+    }
+
+    #[test]
+    fn wizard_supports_in_place_unicode_edits_and_paste() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.wizard = Some(ProviderDraft { adding: true, model: "ab語cd".into(), ..Default::default() });
+        app.ask(ProviderStep::Model);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &h);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &h);
+        app.on_paste("X".into());
+        assert_eq!(app.wiz_input, "aXb語cd");
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &h);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &h);
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &h);
+        assert_eq!(app.wiz_input, "aXcd");
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &h);
+        app.on_paste("Z".into());
+        assert_eq!(app.wiz_input, "aXcdZ");
+    }
+
+    #[test]
+    fn custom_servers_without_keys_switch_without_an_unnecessary_key_prompt() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.settings.custom_providers.push(crate::config::CustomProvider {
+            name: "local".into(), base_url: "http://localhost:1234/v1".into(), model: "m".into(),
+        });
+        app.open_provider_picker();
+        let p = app.picker.as_mut().unwrap();
+        p.cursor = p.items.iter().position(|i| i.starts_with("local ")).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &h);
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::BaseUrl }));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
+        app.provider_picked("local", &h);
+        assert_eq!(app.settings.provider, "local");
+        assert!(app.wizard.is_none());
+        assert!(rx.try_iter().any(|cmd| matches!(cmd, WorkerCmd::ListModels)));
+    }
+
+    #[test]
+    fn wizard_hints_and_the_cursor_remain_visible_in_narrow_terminals() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.wizard = Some(ProviderDraft { adding: true, base_url: format!("https://gateway.example/{}/v1", "long-path/".repeat(8)), ..Default::default() });
+        app.ask(ProviderStep::BaseUrl);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(46, 20)).unwrap();
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("localhost:1234/v1"), "{screen}");
+        assert!(screen.contains("Shift+Tab back"), "{screen}");
+        assert!(screen.contains("Ctrl+U clear"), "{screen}");
+        let buf = term.backend().buffer();
+        assert!(buf.content().iter().any(|c| c.modifier.contains(ratatui::style::Modifier::REVERSED)), "cursor must remain visible: {screen}");
+    }
+
+    #[test]
+    fn clearing_a_saved_key_and_editing_the_active_server_updates_live_settings() {
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        let cp = crate::config::CustomProvider { name: "local".into(), base_url: "http://localhost:1234/v1".into(), model: "old-model".into() };
+        app.settings.custom_providers.push(cp.clone());
+        app.settings.provider = cp.name;
+        app.settings.base_url = cp.base_url;
+        app.settings.model = cp.model;
+        app.settings.api_keys.insert("local".into(), "old-secret".into());
+        app.provider_command(Some("edit"), &h);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        app.on_paste("-".into());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &h);
+        app.on_paste("new-model".into());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(app.settings.provider, "local");
+        assert_eq!(app.settings.api_key, "");
+        assert_eq!(app.settings.model, "new-model");
+        assert_eq!(app.model_info, "new-model");
+        assert!(rx.try_iter().any(|c| matches!(c, WorkerCmd::Patch(ConfigPatch::Provider { provider, model, .. }) if provider == "local" && model == "new-model")));
     }
 
     #[test]

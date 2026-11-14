@@ -262,6 +262,28 @@ pub fn valid_custom_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate API base addresses before saving or attaching credentials.
+pub fn normalize_provider_url(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err("The URL must start with http:// or https:// and include a host".into());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| "Enter a full API base URL, e.g. http://localhost:1234/v1".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("The URL must start with http:// or https:// and include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Put credentials in the API key field, not in the URL".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() || value.chars().any(char::is_whitespace) {
+        return Err("Use an API base URL without spaces, query parameters or a fragment".into());
+    }
+    if ["/chat/completions", "/models", "/responses"].iter().any(|suffix| parsed.path().ends_with(suffix)) {
+        return Err("Use the API base URL (e.g. https://server.example/v1), without /chat/completions, /models or /responses".into());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1250,6 +1272,18 @@ impl Config {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn server_addresses_reject_mistakes_before_saving_credentials() {
+        for valid in ["http://localhost:1234/v1", "http://127.0.0.1:11434/v1", "https://gateway.example/api/v1", "http://[::1]:8080/v1"] {
+            assert_eq!(super::normalize_provider_url(&format!(" {valid}/ ")).unwrap(), valid);
+        }
+        for invalid in ["", "localhost:1234", "https://", "https:host/v1", "http:/host/v1", "ftp://host/v1", "https://host:bad/v1",
+            "https://host/v1 with space", "https://host/v1?key=secret", "https://host/v1#fragment",
+            "https://user:secret@host/v1", "https://host/v1/chat/completions", "https://host/v1/models/"] {
+            assert!(super::normalize_provider_url(invalid).is_err(), "{invalid}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1715,11 +1749,10 @@ pub fn run_setup() -> Result<Config> {
         };
         let b = loop {
             let b = prompt("base_url (OpenAI-compatible): ")?;
-            let b = b.trim().to_string();
-            if b.starts_with("http") {
-                break b;
+            match normalize_provider_url(&b) {
+                Ok(b) => break b,
+                Err(e) => println!("\x1b[31m  {e}\x1b[0m"),
             }
-            println!("\x1b[31m  URL must start with http\x1b[0m");
         };
         let m = loop {
             let m = prompt("model: ")?;

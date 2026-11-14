@@ -57,6 +57,25 @@ pub fn summarize(run: &[TLine]) -> Vec<(&'static str, String)> {
     }).collect()
 }
 
+/// A running tool's action, replaced in place as work progresses.
+pub fn action(name: &str, summary: &str) -> String {
+    let verb = match name {
+        "read_file" => "Reading",
+        "grep" | "glob" | "web_search" | "recall" => "Searching",
+        "list_files" => "Listing",
+        "web_fetch" => "Fetching",
+        "write_file" => "Writing",
+        "edit_file" | "multi_edit" => "Editing",
+        "bash" | "bash_bg" => "Running",
+        _ => {
+            return format!("Running {name} {}", summary.trim())
+                .trim_end()
+                .to_string()
+        }
+    };
+    format!("{verb} {}", summary.trim()).trim_end().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

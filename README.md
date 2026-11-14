@@ -92,6 +92,10 @@ memory, sessions, skills) into `~/.config/haikucode`.
   an empty paste for an image-only clipboard; Haiku Terminal and Terminal.app
   send nothing, so use Ctrl+V there. Image files dragged into the terminal
   attach instead of pasting as bare paths.
+- **Brief thinking view** — concise thinking summaries stay in the transcript;
+  the current action (reading, searching, editing, or running a command) updates
+  in one live line above the prompt and disappears when the turn finishes.
+  Ctrl+T or `/thinking full` reveals full reasoning, tool output, and diffs.
 - **Streaming TUI** — a Claude-style composer with a reverse-block cursor,
   live token streaming, and colored unified diffs previewed before every
   write/edit. Drag across the output — or the composer — to select text:
@@ -233,8 +237,19 @@ memory, sessions, skills) into `~/.config/haikucode`.
   works), then its model from the server's list. "+ Add a custom provider"
   walks through name, base URL, API key and model for any OpenAI-compatible
   endpoint (a LiteLLM or other gateway, a local server). Shortcuts:
-  `/provider <name>` switches, `/provider add <name> <base_url> <model>`,
-  `/provider remove <name>` forgets one and its key, `/provider list`. Each keeps its own API key (the `/config`
+  `/provider <name>` switches, `/provider add` opens setup (or use
+  `/provider add <name> <base_url> <model>`),
+  `/provider edit <name>` edits a saved custom server (`/provider edit` edits
+  the active one; Ctrl+E edits the highlighted custom server in the picker).
+  Address and model fields are prefilled and support arrow keys, Home/End,
+  Delete, and paste; Shift+Tab goes back, Esc cancels without saving.
+  Enter keeps a prefilled value or a saved key; a new key replaces the old
+  one, and `-` in the key field removes it. Changing the address requires
+  entering the key again, or Enter to use no saved key. Clear the model with
+  Ctrl+U to browse the server's models instead. Editing an inactive server
+  keeps the current provider unless you choose to browse its models.
+  `/provider remove <name>` forgets one and its key; `/provider list` lists them.
+  Each keeps its own API key (the `/config`
   key row) and remembers its model; the `/config` provider row cycles through
   them too. A provider made by the setup wizard's "custom" choice joins the list.
 - **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
