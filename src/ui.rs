@@ -3638,7 +3638,7 @@ impl App {
                 // built-in (USD-quoted) list: the prices are relabelled, not
                 // converted, so say where the real ones go.
                 if s.price_currency != "USD" && !s.prices.contains_key(&s.provider) {
-                    format!("{} (built-in list is still USD: set a prices entry for {0} in config.json)", s.price_currency)
+                    format!("{} (built-in list is still USD: set prices.{} in config.json)", s.price_currency, s.provider)
                 } else {
                     s.price_currency.clone()
                 }
