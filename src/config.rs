@@ -939,14 +939,22 @@ impl Config {
         if on_disk.context_window_explicit {
             json["context_window"] = serde_json::json!(on_disk.context_window);
         }
-        if on_disk.price_in != default_price_in() {
-            json["price_in"] = serde_json::json!(on_disk.price_in);
+        // The top-level price fields mirror the active provider's list. Skip
+        // them when the provider has no list (a custom server with a hidden
+        // cost) so a reload doesn't mistake the zeros for a user price list.
+        if on_disk.price_list().is_some() {
+            if on_disk.price_in != default_price_in() {
+                json["price_in"] = serde_json::json!(on_disk.price_in);
+            }
+            if on_disk.price_out != default_price_out() {
+                json["price_out"] = serde_json::json!(on_disk.price_out);
+            }
+            if on_disk.price_currency.to_ascii_uppercase() != default_price_currency() {
+                json["price_currency"] = serde_json::json!(on_disk.price_currency);
+            }
         }
-        if on_disk.price_out != default_price_out() {
-            json["price_out"] = serde_json::json!(on_disk.price_out);
-        }
-        if on_disk.price_currency.to_ascii_uppercase() != default_price_currency() {
-            json["price_currency"] = serde_json::json!(on_disk.price_currency);
+        if !on_disk.prices.is_empty() {
+            json["prices"] = serde_json::to_value(&on_disk.prices).unwrap_or_default();
         }
         if on_disk.permission != default_permission() {
             json["permission"] = serde_json::json!(on_disk.permission);
