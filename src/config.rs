@@ -293,7 +293,7 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
 /// provider without a user-set `prices` entry has no known price here and its
 /// cost readout is hidden.
 pub const PRICES: &[(&str, f64, f64, f64, &str)] = &[
-    ("deepseek", 0.15, 0.60, 0.003, "USD"),
+    ("deepseek", 0.15, 0.60, DEEPSEEK_CACHE_HIT_PRICE, "USD"),
     ("openai", 0.15, 0.60, 0.075, "USD"),
     ("anthropic", 15.0, 75.0, 1.50, "USD"),
     ("groq", 0.59, 0.79, 0.059, "USD"),
