@@ -3514,7 +3514,7 @@ impl App {
 
     pub fn tick_spinner(&mut self) -> bool {
         self.spin_counter += 1;
-        if self.spin_counter % 6 == 0 {
+        if self.spin_counter.is_multiple_of(6) {
             self.spinner = (self.spinner + 1) % 10;
             true
         } else {
