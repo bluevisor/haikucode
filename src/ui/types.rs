@@ -87,17 +87,13 @@ pub fn detect_ascii() -> bool {
     if std::env::var("HAIKUCODE_ASCII").is_ok() {
         return true;
     }
-    match std::env::var("TERM").as_deref() {
-        Ok("dumb") | Ok("vt100") | Ok("") | Err(_) => true,
-        _ => false,
-    }
+    matches!(std::env::var("TERM").as_deref(), Ok("dumb") | Ok("vt100") | Ok("") | Err(_))
 }
 
 /// True when the terminal likely has only 16 colors (Linux console without truecolor).
 pub fn is_16color_terminal() -> bool {
     // COLORTERM=truecolor or COLORTERM=24bit means true color support.
-    matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor") | Ok("24bit"))
-        == false
+    !matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor") | Ok("24bit"))
         && matches!(std::env::var("TERM").as_deref(), Ok("linux") | Ok("dumb") | Ok("vt100"))
 }
 
@@ -130,7 +126,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "list / allow / deny permission rules"),
     ("/hooks", "list configured lifecycle hooks"),
     ("/commands", "reload and list custom slash commands"),
-    ("/thinking", "toggle full thinking + tool output vs brief summaries (Ctrl+T)"),
+    ("/thinking", "toggle full thinking + tool output vs thoughts and live status (Ctrl+T)"),
     ("/clear", "clear the screen transcript"),
     ("/update", "install the latest Haiku Code release from GitHub"),
     ("/help", "show help"),
@@ -167,7 +163,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/statusline reset", "back to the default status bar"),
     ("/statusline ", "<items…> set them in order, e.g. model git ctx time"),
     ("/thinking full", "show reasoning, tool output and diffs"),
-    ("/thinking brief", "one-line summaries of each stretch of work"),
+    ("/thinking brief", "keep thoughts and show only the current activity"),
     ("/mcp approve ", "<server> trust a project's MCP server"),
     ("/mcp deny ", "<server> refuse a project's MCP server"),
     ("/mcp login ", "<server> sign in to a server that needs OAuth"),
