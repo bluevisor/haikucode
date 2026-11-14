@@ -620,8 +620,13 @@ fn run_oneshot(
 ) -> bool {
     let started = std::time::Instant::now();
     let model = cfg.model.clone();
-    let (price_in, price_out, price_currency) = (cfg.price_in, cfg.price_out, cfg.price_currency.clone());
-    let price_cached = cfg.price_cached();
+    // The cost counter follows the provider: a custom server without a price
+    // list has no known cost (null in the JSON summary).
+    let price_list = cfg.price_list();
+    let price_currency = price_list
+        .as_ref()
+        .map(|p| p.price_currency.clone())
+        .unwrap_or_default();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let h = agent::spawn(cfg, messages, perm, session, ui_tx);
     let (task_text, attached) = ui::expand_attachments(&task);
