@@ -872,7 +872,11 @@ fn run_tui(
     let ctx_limit = cfg.context_window;
     let price_in = cfg.price_in;
     let price_out = cfg.price_out;
+    let price_cached_in = cfg.price_cached_in;
     let price_currency = money::Currency::parse(&cfg.price_currency);
+    // A custom server without a price list has no known cost: the readout is
+    // hidden rather than priced at a guess.
+    let cost_known = cfg.price_list().is_some();
     let settings = cfg.clone();
     let perm_start = start_perm(&cfg, auto);
 
