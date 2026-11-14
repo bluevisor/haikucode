@@ -796,6 +796,25 @@ impl Config {
             }
         }
         cfg.adopt_active_custom();
+        // Legacy: the single top-level price list belonged to the provider
+        // active when it was written. Fold it into the per-provider map so
+        // switching providers and back keeps it.
+        if !cfg.prices.contains_key(&cfg.provider)
+            && (cfg.price_in != default_price_in()
+                || cfg.price_out != default_price_out()
+                || cfg.price_currency != default_price_currency()
+                || cfg.price_cached_in.is_some())
+        {
+            cfg.prices.insert(
+                cfg.provider.clone(),
+                PriceList {
+                    price_in: cfg.price_in,
+                    price_out: cfg.price_out,
+                    price_cached_in: cfg.price_cached_in,
+                    price_currency: cfg.price_currency.clone(),
+                },
+            );
+        }
         for key in [
             "permissions",
             "hooks",
