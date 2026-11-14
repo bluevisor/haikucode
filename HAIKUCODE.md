@@ -86,10 +86,12 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   messages that send in order as turns finish (Esc interrupts and restores them).
 - One-shot `--output FILE` writes the final reply to disk after the run.
 - Status bar: model · session tokens + cost · context-window bar · account
-  balance. `money.rs` tags both figures with their ISO code whenever the
-  account's billing currency differs from `price_currency` (a CNY DeepSeek
-  account using the USD price list), and a one-time notice says how to align
-  them; prices are never converted across currencies.
+  balance. The cost counter follows the active provider (each preset has its
+  own price list; user-set lists are stored per provider as `prices` in
+  config.json) — a custom server without one hides the cost. `money.rs` tags
+  both money figures with their ISO code whenever the account's billing
+  currency differs from `price_currency` (a CNY DeepSeek account using the
+  USD price list); prices are never converted across currencies.
 - Permission modes via Shift+Tab (also Ctrl+P, which the Pi's framebuffer console
   needs since it can't report Shift+Tab): ask / YOLO / plan (read-only), saved for the next session; colored
   diff before write/edit. Handled in every mode, and never confused with the
@@ -136,14 +138,17 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   skips mouse capture (below) and would otherwise have no way to scroll.
 - Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) so click-drag
   text selection keeps working; `HAIKUCODE_MOUSE=1`/`0` overrides either way.
-- Selecting output: drag across the transcript and the cells under the drag are
+- Selecting text: drag across the transcript and the cells under the drag are
   reversed as you go; letting go copies them. The copy is read back out of the
   frame ratatui just drew (`helpers::selected_text`), so it is exactly what was
   on screen — wrapped where it wrapped, diffs and tool output included, wide
-  characters once — with no second model of the layout to keep in sync. It goes
-  to `pbcopy` (macOS), `clipboard -i` (Haiku), `wl-copy`/`xclip`/`xsel` (Linux),
-  or OSC 52 where the terminal has no such tool, and the status bar flashes how
-  much went. A click, or a drag over blanks, copies nothing.
+  characters once — with no second model of the layout to keep in sync. The
+  composer selects too, but copies its own input text rather than cells, so the
+  prompt, the wrap points and the block cursor never come along; a plain click
+  in it puts the caret where it landed. It goes to `pbcopy` (macOS),
+  `clipboard -i` (Haiku), `wl-copy`/`xclip`/`xsel` (Linux), or OSC 52 where the
+  terminal has no such tool, and the status bar flashes how much went. A click
+  in the transcript, or a drag over blanks, copies nothing.
 - ASCII fallback + clear-on-exit for the Pi's framebuffer console (`TERM=linux`),
   whose 16-color palette can't show a theme's RGB shades: the palette is snapped
   to the nearest ANSI color there (`palette::for_16color`), since the console
