@@ -65,8 +65,8 @@ pub struct Palette {
 }
 
 // HaikuOS (the default) — Haiku's own look: the yellow window tab as accent
-// and logo, panel-gray text, a dark take on the blue desktop, and the stock
-// bash `~>` prompt.
+// and logo, panel-gray text, a dark take on the blue desktop, and a plain `>`
+// prompt.
 pub const HAIKU_YELLOW: Color = Color::Rgb(255, 203, 0);
 pub const HAIKU_BLUE: Color = Color::Rgb(116, 166, 222);
 pub const HAIKU_PANEL: Color = Color::Rgb(216, 216, 216);
@@ -101,7 +101,7 @@ pub const HAIKU_PALETTE: Palette = Palette {
     secondary: Color::Rgb(150, 160, 176),
     user_bg: Color::Rgb(38, 60, 88),
     bg: Color::Rgb(22, 34, 50),
-    prompt: Some("~> "),
+    prompt: Some("> "),
     cursor: CursorKind::Block,
 };
 
