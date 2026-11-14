@@ -118,6 +118,10 @@ pub struct App {
     banner_status: Vec<String>,
     live: String,
     live_reasoning: String,
+    /// Current activity only; never retained as a status history.
+    current_activity: Option<String>,
+    /// Immediate acknowledgement until this turn produces its first content.
+    awaiting_response: bool,
     input: String,
     cursor: usize, // char index
     /// Terminal size at the last render, so key handlers can lay the composer
@@ -373,6 +377,8 @@ impl App {
             banner_status: Vec::new(),
             live: String::new(),
             live_reasoning: String::new(),
+            current_activity: None,
+            awaiting_response: false,
             input: String::new(),
             cursor: 0,
             term_w: 80,
@@ -585,10 +591,14 @@ impl App {
     pub fn handle_event(&mut self, ev: UiEvent, h: &Handles) {
         match ev {
             UiEvent::Token(t) => {
+                if !t.is_empty() { self.awaiting_response = false; }
+                self.current_activity = Some("responding…".into());
                 self.live.push_str(&t);
                 self.dirty();
             }
             UiEvent::Reasoning(t) => {
+                if !t.is_empty() { self.awaiting_response = false; }
+                self.current_activity = Some("thinking…".into());
                 self.live_reasoning.push_str(&t);
                 self.dirty();
             }
@@ -609,7 +619,9 @@ impl App {
                 }
             }
             UiEvent::ToolStart { name, summary } => {
+                self.awaiting_response = false;
                 self.flush_live();
+                self.current_activity = Some(format!("{name} {summary}"));
                 self.push(Kind::Tool, format!("{name} {summary}"));
             }
             UiEvent::Diff(d) => {
@@ -629,6 +641,7 @@ impl App {
                 self.after_push();
             }
             UiEvent::ToolResult { ok, preview } => {
+                self.current_activity = None;
                 self.flush_live();
                 if preview.is_empty() {
                     return;
@@ -760,12 +773,17 @@ impl App {
                 self.push(Kind::Notice, msg);
             }
             UiEvent::Progress(msg) => {
+                self.current_activity = Some(msg.clone());
                 self.push(Kind::Progress, msg);
             }
             UiEvent::Error(msg) => {
+                self.awaiting_response = false;
+                self.current_activity = None;
                 self.push(Kind::ErrorK, msg);
             }
             UiEvent::TurnDone => {
+                self.awaiting_response = false;
+                self.current_activity = None;
                 self.flush_live();
                 // Keep an open picker alive: the worker sends TurnDone right
                 // after ModelList, and clear_busy would drop back to Idle.
@@ -1971,7 +1989,7 @@ impl App {
             KeyCode::Delete => self.on_key_edit(key),
             // Modified arrows: Alt/Ctrl+←/→ move by word, Alt/Ctrl+↑/↓ roll the
             // transcript a few lines — the scroll gesture that works on every
-            // terminal (Warp, and any terminal without mouse capture, sends no
+            // terminal (any terminal without mouse capture sends no
             // wheel events). Plain ↑/↓ are the draft rows and history below.
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::ALT)
@@ -2459,6 +2477,8 @@ impl App {
 
 
     fn set_busy(&mut self) {
+        self.awaiting_response = false;
+        self.current_activity = None;
         self.mode = Mode::Busy;
         self.busy_since = Some(Instant::now());
     }
@@ -2473,6 +2493,8 @@ impl App {
     }
 
     fn clear_busy(&mut self) {
+        self.awaiting_response = false;
+        self.current_activity = None;
         self.mode = Mode::Idle;
         self.busy_since = None;
     }
@@ -2522,6 +2544,8 @@ impl App {
             self.push(Kind::Notice, format!("attached: {}", all.join(", ")));
         }
         self.set_busy();
+        self.awaiting_response = true;
+        self.current_activity = Some("waiting for model…".into());
         let _ = h.cmd_tx.send(WorkerCmd::User { text: task_text, images, typed: shown_typed });
     }
 
@@ -3382,7 +3406,7 @@ impl App {
         self.push(Kind::Notice, String::from("  Esc         interrupt the agent / clear the line"));
         self.push(Kind::Notice, String::from("  Ctrl+C      clear the line (twice = quit)"));
         self.push(Kind::Notice, String::from("  Ctrl+L      force clear/repaint"));
-        self.push(Kind::Notice, String::from("  Ctrl+T      show full thinking / brief summaries"));
+        self.push(Kind::Notice, String::from("  Ctrl+T      show full thinking / thoughts and live status"));
     }
 
     /// Add the launch banner. Only a placeholder goes into the transcript; the
@@ -3433,7 +3457,7 @@ impl App {
         self.show_thinking = !self.show_thinking;
         self.settings.show_thinking = self.show_thinking;
         Config::persist_show_thinking(self.show_thinking);
-        let what = if self.show_thinking { "full thinking and tool output" } else { "brief summaries (ctrl+t for details)" };
+        let what = if self.show_thinking { "full thinking and tool output" } else { "thoughts and live status (ctrl+t for details)" };
         self.push(Kind::Notice, format!("showing {what}"));
     }
 
@@ -3793,6 +3817,17 @@ impl App {
         // the answer, with the same separators), so nothing on screen moves
         // the moment the live text becomes transcript.
         let mut out: Vec<Line<'static>> = Vec::new();
+        if self.awaiting_response && self.mode == Mode::Busy {
+            // Fixed-width ASCII pulse: a short trail glides through the track
+            // without shifting the label or growing a line of punctuation.
+            const PULSE: [&str; 10] = [
+                ".      ", "..     ", "...    ", " ...   ", "  ...  ",
+                "   ... ", "    ...", "     ..", "      .", "       ",
+            ];
+            let pulse = PULSE[(self.spin_counter / 6) % PULSE.len()];
+            let text = brief::clip(&format!("Waiting for model  [{pulse}]"), width);
+            out.push(Line::from(Span::styled(text, Style::default().fg(self.dim_text()))));
+        }
         let mut prev = self.transcript.last().map(|t| t.kind);
         if !self.live_reasoning.trim().is_empty() {
             // In brief view a blank between work entries is absorbed into the
@@ -3804,7 +3839,7 @@ impl App {
             if self.show_thinking {
                 render_tline(&mut out, Kind::Reasoning, &self.live_reasoning, true, None, width, self.glyphs, &self.palette, self.single_width);
             } else {
-                out.push(self.brief_row("thinking…", self.live_reasoning.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), width, true));
+                out.push(self.brief_row("", &self.live_reasoning, width, true));
             }
             prev = Some(Kind::Reasoning);
         }
@@ -3817,13 +3852,14 @@ impl App {
         out
     }
 
-    /// One brief-view row, always exactly one screen line: `label` padded to a
-    /// fixed column, then `text` (its first sentence when `gist`) clipped to fit.
+    /// One brief-view list entry, clipped to one screen line. Thoughts have
+    /// no label; failures carry an explicit error label.
     fn brief_row(&self, label: &str, text: &str, width: usize, gist: bool) -> Line<'static> {
-        let room = width.saturating_sub(2 + 12).max(4);
+        let prefix = if label.is_empty() { String::new() } else { format!("{label}  ") };
+        let room = width.saturating_sub(2 + prefix.len());
         let text = if gist { brief::gist(text, room) } else { brief::clip(text, room) };
         let mut out = Vec::new();
-        render_tline(&mut out, Kind::Reasoning, &format!("{label:<11} {text}"), true, None, width, self.glyphs, &self.palette, self.single_width);
+        render_tline(&mut out, Kind::Reasoning, &format!("{prefix}{text}"), true, None, width, self.glyphs, &self.palette, self.single_width);
         out.truncate(1);
         out.pop().unwrap_or_default()
     }
@@ -3836,10 +3872,20 @@ impl App {
         match &self.mode {
             Mode::Idle => self.render_composer(f, area),
             Mode::Busy => {
+                // The activity text shares its line with the spinner and this
+                // hint, so clip it to the room left: spinner glyph + space,
+                // the activity's own trailing space, and the hint.
+                const BUSY_HINT: &str = "(Esc to interrupt · Enter queues)";
+                let reserved = 3 + BUSY_HINT.chars().count();
                 let mut lines = vec![Line::from(vec![
                     Span::styled(format!("{} ", self.spin_frame()), Style::default().fg(self.palette.accent)),
-                    Span::styled(self.working_timer(), Style::default().fg(self.dim_text())),
-                    Span::styled("(Esc to interrupt · Enter queues)", Style::default().fg(self.dim_text())),
+                    Span::styled(
+                        self.current_activity.as_deref().map(|s| {
+                            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                            format!("{} ", brief::clip(&s, (area.width as usize).saturating_sub(reserved)))
+                        }).unwrap_or_else(|| self.working_timer()),
+                        Style::default().fg(self.dim_text())),
+                    Span::styled(BUSY_HINT, Style::default().fg(self.dim_text())),
                 ])];
                 let mark = if self.ascii { "->" } else { "↳" };
                 for q in &self.queued {
@@ -4514,15 +4560,15 @@ mod tests {
 
         app.mode = Mode::Approval("edit src/ui.rs".into());
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("considered  Check the config loader first."), "{screen}");
-        assert!(screen.contains("explored    read 1 file"), "{screen}");
+        assert!(screen.contains("Check the config loader first."), "{screen}");
+        assert!(!screen.contains("explored") && !screen.contains("considered"), "{screen}");
         assert!(!screen.contains("SECRET_TOOL_OUTPUT"), "{screen}");
         assert!(screen.contains("added_line"), "pending edit's diff stays visible:\n{screen}");
 
         app.mode = Mode::Idle;
         app.push(Kind::ToolResult, "OK".to_string());
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("changed     src/ui.rs +1"), "{screen}");
+        assert!(!screen.contains("changed") && !screen.contains("read_file"), "{screen}");
         assert!(!screen.contains("added_line"), "{screen}");
 
         app.show_thinking = true;
@@ -4531,7 +4577,7 @@ mod tests {
     }
 
     /// Committing live thinking (and the answer streaming after it) must not
-    /// move anything: the brief `thinking…` row becomes the `considered` row on
+    /// move anything: the brief thought stays on
     /// the same screen line, and the answer keeps its line too.
     #[test]
     fn committing_live_thinking_does_not_shift_the_screen() {
@@ -4556,14 +4602,72 @@ mod tests {
                 let before = draw(&mut app, &mut term);
                 app.flush_live();
                 let after = draw(&mut app, &mut term);
-                let thought = if show { "Look at the banner first." } else { "thinking…" };
-                let committed = if show { "Look at the banner first." } else { "considered  Look at the banner first." };
+                let thought = "Look at the banner first.";
+                let committed = thought;
                 let ctx = format!("show={show} after_tool={after_tool}\n--before--\n{before}\n--after--\n{after}");
                 assert!(row_of(&before, thought).is_some(), "{ctx}");
                 assert_eq!(row_of(&before, thought), row_of(&after, committed), "{ctx}");
                 assert_eq!(row_of(&before, "Here is the answer."), row_of(&after, "Here is the answer."), "{ctx}");
             }
         }
+    }
+
+    #[test]
+    fn prompt_is_acknowledged_before_the_first_model_token() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.transcript.clear();
+        app.show_thinking = false;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        app.send_prompt("hi".into(), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Waiting for model  [.      ]"), "{screen}");
+        app.spin_counter = 30;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Waiting for model  [   ... ]"), "{screen}");
+        app.handle_event(UiEvent::Reasoning("A greeting.".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Waiting for model") && screen.contains("A greeting."), "{screen}");
+        app.handle_event(UiEvent::TurnDone, &h);
+        app.send_prompt("hello again".into(), &h);
+        app.handle_event(UiEvent::Token("Hello!".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Waiting for model") && screen.contains("Hello!"), "{screen}");
+        app.handle_event(UiEvent::TurnDone, &h);
+        app.send_prompt("cancel this".into(), &h);
+        app.clear_busy();
+        assert!(!draw(&mut app, &mut term).contains("Waiting for model"));
+        assert!(!app.transcript.iter().any(|t| t.text.contains("Waiting for model")));
+    }
+
+    #[test]
+    fn current_activity_is_replaced_and_removed_without_losing_thoughts() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.transcript.clear();
+        app.show_thinking = false;
+        app.set_busy();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        app.handle_event(UiEvent::Reasoning("Check the renderer first.".into()), &h);
+        app.handle_event(UiEvent::ToolStart { name: "read_file".into(), summary: "src/ui.rs".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the renderer first.") && screen.contains("read_file src/ui.rs"), "{screen}");
+        app.handle_event(UiEvent::Progress("Checking layout".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Checking layout") && !screen.contains("read_file src/ui.rs"), "{screen}");
+        app.handle_event(UiEvent::ToolResult { ok: true, preview: "ok".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Checking layout"), "{screen}");
+        app.handle_event(UiEvent::ToolStart { name: "bash".into(), summary: "cargo test".into() }, &h);
+        app.handle_event(UiEvent::TurnDone, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the renderer first."), "{screen}");
+        assert!(!screen.contains("bash cargo test") && !screen.contains("considered"), "{screen}");
+        app.show_thinking = true;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("read_file src/ui.rs") && screen.contains("bash cargo test"), "{screen}");
     }
 
     /// A tool result with newlines keeps its line structure. The transcript used
@@ -5683,18 +5787,18 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_defaults_to_on_except_on_warp_and_honours_the_override() {
+    fn mouse_capture_defaults_to_on_everywhere_and_honours_the_override() {
         assert!(want_mouse_capture("iTerm.app", None));
         assert!(want_mouse_capture("", None));
-        assert!(!want_mouse_capture("WarpTerminal", None));
+        assert!(want_mouse_capture("WarpTerminal", None));
 
         assert!(want_mouse_capture("WarpTerminal", Some("1")));
         assert!(want_mouse_capture("WarpTerminal", Some("true")));
         assert!(want_mouse_capture("WarpTerminal", Some("ON")));
         assert!(!want_mouse_capture("iTerm.app", Some("0")));
         assert!(!want_mouse_capture("iTerm.app", Some("off")));
-        // Unrecognised value: fall back to the terminal-based default.
-        assert!(!want_mouse_capture("WarpTerminal", Some("maybe")));
+        // Unrecognised value: keep application mouse handling enabled.
+        assert!(want_mouse_capture("WarpTerminal", Some("maybe")));
         assert!(want_mouse_capture("iTerm.app", Some("maybe")));
     }
 
@@ -6271,6 +6375,37 @@ mod tests {
         assert!(!bottom.contains("end") && !bottom.contains("new"));
     }
 
+    #[test]
+    fn wheel_over_output_or_input_only_scrolls_output() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, _h) = scrollable_app();
+        for i in 0..80 { app.note(format!("transcript line {i}")); }
+        app.input = "draft first line\ndraft second line".into();
+        app.cursor = app.input.chars().count();
+        let draft = app.input.clone();
+        let cursor = app.cursor;
+        let history = app.hist_idx;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        draw(&mut app, &mut term);
+        let composer_area = app.composer_area;
+        let bottom = app.scroll;
+        for area in [app.output_area, app.composer_area] {
+            app.on_mouse(MouseEventKind::ScrollUp, area.x, area.y);
+            draw(&mut app, &mut term);
+            assert!(app.scroll < bottom);
+            assert_eq!(app.input, draft);
+            assert_eq!(app.cursor, cursor);
+            assert_eq!(app.hist_idx, history);
+            assert_eq!(app.composer_area, composer_area);
+        }
+        for _ in 0..2 { app.on_mouse(MouseEventKind::ScrollDown, composer_area.x, composer_area.y); }
+        draw(&mut app, &mut term);
+        assert_eq!(app.scroll, bottom);
+        assert_eq!(app.input, draft);
+        assert_eq!(app.cursor, cursor);
+        assert_eq!(app.hist_idx, history);
+    }
+
     /// The transcript separates blocks with blank lines so turns, prose, and
     /// tool activity don't run together — but only at real boundaries: a notice
     /// or a tool result that belongs to the preceding block stays attached.
@@ -6523,21 +6658,14 @@ pub fn run<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// Whether to grab the mouse (needed for scroll-wheel events). Capture is on by
-/// default, but skipped on Warp: it grabs click-drag text selection and Warp has
-/// no modifier to bypass a grabbed mouse, so users couldn't copy anything. Other
-/// terminals (iTerm, …) let you hold Option/Fn to select, so capture stays.
-///
-/// `HAIKUCODE_MOUSE` overrides either way: a truthy value (`1`/`true`/`on`/`yes`)
-/// forces wheel scrolling on even under Warp, a falsy one (`0`/`false`/`off`/
-/// `no`) turns capture off everywhere. Anything else means "decide from the
-/// terminal". Scrolling is also on ↑/↓ and PgUp/PgDn, so a terminal without
-/// capture still has a way to move through the transcript.
-pub fn want_mouse_capture(term_program: &str, override_env: Option<&str>) -> bool {
+/// Capture wheel events by default in every terminal, including Warp, so the
+/// terminal cannot translate them into Up/Down keys that navigate input history.
+/// Explicit HAIKUCODE_MOUSE=0/false/off/no opts out of application mouse handling.
+pub fn want_mouse_capture(_term_program: &str, override_env: Option<&str>) -> bool {
     match override_env.map(str::to_ascii_lowercase).as_deref() {
         Some("1") | Some("true") | Some("on") | Some("yes") => true,
         Some("0") | Some("false") | Some("off") | Some("no") => false,
-        _ => term_program != "WarpTerminal",
+        _ => true,
     }
 }
 
