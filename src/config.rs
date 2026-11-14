@@ -763,6 +763,27 @@ impl Config {
         if let Some(p) = v.get("price_cached_in").and_then(|x| x.as_f64()) {
             cfg.price_cached_in = Some(p);
         }
+        // Per-provider price lists (the cost counter follows the provider).
+        // One malformed entry must not take its siblings with it; the raw
+        // block goes to `extra` so a rewrite keeps it verbatim.
+        if let Some(m) = v.get("prices") {
+            let mut broken = false;
+            if let Some(obj) = m.as_object() {
+                for (k, val) in obj {
+                    match serde_json::from_value::<PriceList>(val.clone()) {
+                        Ok(p) => {
+                            cfg.prices.insert(k.clone(), p);
+                        }
+                        Err(_) => broken = true,
+                    }
+                }
+            } else {
+                broken = true;
+            }
+            if broken {
+                cfg.extra.insert("prices".into(), m.clone());
+            }
+        }
         if let Some(list) = v.get("custom_providers").and_then(|x| x.as_array()) {
             for item in list {
                 match serde_json::from_value::<CustomProvider>(item.clone()) {
