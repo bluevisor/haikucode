@@ -805,15 +805,18 @@ impl Config {
                 || cfg.price_currency != default_price_currency()
                 || cfg.price_cached_in.is_some())
         {
-            cfg.prices.insert(
-                cfg.provider.clone(),
-                PriceList {
-                    price_in: cfg.price_in,
-                    price_out: cfg.price_out,
-                    price_cached_in: cfg.price_cached_in,
-                    price_currency: cfg.price_currency.clone(),
-                },
-            );
+            let mut list = PriceList {
+                price_in: cfg.price_in,
+                price_out: cfg.price_out,
+                price_cached_in: cfg.price_cached_in,
+                price_currency: cfg.price_currency.clone(),
+            };
+            // Legacy files predate the per-provider cache price: keep the
+            // built-in one (e.g. DeepSeek's 0.003 cache-hit price).
+            if list.price_cached_in.is_none() {
+                list.price_cached_in = built_in_prices(&cfg.provider).and_then(|b| b.price_cached_in);
+            }
+            cfg.prices.insert(cfg.provider.clone(), list);
         }
         for key in [
             "permissions",
