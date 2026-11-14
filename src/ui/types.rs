@@ -144,7 +144,8 @@ pub const DOUBLE_PRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// it fills the line instead of running it.
 pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/provider list", "list every provider and whether it has a key"),
-    ("/provider add ", "add one: /provider add <name> <base_url> <model>"),
+    ("/provider add ", "add a server: /provider add (wizard) or /provider add <name> <base_url> <model>"),
+    ("/provider edit ", "edit a custom server: /provider edit <name> (active server if omitted)"),
     ("/provider remove ", "forget a custom provider and its saved key: /provider remove <name>"),
     ("/effort auto", "send nothing: the model's own default"),
     ("/effort off", "no reasoning (or the provider's lowest)"),
@@ -163,7 +164,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/statusline reset", "back to the default status bar"),
     ("/statusline ", "<items…> set them in order, e.g. model git ctx time"),
     ("/thinking full", "show reasoning, tool output and diffs"),
-    ("/thinking brief", "keep thoughts and show only the current activity"),
+    ("/thinking brief", "thinking summaries + current action (live only)"),
     ("/mcp approve ", "<server> trust a project's MCP server"),
     ("/mcp deny ", "<server> refuse a project's MCP server"),
     ("/mcp login ", "<server> sign in to a server that needs OAuth"),
@@ -271,8 +272,12 @@ pub enum ProviderStep {
 /// What the `/provider` wizard has collected so far.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderDraft {
-    /// True while adding a new provider; false when only a key is missing.
+    /// True for full add/edit setup; false when only a key is missing.
     pub adding: bool,
+    /// Editing a saved provider keeps its name and starts at its address.
+    pub editing: bool,
+    /// An explicit '-' answer removes the saved key on commit.
+    pub clear_key: bool,
     pub name: String,
     pub base_url: String,
     pub api_key: String,
