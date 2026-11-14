@@ -200,6 +200,41 @@ pub struct CustomProvider {
     pub model: String,
 }
 
+/// One provider's price list, per 1M tokens. Stored per provider (the
+/// `prices` map in config.json) so the cost counter follows the active
+/// provider; the built-in `PRICES` table covers the presets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PriceList {
+    pub price_in: f64,
+    pub price_out: f64,
+    /// Price per 1M cached (cache-hit) input tokens. Unset: a tenth of
+    /// `price_in`, the usual cache-read discount (see `price_cached`).
+    #[serde(default)]
+    pub price_cached_in: Option<f64>,
+    /// ISO code the prices are quoted in.
+    #[serde(default = "default_price_currency")]
+    pub price_currency: String,
+}
+
+impl Default for PriceList {
+    fn default() -> Self {
+        PriceList {
+            price_in: 0.0,
+            price_out: 0.0,
+            price_cached_in: None,
+            price_currency: default_price_currency(),
+        }
+    }
+}
+
+impl PriceList {
+    /// Price per 1M cached input tokens: the configured one, else a tenth of
+    /// `price_in`, the usual cache-read discount (Anthropic, OpenAI).
+    pub fn price_cached(&self) -> f64 {
+        self.price_cached_in.unwrap_or(self.price_in * 0.1)
+    }
+}
+
 /// Is `name` one of the built-in presets in `PROVIDERS`?
 pub fn is_builtin_provider(name: &str) -> bool {
     PROVIDERS.iter().any(|(n, _, _)| *n == name)
