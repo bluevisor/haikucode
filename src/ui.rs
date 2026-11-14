@@ -6000,6 +6000,59 @@ mod tests {
         assert_eq!(app.settings.price_currency, "USD");
     }
 
+    /// The cost counter follows the provider: switching presets re-prices the
+    /// same session tokens, and a custom server without a price list hides
+    /// the cost (status line and /cost alike).
+    #[test]
+    fn the_cost_counter_follows_the_provider() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
+        app.mode = Mode::Idle;
+        let (h, _cmd_rx) = test_handles();
+        app.sess_prompt = 100_000;
+        app.sess_completion = 50_000;
+        // test_ui_config zeros the prices; take the default provider's list.
+        app.sync_prices();
+        assert!(app.cost_known);
+        let deepseek_cost = app.session_cost().unwrap();
+        assert!(deepseek_cost > 0.0);
+
+        app.switch_provider(
+            "anthropic".into(),
+            "https://api.anthropic.com/v1".into(),
+            "claude-opus-5-5".into(),
+            &h,
+        );
+        assert!(app.cost_known);
+        let opus_cost = app.session_cost().unwrap();
+        assert!(
+            (opus_cost - deepseek_cost).abs() > 1.0,
+            "150k tokens cost very differently on Opus than on DeepSeek Flash ({deepseek_cost} vs {opus_cost})"
+        );
+
+        app.switch_provider(
+            "mylocal".into(),
+            "http://localhost:11434/v1".into(),
+            "qwen3".into(),
+            &h,
+        );
+        assert!(!app.cost_known, "a custom server has no known price");
+        assert!(app.session_cost().is_none());
+
+        // /cost drops the cost figure but keeps the token counts.
+        let lines = app.cost_lines();
+        assert!(lines[0].starts_with("session: 150.0k tokens (100.0k in / 50.0k out)"), "{lines:?}");
+        assert!(!lines[0].contains('·'), "the cost is hidden:\n{lines:?}");
+
+        // And the status line: tokens stay, the cost segment goes.
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("150.0k tok"), "tokens stay on the line:\n{screen}");
+        assert!(!screen.contains('$'), "no cost figure:\n{screen}");
+    }
+
     /// Enter on the api key row opens an empty field; saving it empty used to
     /// wipe the stored key, and every launch after fell into the setup wizard.
     #[test]
