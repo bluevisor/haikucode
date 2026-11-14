@@ -479,6 +479,7 @@ impl Default for Config {
             price_cached_in: None,
             key_from_env: false,
             custom_providers: Vec::new(),
+            prices: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
