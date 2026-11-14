@@ -175,9 +175,8 @@ pub struct Config {
     /// `api_kind`).
     #[serde(default)]
     pub api: Option<String>,
-    /// Price per 1M cached (cache-hit) input tokens. Unset: DeepSeek's cache-hit
-    /// price with the DeepSeek price list, else a tenth of `price_in` (see
-    /// `price_cached`).
+    /// Price per 1M cached (cache-hit) input tokens. Unset: a tenth of
+    /// `price_in`, the usual cache-read discount (see `PriceList::price_cached`).
     #[serde(default)]
     pub price_cached_in: Option<f64>,
     /// True when the current provider's key came from the environment; we never
