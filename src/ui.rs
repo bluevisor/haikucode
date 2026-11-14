@@ -4056,8 +4056,7 @@ impl App {
                     } else {
                         let marker = if self.ascii { ">" } else { "▸" };
                         let end = (picker.scroll + PICKER_VISIBLE).min(filtered.len());
-                        for fi in picker.scroll..end {
-                            let idx = filtered[fi];
+                        for (fi, &idx) in filtered.iter().enumerate().take(end).skip(picker.scroll) {
                             let sel = fi == picker.cursor;
                             let lead = if sel { marker } else { " " };
                             let mark = if Some(idx) == picker.current { " (*)" } else { "" };
