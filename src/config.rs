@@ -961,15 +961,43 @@ impl Config {
         }
     }
 
-    /// Price per 1M cached input tokens: the configured one; with the default
-    /// (DeepSeek) price list, DeepSeek's cache-hit price; otherwise a tenth of
-    /// `price_in`, the usual cache-read discount (Anthropic, OpenAI).
+    /// Price per 1M cached input tokens for the active provider: the
+    /// configured one, else a tenth of `price_in`, the usual cache-read
+    /// discount (Anthropic, OpenAI).
     pub fn price_cached(&self) -> f64 {
-        self.price_cached_in.unwrap_or(if self.price_in == default_price_in() {
-            DEEPSEEK_CACHE_HIT_PRICE
-        } else {
-            self.price_in * 0.1
-        })
+        self.price_cached_in.unwrap_or(self.price_in * 0.1)
+    }
+
+    /// The price list that applies to `provider`: the user-set one from
+    /// `prices`, else the built-in `PRICES` table. `None` for a custom server
+    /// with no known price (its cost readout is hidden).
+    pub fn price_list_for(&self, provider: &str) -> Option<PriceList> {
+        self.prices.get(provider).cloned().or_else(|| built_in_prices(provider))
+    }
+
+    /// The active provider's price list (see `price_list_for`).
+    pub fn price_list(&self) -> Option<PriceList> {
+        self.price_list_for(&self.provider)
+    }
+
+    /// Re-derive the single top-level `price_*` fields from the active
+    /// provider's list, so they always mirror it. A custom server without a
+    /// list zeros them (and the cost readout is hidden — see `price_list`).
+    pub fn sync_prices(&mut self) {
+        match self.price_list() {
+            Some(p) => {
+                self.price_in = p.price_in;
+                self.price_out = p.price_out;
+                self.price_cached_in = p.price_cached_in;
+                self.price_currency = p.price_currency;
+            }
+            None => {
+                self.price_in = 0.0;
+                self.price_out = 0.0;
+                self.price_cached_in = None;
+                self.price_currency = default_price_currency();
+            }
+        }
     }
 
     /// Update only the model field on disk, preserving the rest of the file.
