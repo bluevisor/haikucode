@@ -119,7 +119,10 @@ pub struct Config {
     /// never overwritten or rewritten to disk by auto-detection.
     #[serde(skip)]
     pub context_window_explicit: bool,
-    /// USD per 1M tokens, for the session cost readout (DeepSeek defaults).
+    /// USD per 1M tokens, for the session cost readout. Mirrors the active
+    /// provider's price list (re-derived on load and every provider switch);
+    /// the per-provider store is `prices`, with `PRICES` as the built-in
+    /// fallback (DeepSeek defaults).
     #[serde(default = "default_price_in")]
     pub price_in: f64,
     #[serde(default = "default_price_out")]
