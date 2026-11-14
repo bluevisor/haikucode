@@ -779,7 +779,7 @@ fn run_oneshot(
     if text_mode && !at_line_start {
         println!();
     }
-    let cost = spent.cost(price_in, price_cached, price_out);
+    let cost = price_list.map(|p| spent.cost(p.price_in, p.price_cached(), p.price_out));
     let result = final_text.trim_end().to_string();
     if mode != OutputMode::Text {
         let summary = serde_json::json!({
