@@ -4931,7 +4931,9 @@ mod tests {
             ctx_limit: 128_000,
             price_in: 0.0,
             price_out: 0.0,
+            price_cached_in: None,
             price_currency: crate::money::Currency::default(),
+            cost_known: true,
             perm: Arc::new(AtomicU8::new(0)),
             settings: crate::config::Config::default(),
         }
