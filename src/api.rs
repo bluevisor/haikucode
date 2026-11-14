@@ -906,7 +906,8 @@ pub fn exchange_rate(http: &ureq::Agent, from: &str, to: &str) -> Option<f64> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    static RATES: OnceLock<Mutex<HashMap<(String, String), (f64, Instant)>>> = OnceLock::new();
+    type RateCache = Mutex<HashMap<(String, String), (f64, Instant)>>;
+    static RATES: OnceLock<RateCache> = OnceLock::new();
     let iso = |c: &str| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase());
     if !iso(from) || !iso(to) {
         return None;
