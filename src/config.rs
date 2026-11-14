@@ -1418,6 +1418,142 @@ mod tests {
         assert_eq!(crate::money::Currency::parse(code).symbol, "¥");
     }
 
+    /// The cost counter follows the provider: switching presets takes their
+    /// built-in price lists with them; a custom server without a list has no
+    /// known cost (and the top-level mirror zeros out).
+    #[test]
+    fn the_price_list_follows_the_active_provider() {
+        let mut c = Config::default();
+        let ds = c.price_list().unwrap();
+        assert!((ds.price_in - 0.15).abs() < 1e-9 && (ds.price_out - 0.6).abs() < 1e-9);
+        assert_eq!(ds.price_currency, "USD");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        let o = c.price_list().unwrap();
+        assert!((o.price_in - 0.15).abs() < 1e-9 && (o.price_out - 0.6).abs() < 1e-9);
+        assert!((o.price_cached() - 0.075).abs() < 1e-9, "OpenAI's cache-read price");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5-5".into(),
+        });
+        let a = c.price_list().unwrap();
+        assert!((a.price_in - 15.0).abs() < 1e-9 && (a.price_out - 75.0).abs() < 1e-9);
+        // The top-level fields mirror the active provider's list.
+        assert!((c.price_in - 15.0).abs() < 1e-9 && (c.price_out - 75.0).abs() < 1e-9);
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        assert!(c.price_list().is_none(), "a custom server has no known price");
+        assert_eq!(c.price_in, 0.0, "the mirror zeros out");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5-5".into(),
+        });
+        assert!((c.price_list().unwrap().price_in - 15.0).abs() < 1e-9, "switching back keeps the table's list");
+    }
+
+    /// A user-set price list wins over the built-in table and survives
+    /// switching providers and back.
+    #[test]
+    fn a_user_price_list_overrides_the_table_and_survives_a_round_trip() {
+        let mut c = Config::default();
+        c.prices.insert(
+            "deepseek".into(),
+            PriceList {
+                price_in: 1.0,
+                price_out: 4.0,
+                price_cached_in: None,
+                price_currency: "CNY".into(),
+            },
+        );
+        c.sync_prices();
+        assert_eq!(c.price_list().unwrap().price_currency, "CNY");
+        assert_eq!(c.price_currency, "CNY", "the mirror follows the user's list");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        assert_eq!(c.price_list().unwrap().price_currency, "USD", "openai gets its own list");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+        });
+        let back = c.price_list().unwrap();
+        assert!((back.price_in - 1.0).abs() < 1e-9 && back.price_currency == "CNY", "the CNY list comes back");
+    }
+
+    /// A pre-per-provider file carries one top-level price list; it belongs
+    /// to the provider that was active when it was written, and the built-in
+    /// cache-hit price fills in where the file has none.
+    #[test]
+    fn a_legacy_top_level_price_list_folds_into_the_active_provider() {
+        let v = serde_json::json!({
+            "provider": "deepseek",
+            "price_in": 1.0,
+            "price_out": 4.0,
+            "price_currency": "cny",
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        c.sync_prices();
+        let list = c.price_list().unwrap();
+        assert!((list.price_in - 1.0).abs() < 1e-9 && list.price_currency == "CNY");
+        assert!((list.price_cached() - DEEPSEEK_CACHE_HIT_PRICE).abs() < 1e-9, "the built-in cache-hit price carries over");
+        // Switching to another preset and back keeps the folded list.
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+        });
+        assert!((c.price_list().unwrap().price_in - 1.0).abs() < 1e-9);
+    }
+
+    /// A custom server without a price list stays hidden across save/reload:
+    /// the zeroed top-level mirror must not be written as a user price list.
+    #[test]
+    fn a_custom_provider_without_a_list_keeps_its_cost_hidden() {
+        let mut c = Config::default();
+        c.custom_providers.push(CustomProvider {
+            name: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        assert!(c.price_list().is_none());
+        let json = c.to_disk_json();
+        assert!(json.get("price_in").is_none() && json.get("price_currency").is_none(), "{json}");
+
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        back.sync_prices();
+        assert!(back.price_list().is_none(), "still hidden after a round trip");
+        assert_eq!(back.price_in, 0.0);
+    }
+
     /// The old `thinking: true` did something only on DeepSeek/GLM. Elsewhere
     /// (here: a local Qwen behind Splash) it must stay a no-op, not become a
     /// request that switches reasoning on.
