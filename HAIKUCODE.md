@@ -204,12 +204,18 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   permission mode (ask/yolo/plan — applies live and saves for new sessions),
   auto-commit, theme, context window, max tool calls, price currency. Changes
   apply immediately and persist.
-- Costs and balance: `src/money.rs` formats both, tagging each with its ISO code
-  when the account's billing currency differs from `price_currency`. DeepSeek
-  reports CNY for China-region accounts, so a CNY account on the default USD
-  prices sees `$0.03 USD · … │ bal ¥135.70 CNY` plus a one-time hint to set
-  `price_currency` (and CNY prices) if they want a single unit. Nothing is ever
-  converted — an exchange rate would be a guess.
+- Costs and balance: the cost counter follows the active provider — switching
+  providers switches the price list (the built-in `PRICES` table in config.rs
+  for the presets, or the user's `prices.<provider>` entry in config.json,
+  which wins and survives a provider round trip). A custom server without a
+  price list hides the cost: the status segment drops out, `/cost` drops the
+  figure, and the one-shot JSON reports `cost: null`. `src/money.rs` formats
+  both money readouts, tagging each with its ISO code when the account's
+  billing currency differs from `price_currency`. DeepSeek reports CNY for
+  China-region accounts, so a CNY account on the default USD prices sees
+  `$0.03 USD · … │ bal ¥135.70 CNY`; set `price_currency` (and CNY prices)
+  for that provider if you want a single unit. Nothing is ever converted —
+  an exchange rate would be a guess.
 
 ## Building (natively on Haiku)
 
