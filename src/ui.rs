@@ -2899,13 +2899,17 @@ impl App {
 
     fn cost_lines(&self) -> Vec<String> {
         let tokens = self.sess_prompt + self.sess_completion;
-        let cost = self.session_cost();
+        // A custom server without a price list: the cost is hidden.
+        let cost = match self.session_cost() {
+            Some(c) => format!(" · {}", money::fmt_cost_tagged(c, &self.price_currency)),
+            None => String::new(),
+        };
         let mut v = vec![format!(
-            "session: {} tokens ({} in / {} out) · {}",
+            "session: {} tokens ({} in / {} out){}",
             humanize(tokens),
             humanize(self.sess_prompt),
             humanize(self.sess_completion),
-            money::fmt_cost_tagged(cost, &self.price_currency)
+            cost
         )];
         if self.sess_cached + self.sess_written > 0 {
             v.push(format!(
