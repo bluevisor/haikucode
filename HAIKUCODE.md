@@ -292,6 +292,8 @@ Each server is spawned over stdio at launch; its tools appear as
 
 ## CI
 
-`.github/workflows/ci.yml` runs `cargo test` on Linux (hard gate); GitHub has
-no Haiku runners, so run `cargo test --bins` on the VM before shipping. Clippy
-and `cargo fmt --check` run advisory-only until the tree is clean.
+`.github/workflows/ci.yml` runs build, `cargo test` and
+`cargo clippy --all-targets -- -D warnings` on Linux with a pinned Rust version
+(all hard gates); GitHub has no Haiku runners, so run `cargo test --bins` on the
+VM before shipping. `cargo fmt --check` is advisory until the tree is
+formatted. See [`DEVELOPMENT.md`](DEVELOPMENT.md).

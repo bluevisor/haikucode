@@ -503,10 +503,8 @@ pub fn spawn(
                     Config::persist_patch(&p);
                     // Rebuild the system prompt when auto_commit toggles, so the
                     // model's git-instructions stay in sync with the live config.
-                    if matches!(&p, ConfigPatch::AutoCommit(_)) {
-                        if !w.messages.is_empty() {
-                            w.messages[0] = Message::system(system_prompt(w.cfg.auto_commit));
-                        }
+                    if matches!(&p, ConfigPatch::AutoCommit(_)) && !w.messages.is_empty() {
+                        w.messages[0] = Message::system(system_prompt(w.cfg.auto_commit));
                     }
                     // The balance is shown in this currency: re-fetch it.
                     if matches!(&p, ConfigPatch::PriceCurrency(_)) {
@@ -597,22 +595,21 @@ pub fn spawn(
                         let cancel_flag = Arc::new(AtomicBool::new(false));
                         w.suggest_cancel = cancel_flag.clone();
                         std::thread::spawn(move || {
-                            match api::chat_plain(&suggest_http, &suggest_cfg, &suggest_msgs, &cancel_flag) {
-                                Ok((text, usage)) => {
-                                    // Billed even when the result arrives too late to show.
-                                    if let Some(u) = usage {
-                                        let _ = suggest_ui.send(spend(&u));
-                                    }
-                                    // Drop a result that arrived after a new turn began.
-                                    if cancel_flag.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    let text = text.trim().trim_matches('"').trim();
-                                    if !text.is_empty() && text.len() < 200 {
-                                        let _ = suggest_ui.send(UiEvent::Suggestion(text.to_string()));
-                                    }
+                            if let Ok((text, usage)) = api::chat_plain(&suggest_http, &suggest_cfg, &suggest_msgs, &cancel_flag) {
+                                // Billed even when the result arrives too late to show.
+                                if let Some(u) = usage {
+                                    let _ = suggest_ui.send(spend(&u));
                                 }
-                                Err(_) => {} // silently skip on error
+                                // Drop a result that arrived after a new turn began.
+                                if cancel_flag.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let text = text.trim().trim_matches('"').trim();
+                                if !text.is_empty() && text.len() < 200 {
+                                    let _ = suggest_ui.send(UiEvent::Suggestion(text.to_string()));
+                                }
+                            } else {
+                                // silently skip on error
                             }
                         });
                     }

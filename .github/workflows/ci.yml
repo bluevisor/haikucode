@@ -7,25 +7,29 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a new Rust release can't turn main red with fresh clippy lints.
+  # Bump it deliberately, fixing whatever the new clippy reports in the same PR.
+  RUST_VERSION: "1.94.1"
 
 jobs:
-  # Hard gate: the code compiles and every unit test passes on the host.
+  # Hard gates: the code compiles, every unit test passes and clippy is clean.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # rustup is preinstalled on GitHub runners; no third-party toolchain action.
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --locked --verbose
       - name: Test
         run: cargo test --bins --locked --verbose
-      # Lint and format are advisory: the tree isn't fully rustfmt/clippy-clean
-      # yet, and clippy lints drift between toolchain versions. Surface them
-      # without failing the build.
-      - name: Clippy (advisory)
-        run: cargo clippy --bins || true
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # Advisory: the tree predates rustfmt, and reformatting it in one go
+      # would conflict with every open branch. Format the code you touch.
       - name: Format check (advisory)
         run: cargo fmt --check || true

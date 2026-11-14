@@ -3166,7 +3166,7 @@ impl App {
 
     pub fn tick_spinner(&mut self) -> bool {
         self.spin_counter += 1;
-        if self.spin_counter % 6 == 0 {
+        if self.spin_counter.is_multiple_of(6) {
             self.spinner = (self.spinner + 1) % 10;
             true
         } else {
@@ -3654,8 +3654,7 @@ impl App {
                     } else {
                         let marker = if self.ascii { ">" } else { "▸" };
                         let end = (picker.scroll + PICKER_VISIBLE).min(filtered.len());
-                        for fi in picker.scroll..end {
-                            let idx = filtered[fi];
+                        for (fi, &idx) in filtered.iter().enumerate().take(end).skip(picker.scroll) {
                             let sel = fi == picker.cursor;
                             let lead = if sel { marker } else { " " };
                             let mark = if Some(idx) == picker.current { " (*)" } else { "" };
@@ -3979,6 +3978,7 @@ impl App {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::helpers::clean_text;
     use super::palette::palette_by_name;
@@ -4429,7 +4429,7 @@ mod tests {
 
     #[test]
     fn provider_wizard_asks_only_for_a_missing_key_then_the_model() {
-        use crate::ui::types::{PickAction, ProviderStep};
+        use crate::ui::types::ProviderStep;
         let mut app = App::new(test_ui_config(), Vec::new());
         let (h, rx) = test_handles();
         app.settings.api_keys.insert("deepseek".into(), "k".into());

@@ -621,11 +621,7 @@ mod tests {
     use crate::api::{FunctionCall, ToolCall};
 
     fn cfg(provider: &str, model: &str, reasoning: &str) -> Config {
-        let mut c = Config::default();
-        c.provider = provider.into();
-        c.model = model.into();
-        c.reasoning = reasoning.into();
-        c
+        Config { provider: provider.into(), model: model.into(), reasoning: reasoning.into(), ..Config::default() }
     }
 
     fn assistant_call(id: &str, args: &str) -> Message {

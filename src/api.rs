@@ -906,7 +906,8 @@ pub fn exchange_rate(http: &ureq::Agent, from: &str, to: &str) -> Option<f64> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    static RATES: OnceLock<Mutex<HashMap<(String, String), (f64, Instant)>>> = OnceLock::new();
+    type RateCache = Mutex<HashMap<(String, String), (f64, Instant)>>;
+    static RATES: OnceLock<RateCache> = OnceLock::new();
     let iso = |c: &str| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase());
     if !iso(from) || !iso(to) {
         return None;
@@ -1039,9 +1040,7 @@ mod balance_tests {
     #[test]
     fn reasoning_maps_to_fields_each_provider_accepts() {
         let fields = |provider: &str, level: &str| {
-            let mut c = Config::default();
-            c.provider = provider.into();
-            c.reasoning = level.into();
+            let c = Config { provider: provider.into(), reasoning: level.into(), ..Config::default() };
             serde_json::to_value(reasoning_fields(&c).into_iter().collect::<std::collections::BTreeMap<_, _>>()).unwrap()
         };
         use serde_json::json as j;
@@ -1074,9 +1073,7 @@ mod balance_tests {
 
     #[test]
     fn a_text_only_rejection_marks_the_model_and_strips_images() {
-        let mut cfg = Config::default();
-        cfg.provider = "vercel".into();
-        cfg.model = "reflection/beam-free-test".into();
+        let cfg = Config { provider: "vercel".into(), model: "reflection/beam-free-test".into(), ..Config::default() };
         let with_img = [Message::user_with_images("look", vec!["data:image/png;base64,AAAA".into()])];
         let err = |code, detail: &str| anyhow::Error::from(HttpStatus { code, retry_after: None, detail: detail.into() });
         let vercel = r#"{"error":{"message":"This API supports text input only. This conversation contains an image."}}"#;
@@ -1178,7 +1175,7 @@ mod balance_tests {
     #[test]
     fn images_are_dropped_entirely_for_providers_without_vision() {
         let m = Message::user_with_images("look", vec!["data:image/png;base64,AAAA".into()]);
-        let v = &messages_payload(&[m.clone()], false, "m")[0];
+        let v = &messages_payload(std::slice::from_ref(&m), false, "m")[0];
         assert!(v.get("images").is_none(), "{v}");
         assert_eq!(v["content"], "look");
         let v = &messages_payload(&[m], true, "m")[0];
