@@ -1014,13 +1014,6 @@ impl Config {
         }
     }
 
-    /// Price per 1M cached input tokens for the active provider: the
-    /// configured one, else a tenth of `price_in`, the usual cache-read
-    /// discount (Anthropic, OpenAI).
-    pub fn price_cached(&self) -> f64 {
-        self.price_cached_in.unwrap_or(self.price_in * 0.1)
-    }
-
     /// The price list that applies to `provider`: the user-set one from
     /// `prices`, else the built-in `PRICES` table. `None` for a custom server
     /// with no known price (its cost readout is hidden).
