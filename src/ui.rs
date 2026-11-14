@@ -169,6 +169,10 @@ pub struct App {
     /// The same for the composer's text, and zero when no composer is on
     /// screen (an approval prompt, say).
     composer_area: Rect,
+    /// The layout row drawn on the composer's first screen row: the text
+    /// scrolls to the caret once it outgrows the box, so a cell only maps back
+    /// to a char if the offset it was drawn at is known.
+    composer_first: usize,
     /// A short note the status bar shows for a moment ("copied 214 chars"), for
     /// actions that shouldn't write a line into the transcript.
     flash: Option<(String, Instant)>,
@@ -224,8 +228,13 @@ pub struct App {
     ctx_limit: u32,
     price_in: f64,
     price_out: f64,
+    /// Price per 1M cached input tokens for the active provider's list.
+    price_cached_in: Option<f64>,
     /// Unit the prices above are quoted in; the account balance carries its own.
     price_currency: money::Currency,
+    /// False when the active server's price is unknown (a custom provider
+    /// without a price list): the cost readout is hidden.
+    cost_known: bool,
     last_prompt_tokens: u32,
     sess_prompt: u64,
     sess_completion: u64,
@@ -392,6 +401,7 @@ impl App {
             select: None,
             output_area: Rect::new(0, 0, 0, 0),
             composer_area: Rect::new(0, 0, 0, 0),
+            composer_first: 0,
             flash: None,
             screen: None,
             spinner: 0,
@@ -2151,9 +2161,10 @@ impl App {
     }
 
     /// Handle a mouse event and say what the loop should do about it: the
-    /// wheel scrolls (dropping any selection), a left drag selects, and letting
-    /// go asks for a copy. Kept apart from the event loop so the mapping is
-    /// tested; reading the drawn frame and repainting stay the loop's job.
+    /// wheel scrolls (dropping any selection), a left drag selects in the
+    /// transcript or the composer, and letting go asks for a copy. Kept apart
+    /// from the event loop so the mapping is tested; reading the drawn frame
+    /// and repainting stay the loop's job.
     pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> MouseAction {
         match kind {
             MouseEventKind::ScrollUp => {
@@ -2173,73 +2184,71 @@ impl App {
                 if self.select_drag(col, row) { MouseAction::Redraw } else { MouseAction::None }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                // Letting go ends the selection either way; a click that never
-                // moved copies nothing.
-                let Some((start, end)) = self.select.take().map(|(a, b)| {
-                    if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
-                }) else {
+                // Letting go ends the selection either way.
+                let Some(select) = self.select.take() else {
                     return MouseAction::None;
                 };
+                let (start, end) = select.corners();
                 if start == end {
-                    MouseAction::None
-                } else {
-                    MouseAction::Copy(start, end)
+                    // A click: in the composer it puts the caret where it
+                    // landed (the transcript has nothing to put it in).
+                    if select.kind == SelectKind::Composer {
+                        self.place_caret(end.0, end.1);
+                        return MouseAction::Redraw;
+                    }
+                    return MouseAction::None;
                 }
+                MouseAction::Copy(select.kind, start, end)
             }
             _ => MouseAction::None,
         }
     }
 
-    /// Start a drag-selection at a screen cell, if that cell is in the
-    /// transcript. Returns whether one started (so the caller repaints).
+    /// Start a drag at a screen cell: in the transcript, or in the composer's
+    /// text. A press anywhere else starts nothing. Returns whether one began
+    /// (so the caller repaints).
     pub fn select_begin(&mut self, col: u16, row: u16) -> bool {
-        if !self.output_area.contains(Position::new(col, row)) {
-            return false;
-        }
-        let Some(at) = self.clamped_cell(col, row) else {
+        let pos = Position::new(col, row);
+        let (kind, area, left) = if self.output_area.contains(pos) {
+            (SelectKind::Output, self.output_area, self.output_area.x)
+        } else if self.composer_area.contains(pos) {
+            // The prompt isn't text: the drag starts at the first input column.
+            let left = self.composer_area.x + self.prompt_w() as u16;
+            (SelectKind::Composer, self.composer_area, left.min(self.composer_area.right() - 1))
+        } else {
             return false;
         };
-        self.select = Some((at, at));
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+        let at = (col.clamp(left, area.right() - 1), row.clamp(area.y, area.bottom() - 1));
+        self.select = Some(Select { kind, area, left, anchor: at, cursor: at });
         true
     }
 
     /// Extend the drag to a screen cell: past the box's edge the selection
-    /// stops at the edge rather than running into the composer.
+    /// stops at the edge rather than running into the rest of the screen.
     pub fn select_drag(&mut self, col: u16, row: u16) -> bool {
-        let Some(at) = self.clamped_cell(col, row) else {
+        let Some(select) = self.select.as_mut() else {
             return false;
         };
-        match self.select.as_mut() {
-            Some((_, end)) => {
-                *end = at;
-                true
-            }
-            None => false,
-        }
+        select.cursor = (
+            col.clamp(select.left, select.area.right().saturating_sub(1)),
+            row.clamp(select.area.y, select.area.bottom().saturating_sub(1)),
+        );
+        true
     }
 
     /// The selection in reading order — top-left cell first — for the copy and
     /// the highlight alike.
     pub fn selection(&self) -> Option<((u16, u16), (u16, u16))> {
-        self.select
-            .map(|(a, b)| if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) })
+        self.select.map(|s| s.corners())
     }
 
-    /// Forget the selection (the view scrolled, or the user typed).
+    /// Forget the selection (the view scrolled, the user typed).
     pub fn select_clear(&mut self) {
         self.select = None;
         self.screen = None;
-    }
-
-    fn clamped_cell(&self, col: u16, row: u16) -> Option<(u16, u16)> {
-        let area = self.output_area;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        Some((
-            col.clamp(area.x, area.right() - 1),
-            row.clamp(area.y, area.bottom() - 1),
-        ))
     }
 
     /// Copy a range of screen cells out of the frame that was drawn and put it
@@ -2251,6 +2260,77 @@ impl App {
             return;
         };
         let text = helpers::selected_text(&buf, self.output_area, start, end);
+        self.copy_text(text);
+    }
+
+    /// Copy the composer's text between two cells of it: the input string, not
+    /// the cells, so the prompt, the wrap points and the block cursor stay out
+    /// of what lands on the clipboard.
+    pub fn copy_input_range(&mut self, start: (u16, u16), end: (u16, u16)) {
+        let text = self.input_text(start, end);
+        self.copy_text(text);
+    }
+
+    /// The input text a cell range covers. Char indices, so a wide character or
+    /// a tab can't shift the result.
+    fn input_text(&self, a: (u16, u16), b: (u16, u16)) -> String {
+        let chars: Vec<char> = self.input.chars().collect();
+        let (Some(from), Some(to)) = (self.composer_index(a), self.composer_index(b)) else {
+            return String::new();
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        if chars.is_empty() {
+            return String::new();
+        }
+        // The cell past a row's last character selects up to it, not past the
+        // end of the input.
+        let hi = hi.min(chars.len() - 1);
+        if lo > hi {
+            return String::new();
+        }
+        chars[lo..=hi].iter().collect()
+    }
+
+    /// Put the caret where a click landed in the composer.
+    fn place_caret(&mut self, col: u16, row: u16) {
+        if let Some(index) = self.composer_index((col, row)) {
+            self.cursor = index.min(self.input.chars().count());
+        }
+    }
+
+    /// The char of the input a composer cell maps to, laid out exactly as the
+    /// composer was drawn (same wrap width, same scrolled-to-the-caret offset).
+    /// Past the end of a row it is the position after that row's last char;
+    /// below the last row, the end of the input.
+    fn composer_index(&self, at: (u16, u16)) -> Option<usize> {
+        let area = self.composer_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let pw = self.prompt_w();
+        let width = (area.width as usize).saturating_sub(pw).max(1);
+        let layout = self.layout_input(width);
+        let offset = at.1.saturating_sub(area.y) as usize;
+        let row = self.composer_first + offset;
+        let Some(line) = layout.rows.get(row) else {
+            return Some(self.input.chars().count());
+        };
+        // Columns are measured from the first cell of the input on that row.
+        let mut want = (at.0.saturating_sub(area.x) as usize).saturating_sub(pw);
+        let mut chars = 0;
+        for c in line.chars() {
+            let cells = self.cell_w(c).max(1);
+            if want < cells {
+                return Some(layout.starts[row] + chars);
+            }
+            want -= cells;
+            chars += 1;
+        }
+        Some(layout.starts[row] + chars)
+    }
+
+    /// Hand `text` to the clipboard and say how much went, or why it couldn't.
+    fn copy_text(&mut self, text: String) {
         if text.trim().is_empty() {
             self.flash_note("nothing to copy".to_string());
             return;
@@ -2259,7 +2339,11 @@ impl App {
             Ok(()) => {
                 let chars = text.chars().count();
                 let lines = text.lines().count().max(1);
-                let what = if lines > 1 { format!("{chars} chars, {lines} lines") } else { format!("{chars} chars") };
+                let what = if lines > 1 {
+                    format!("{chars} chars, {lines} lines")
+                } else {
+                    format!("{chars} chars")
+                };
                 self.flash_note(format!("copied {what}"));
             }
             Err(e) => self.flash_note(format!("copy failed: {e}")),
@@ -3262,7 +3346,8 @@ impl App {
         self.push(Kind::Notice, "   and tmux/screen keep Ctrl+B/Ctrl+A for themselves)");
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
         self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  scroll the output 3 lines");
-        self.push(Kind::Notice, "  drag        select output text (releasing copies it)");
+        self.push(Kind::Notice, "  drag        select output or input text (releasing copies it)");
+        self.push(Kind::Notice, "  click       in the input: put the caret there");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
         self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / YOLO / plan; remembered)"));
         self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A YOLO (approve everything)"));
@@ -3461,14 +3546,14 @@ impl App {
     /// wrapped long line. Reversing them keeps each cell's own color readable
     /// on any theme, and it needs nothing from the renderer but the box.
     fn render_selection(&self, f: &mut Frame) {
-        let Some((start, end)) = self.selection() else {
+        let Some(select) = self.select else {
             return;
         };
-        let area = self.output_area;
-        let right = area.right().saturating_sub(1);
+        let (start, end) = select.corners();
+        let right = select.area.right().saturating_sub(1);
         let buf = f.buffer_mut();
         for row in start.1..=end.1 {
-            let from = if row == start.1 { start.0 } else { area.x };
+            let from = if row == start.1 { start.0 } else { select.left };
             let to = if row == end.1 { end.0 } else { right };
             for col in from.min(right)..=to.min(right) {
                 if let Some(cell) = buf.cell_mut((col, row)) {
@@ -3713,7 +3798,11 @@ impl App {
         out.pop().unwrap_or_default()
     }
 
-    fn render_inputline(&self, f: &mut Frame, area: Rect) {
+    fn render_inputline(&mut self, f: &mut Frame, area: Rect) {
+        // Whatever the mode, forget where the last frame's composer was: only
+        // a composer drawn this frame may be dragged in.
+        self.composer_area = Rect::new(0, 0, 0, 0);
+        self.composer_first = 0;
         match &self.mode {
             Mode::Idle => self.render_composer(f, area),
             Mode::Busy => {
@@ -3978,7 +4067,10 @@ impl App {
         }
     }
 
-    fn render_composer(&self, f: &mut Frame, inner: Rect) {
+    fn render_composer(&mut self, f: &mut Frame, inner: Rect) {
+        // Remembered for mouse selections: a drag in the composer is a range
+        // of its cells, mapped back to chars by the same layout.
+        self.composer_area = inner;
         let pw = self.prompt_w();
         let w = (inner.width as usize).saturating_sub(pw).max(1);
         let empty = self.input.is_empty();
@@ -3986,6 +4078,7 @@ impl App {
         let total_rows = rows.len();
         let max_rows = inner.height as usize;
         let start_row = if cur_row >= max_rows { cur_row - max_rows + 1 } else { 0 };
+        self.composer_first = start_row;
 
         let prompt = self.prompt_str();
         let cursor = self.palette.cursor;
@@ -4231,8 +4324,8 @@ mod tests {
     use super::palette::palette_by_name;
     use super::{
         echo_excerpt, palette_for, want_mouse_capture, App, ConfigPatch, Handles, KeyCode, KeyEvent,
-        KeyModifiers, Mode, MouseAction, MouseButton, MouseEventKind, ECHO_LINES, TAB_W, THEMES,
-        UiConfig, UiEvent, WorkerCmd,
+        KeyModifiers, Mode, MouseAction, MouseButton, MouseEventKind, SelectKind, ECHO_LINES,
+        TAB_W, THEMES, UiConfig, UiEvent, WorkerCmd,
     };
 
     #[test]
@@ -5599,6 +5692,167 @@ mod tests {
         assert!(app.selection().is_none());
     }
 
+    /// A composer drag selects the input's characters, not the cells: tabs and
+    /// wide characters can't shift the result, and the prompt stays out of it.
+    #[test]
+    fn a_drag_in_the_composer_copies_input_text() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.composer_area = Rect::new(0, 20, 60, 2);
+        let pw = app.prompt_w() as u16;
+        let row = 20;
+
+        app.input = "git commit -m wip".to_string();
+        assert_eq!(app.input_text((pw + 4, row), (pw + 9, row)), "commit");
+        // Either direction is the same selection.
+        assert_eq!(app.input_text((pw + 9, row), (pw + 4, row)), "commit");
+        // The cell past a row's last character stops there, not past the end.
+        assert_eq!(app.input_text((pw, row), (pw + 40, row)), "git commit -m wip");
+
+        // A tab is one char in the buffer however many cells it draws over.
+        app.input = "a\tb".to_string();
+        assert_eq!(app.input_text((pw + 1, row), (pw + 2, row)), "\t");
+        assert_eq!(app.input_text((pw, row), (pw + 5, row)), "a\tb");
+
+        // Wide characters map to their own char, not to two cells of it.
+        app.input = "世界 x".to_string();
+        assert_eq!(app.input_text((pw, row), (pw + 3, row)), "世界");
+        assert_eq!(app.input_text((pw + 5, row), (pw + 5, row)), "x");
+
+        // A click in the prompt selects from the first input column.
+        app.input = "abc".to_string();
+        assert!(app.select_begin(0, row));
+        let select = app.select.expect("a selection started");
+        assert_eq!(select.kind, SelectKind::Composer);
+        assert_eq!(select.anchor, (pw, row), "clamped past the prompt");
+        assert_eq!(app.input_text(select.anchor, (pw + 2, row)), "abc");
+    }
+
+    /// A click (no drag) in the composer puts the caret where it landed, which
+    /// is what a text field is expected to do; the transcript ignores clicks.
+    #[test]
+    fn a_click_in_the_composer_places_the_caret() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.input = "hello world".to_string();
+        app.cursor = 0;
+        app.output_area = Rect::new(0, 0, 60, 3);
+        app.composer_area = Rect::new(0, 8, 60, 1);
+        let pw = app.prompt_w() as u16;
+
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), pw + 6, 8),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), pw + 6, 8),
+            MouseAction::Redraw
+        );
+        assert_eq!(app.cursor, 6, "the caret goes before the word clicked on");
+        assert!(app.select.is_none(), "a click leaves no selection behind");
+
+        // A drag in the composer asks for the copy instead.
+        assert!(app.select_begin(pw + 2, 8));
+        assert!(app.select_drag(pw + 6, 8));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), pw + 6, 8),
+            MouseAction::Copy(SelectKind::Composer, (pw + 2, 8), (pw + 6, 8))
+        );
+        assert_eq!(app.cursor, 6, "a selection never moves the caret");
+    }
+
+    /// The composer that was drawn is the one drags map to: the box the mouse
+    /// is over, the row the text sits on, and the cells the highlight covers.
+    #[test]
+    fn the_composer_drawn_on_screen_is_the_one_drags_map_to() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.input = "select me please".to_string();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let screen = draw(&mut app, &mut term);
+
+        let row = app.composer_area.y;
+        let line = screen.lines().nth(row as usize).unwrap();
+        assert!(line.contains("select me please"), "{screen}");
+        let col = |byte: usize| line[..byte].chars().count() as u16;
+        let from = col(line.find("me please").unwrap());
+        let to = from + 1;
+
+        assert!(app.select_begin(from, row), "the press lands in the composer");
+        assert!(app.select_drag(to, row));
+        draw(&mut app, &mut term);
+
+        let buf = term.backend().buffer();
+        for c in from..=to {
+            assert!(
+                buf.cell((c, row)).unwrap().modifier.contains(Modifier::REVERSED),
+                "column {c} of the composer is not highlighted"
+            );
+        }
+        assert_eq!(app.input_text((from, row), (to, row)), "me");
+    }
+
+    /// A wrapped composer maps the second and later rows back to the chars
+    /// drawn on them, and pulls up to the caret when the text outgrows a box
+    /// that is only two rows tall.
+    #[test]
+    fn a_wrapped_composer_maps_each_row_back_to_its_chars() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.composer_area = Rect::new(0, 20, 16, 2);
+        let pw = app.prompt_w() as u16;
+        app.input = "abcdefghij klmnopqrstuvwxyz abcd efgh".to_string();
+        app.cursor = app.input.chars().count();
+
+        let layout = app.layout_input((16 - pw) as usize);
+        assert!(layout.rows.len() > 2, "the text needs more rows than the box: {:?}", layout.rows);
+        // The box shows the last two rows, so its first screen row is row 1.
+        app.composer_first = layout.cur_row - 1;
+        let second = layout.rows[app.composer_first + 1].clone();
+        let first_on_screen = layout.starts[app.composer_first];
+        assert_eq!(app.input_text((pw, 20), (pw, 20)).chars().count(), 1);
+        assert_eq!(
+            app.input_text((pw, 20), (pw + 1, 20)),
+            app.input.chars().skip(first_on_screen).take(2).collect::<String>()
+        );
+        assert_eq!(
+            app.input_text((pw, 21), (pw + 1, 21)),
+            second.chars().take(2).collect::<String>()
+        );
+    }
+
+    /// A press outside both boxes starts nothing, and a drag never leaves the
+    /// box it began in.
+    #[test]
+    fn a_drag_stays_in_the_box_it_started_in() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(0, 0, 40, 6);
+        app.composer_area = Rect::new(0, 8, 40, 1);
+
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 5, 7),
+            MouseAction::None,
+            "the rule between the boxes takes no selection"
+        );
+        assert!(app.select_begin(5, 5));
+        assert!(app.select_drag(5, 30));
+        let select = app.select.expect("still dragging");
+        assert_eq!(select.kind, SelectKind::Output);
+        assert_eq!(select.cursor.1, 5, "clamped to the transcript's last row");
+    }
+
     /// The loop's mouse arms: the wheel scrolls and drops a selection, a left
     /// drag selects, letting go asks for the copy, and stray motion does
     /// nothing.
@@ -5620,7 +5874,7 @@ mod tests {
         );
         assert_eq!(
             app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
-            MouseAction::Copy((5, 3), (9, 3))
+            MouseAction::Copy(SelectKind::Output, (5, 3), (9, 3))
         );
         assert_eq!(
             app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
@@ -6136,8 +6390,11 @@ pub fn run<B: ratatui::backend::Backend>(
                 Event::Mouse(m) => match app.on_mouse(m.kind, m.column, m.row) {
                     MouseAction::None => {}
                     MouseAction::Redraw => dirty = true,
-                    MouseAction::Copy(start, end) => {
-                        app.copy_range(start, end);
+                    MouseAction::Copy(kind, start, end) => {
+                        match kind {
+                            SelectKind::Output => app.copy_range(start, end),
+                            SelectKind::Composer => app.copy_input_range(start, end),
+                        }
                         dirty = true;
                     }
                 },
