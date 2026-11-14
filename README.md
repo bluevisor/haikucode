@@ -522,10 +522,9 @@ when the terminal supports it, so modified keys are reported unambiguously.
 Without it, some terminals (e.g. Warp in full-screen mode) flatten
 `Option+Backspace` to a plain Backspace.
 
-Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) because it grabs
-click-drag text selection with no modifier to bypass it — Warp users scroll with
-`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn`, and select with Warp's own drag. Elsewhere,
-because haikucode holds the mouse for the wheel, it does the selecting itself:
+Mouse capture is enabled by default in all terminals, including Warp, so the
+wheel scrolls only the output and cannot navigate input history. Haikucode
+handles selection itself:
 drag across the transcript (or the composer) and the text under the drag is
 copied when you let go (and the status bar says how much), to `pbcopy`, Haiku's
 `clipboard`, or `wl-copy`/`xclip`/`xsel`, falling back to OSC 52 where the

@@ -989,22 +989,30 @@ pub fn parse_max_tool_calls(s: &str) -> u32 {
 }
 
 /// The text under a screen-cell selection, read back from the frame that was
-/// drawn: rows `a` to `b` in either order, each stripped of trailing blanks
+/// drawn: rows `a` to `b` in either order, clipped to `area` (the transcript,
+/// so a row never picks up the box's border), each stripped of trailing blanks
 /// and joined with newlines. Reading the cells rather than the transcript
 /// means the copy is exactly what the user saw — wrapped where it wrapped,
 /// tool output and diffs included — without the renderer having to expose its
 /// layout. A wide character's second cell carries an empty symbol and is
 /// skipped, so CJK text isn't doubled.
-pub fn selected_text(buf: &ratatui::buffer::Buffer, a: (u16, u16), b: (u16, u16)) -> String {
+pub fn selected_text(
+    buf: &ratatui::buffer::Buffer,
+    area: Rect,
+    a: (u16, u16),
+    b: (u16, u16),
+) -> String {
     use unicode_width::UnicodeWidthStr;
 
     let (start, end) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
-    let area = buf.area;
     let last_col = area.right().saturating_sub(1);
+    let last_row = area.bottom().saturating_sub(1);
     let mut rows = Vec::new();
-    for row in start.1..=end.1.min(area.bottom().saturating_sub(1)) {
-        let from = if row == start.1 { start.0 } else { area.x }.min(last_col);
-        let to = if row == end.1 { end.0 } else { last_col }.min(last_col);
+    for row in start.1..=end.1.min(last_row) {
+        // Continuation rows run the transcript's width; the first and last
+        // start and stop where the drag did, all of it inside `area`.
+        let from = (if row == start.1 { start.0.max(area.x) } else { area.x }).min(last_col);
+        let to = (if row == end.1 { end.0 } else { last_col }).min(last_col);
         let mut line = String::new();
         // Cells covered by the second half of a wide character keep a blank
         // symbol of their own: stepping over them is what keeps 世界 from
@@ -1114,14 +1122,20 @@ mod tests {
         Paragraph::new("hello 世界").render(Rect::new(0, 0, 14, 1), &mut buf);
         Paragraph::new("  indent  ").render(Rect::new(0, 1, 14, 1), &mut buf);
 
-        assert_eq!(selected_text(&buf, (0, 0), (13, 1)), "hello 世界\n  indent");
+        let area = Rect::new(0, 0, 14, 3);
+        assert_eq!(selected_text(&buf, area, (0, 0), (13, 1)), "hello 世界\n  indent");
         // Bottom-right to top-left is the same selection.
-        assert_eq!(selected_text(&buf, (13, 1), (0, 0)), "hello 世界\n  indent");
+        assert_eq!(selected_text(&buf, area, (13, 1), (0, 0)), "hello 世界\n  indent");
         // Partial rows, from either end of the drag.
-        assert_eq!(selected_text(&buf, (7, 1), (2, 0)), "llo 世界\n  indent");
-        assert_eq!(selected_text(&buf, (2, 0), (7, 1)), "llo 世界\n  indent");
+        assert_eq!(selected_text(&buf, area, (7, 1), (2, 0)), "llo 世界\n  indent");
+        assert_eq!(selected_text(&buf, area, (2, 0), (7, 1)), "llo 世界\n  indent");
         // A blank row copies nothing at all, not a run of spaces.
-        assert_eq!(selected_text(&buf, (0, 2), (13, 2)), "");
+        assert_eq!(selected_text(&buf, area, (0, 2), (13, 2)), "");
+
+        // Clipped to the transcript: a row inside a box stops at its last
+        // column, so the border never comes along.
+        let inner = Rect::new(1, 0, 12, 3);
+        assert_eq!(selected_text(&buf, inner, (0, 0), (13, 1)), "ello 世界\n indent");
     }
 
     /// OSC 52 carries the clipboard text as standard base64.

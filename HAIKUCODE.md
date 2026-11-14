@@ -134,10 +134,10 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
 - Transcript scrolling: Ctrl/Alt+↑/↓ roll the output 3 lines, PgUp/PgDn a whole
   viewport, the mouse wheel a notch (where capture is on). Scrolling up pins the
   view and turns on a "↓ new" hint; sending a message snaps back to the live
-  end. Scrolling has a keyboard gesture rather than only the wheel because Warp
-  skips mouse capture (below) and would otherwise have no way to scroll.
-- Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) so click-drag
-  text selection keeps working; `HAIKUCODE_MOUSE=1`/`0` overrides either way.
+  end. Keyboard scrolling also works when mouse capture is disabled.
+- Mouse capture is enabled in every terminal, including Warp, so wheel events
+  only scroll output instead of navigating input history. `HAIKUCODE_MOUSE=0`
+  opts out; app-managed click-drag selection remains available with capture on.
 - Selecting text: drag across the transcript and the cells under the drag are
   reversed as you go; letting go copies them. The copy is read back out of the
   frame ratatui just drew (`helpers::selected_text`), so it is exactly what was
