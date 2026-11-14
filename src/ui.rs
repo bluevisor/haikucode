@@ -3218,7 +3218,24 @@ impl App {
         self.settings.base_url = base_url.clone();
         self.settings.model = model.clone();
         self.settings.resolve_key();
+        self.sync_prices(); // the cost counter follows the provider
         let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider { provider, base_url, model }));
+    }
+
+    /// The cost counter follows the active provider: take its price list (the
+    /// user-set one, else the built-in table) or hide the cost (a custom
+    /// server with no known price).
+    fn sync_prices(&mut self) {
+        match self.settings.price_list() {
+            Some(p) => {
+                self.price_in = p.price_in;
+                self.price_out = p.price_out;
+                self.price_cached_in = p.price_cached_in;
+                self.price_currency = money::Currency::parse(&p.price_currency);
+                self.cost_known = true;
+            }
+            None => self.cost_known = false,
+        }
     }
 
     /// Apply a settings change here and in the worker (which saves it).
