@@ -3634,9 +3634,11 @@ impl App {
             9 => s.context_window.to_string(),
             10 => setting_max_tool_calls(s.max_tool_calls),
             11 => {
-                let defaults = Config::default();
-                if s.price_currency != "USD" && self.price_in == defaults.price_in && self.price_out == defaults.price_out {
-                    format!("{} (the price list is still USD: set price_in/price_out)", s.price_currency)
+                // Cycled off USD while the active provider still runs the
+                // built-in (USD-quoted) list: the prices are relabelled, not
+                // converted, so say where the real ones go.
+                if s.price_currency != "USD" && !s.prices.contains_key(&s.provider) {
+                    format!("{} (built-in list is still USD: set a prices entry for {0} in config.json)", s.price_currency)
                 } else {
                     s.price_currency.clone()
                 }
