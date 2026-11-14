@@ -4240,7 +4240,10 @@ impl App {
                 vec![Span::styled(format!("effort:{}", self.settings.reasoning), gray)]
             }
             "cost" if tokens > 0 => {
-                let cost = self.session_cost();
+                // A custom server without a price list has nothing to show.
+                let Some(cost) = self.session_cost() else {
+                    return Vec::new();
+                };
                 let cost = if aligned {
                     money::fmt_cost(cost, &self.price_currency)
                 } else {
