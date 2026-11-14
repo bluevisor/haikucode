@@ -1135,6 +1135,9 @@ impl Config {
                 self.model = model.clone();
                 // Swap to the new provider's saved key (or empty).
                 self.resolve_key();
+                // The cost counter follows the provider: its price list (the
+                // user-set one, else the built-in table, else hidden).
+                self.sync_prices();
             }
             ConfigPatch::AddProvider(cp) => {
                 self.custom_providers.retain(|c| c.name != cp.name);
