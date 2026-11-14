@@ -2875,15 +2875,20 @@ impl App {
         self.sess_written += s.written;
     }
 
-    /// Session cost so far, cache hits at the cached-input price.
-    fn session_cost(&self) -> f64 {
+    /// Session cost so far, cache hits at the cached-input price; `None` when
+    /// the active server's price is unknown (a custom provider without a
+    /// price list) — the cost readout is hidden.
+    fn session_cost(&self) -> Option<f64> {
+        if !self.cost_known {
+            return None;
+        }
         let spent = money::Spent {
             prompt: self.sess_prompt,
             completion: self.sess_completion,
             cached: self.sess_cached,
             written: self.sess_written,
         };
-        spent.cost(self.price_in, self.settings.price_cached(), self.price_out)
+        Some(spent.cost(self.price_in, self.price_cached_in.unwrap_or(self.price_in * 0.1), self.price_out))
     }
 
     /// Change the reasoning setting: live in the worker, persisted, and shown.
