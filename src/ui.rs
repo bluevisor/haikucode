@@ -2,11 +2,13 @@
 //! composer, and a status bar. Runs on the UI thread; the agent runs on a
 //! worker thread and feeds this UI through a channel.
 
+mod activity;
 mod banner;
 #[cfg_attr(not(target_os = "haiku"), allow(dead_code))]
 mod beclip;
 mod brief;
 mod helpers;
+mod markdown;
 mod palette;
 mod statusline;
 mod types;
@@ -19,6 +21,7 @@ pub use types::{detect_ascii, UiConfig};
 use crate::agent::{ApprovalResponse, Handles, UiEvent, WorkerCmd};
 use crate::config::{Config, ConfigPatch, PROVIDERS};
 use crate::money;
+use activity::Activity;
 use banner::{BRole, banner_lines};
 use helpers::{
     bar, clipboard_image, complete_path, humanize, longest_common_prefix, pad1,
@@ -164,6 +167,9 @@ pub struct App {
     spin_counter: usize,
     /// Clock time when the agent last entered Busy; used to show an elapsed timer.
     busy_since: Option<Instant>,
+    /// The tool the agent is running (from ToolStart until its result), for
+    /// the prompt's activity marker.
+    tool_running: Option<String>,
     model_info: String,
     last_models: Vec<String>,
     /// The current session ("id — label"), for /status.
@@ -326,6 +332,7 @@ impl App {
             spinner: 0,
             spin_counter: 0,
             busy_since: None,
+            tool_running: None,
             model_info: cfg.model,
             last_models: Vec::new(),
             session_label: String::new(),
@@ -502,6 +509,7 @@ impl App {
     pub fn handle_event(&mut self, ev: UiEvent, h: &Handles) {
         match ev {
             UiEvent::Token(t) => {
+                self.tool_running = None;
                 self.live.push_str(&t);
                 self.dirty();
             }
@@ -526,6 +534,7 @@ impl App {
                 }
             }
             UiEvent::ToolStart { name, summary } => {
+                self.tool_running = Some(name.clone());
                 self.flush_live();
                 self.push(Kind::Tool, format!("{name} {summary}"));
             }
@@ -546,6 +555,7 @@ impl App {
                 self.after_push();
             }
             UiEvent::ToolResult { ok, preview } => {
+                self.tool_running = None;
                 self.flush_live();
                 if preview.is_empty() {
                     return;
@@ -2179,6 +2189,7 @@ impl App {
     fn clear_busy(&mut self) {
         self.mode = Mode::Idle;
         self.busy_since = None;
+        self.tool_running = None;
     }
 
     fn dispatch(&mut self, text: String, h: &Handles) {
@@ -3298,12 +3309,29 @@ impl App {
         }
     }
 
-    fn prompt_str(&self) -> &'static str {
-        self.palette.prompt.unwrap_or(self.glyphs.prompt)
+    /// What the agent is doing, for the prompt's marker.
+    fn activity(&self) -> Activity {
+        match &self.mode {
+            Mode::Approval(_) | Mode::Question { .. } | Mode::Password { .. } => Activity::Asking,
+            Mode::Busy => match &self.tool_running {
+                Some(name) => Activity::of_tool(name),
+                None if !self.live.is_empty() => Activity::Writing,
+                None => Activity::Thinking,
+            },
+            _ => Activity::Idle,
+        }
     }
 
+    /// The theme's prompt with its marker showing the agent's activity.
+    fn prompt_str(&self) -> String {
+        let base = self.palette.prompt.unwrap_or(self.glyphs.prompt);
+        activity::prompt_for(base, self.activity(), !self.ascii && !self.single_width)
+    }
+
+    /// Width of the prompt. Taken from the theme's own prompt: the activity
+    /// marker is always one cell, so the composer never reflows.
     fn prompt_w(&self) -> usize {
-        self.str_w(self.prompt_str())
+        self.str_w(self.palette.prompt.unwrap_or(self.glyphs.prompt))
     }
 
     /// Wrap width for an ask_user question: `inner_width` is the panel's own
@@ -3759,7 +3787,7 @@ impl App {
         let tabs = |t: String| if t.contains('\t') { t.replace('\t', &" ".repeat(TAB_W)) } else { t };
         let mut lines: Vec<Line> = Vec::new();
         for r in start_row..(start_row + max_rows).min(total_rows.max(1)) {
-            let prefix = if r == 0 { Span::styled(prompt, accent) } else { Span::raw(cont.clone()) };
+            let prefix = if r == 0 { Span::styled(prompt.clone(), accent) } else { Span::raw(cont.clone()) };
             let row: &str = rows.get(r).map(String::as_str).unwrap_or("");
             let mut spans = vec![prefix];
             let text_style = Style::default().fg(self.palette.accent);
@@ -5070,6 +5098,32 @@ mod tests {
 
     /// While busy, a multi-line queued message is one row (its first line and
     /// a count), and a multi-line draft draws one row per line, tabs as spaces.
+    /// The prompt's marker tracks a turn: thinking, writing, a shell command,
+    /// an approval, then back to the theme's own prompt.
+    #[test]
+    fn the_prompt_marker_follows_the_agents_activity() {
+        use super::activity::Activity;
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        let idle = app.prompt_str();
+        app.mode = Mode::Busy;
+        assert_eq!(app.activity(), Activity::Thinking);
+        app.handle_event(UiEvent::Token("Let me look.".into()), &h);
+        assert_eq!(app.activity(), Activity::Writing);
+        app.handle_event(UiEvent::ToolStart { name: "bash".into(), summary: "ls".into() }, &h);
+        assert_eq!(app.activity(), Activity::Shell);
+        assert_ne!(app.prompt_str(), idle);
+        assert_eq!(app.str_w(&app.prompt_str()), app.prompt_w(), "the marker never changes the width");
+        app.handle_event(UiEvent::ToolResult { ok: true, preview: "a.rs".into() }, &h);
+        assert_eq!(app.activity(), Activity::Thinking);
+        app.handle_event(UiEvent::Approval { desc: "run: rm a.rs".into(), rule: None }, &h);
+        assert_eq!(app.activity(), Activity::Asking);
+        app.mode = Mode::Busy;
+        app.handle_event(UiEvent::TurnDone, &h);
+        assert_eq!(app.activity(), Activity::Idle);
+        assert_eq!(app.prompt_str(), idle);
+    }
+
     #[test]
     fn busy_view_draws_multi_line_queue_and_draft() {
         use ratatui::backend::TestBackend;
