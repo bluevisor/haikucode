@@ -527,7 +527,7 @@ fn collect_context(cwd: &std::path::Path, global: &std::path::Path) -> Vec<(Stri
         }
         let Some((name, text)) = CONTEXT_FILES.iter().find_map(|n| {
             let text = read_capped(&dir.join(n))?;
-            (!text.trim().is_empty()).then(|| (*n, text))
+            (!text.trim().is_empty()).then_some((*n, text))
         }) else {
             continue;
         };

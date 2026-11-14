@@ -559,7 +559,7 @@ mod skill_tests {
         fs::create_dir_all(root.join("changelog/references")).unwrap();
         fs::write(root.join("changelog/references/format.md"), "x").unwrap();
         fs::write(root.join("changelog/.hidden"), "x").unwrap();
-        let skills = skills_in(&[root.clone()]);
+        let skills = skills_in(std::slice::from_ref(&root));
         let out = skill_text(&skills, "Changelog");
         assert!(out.contains("Body of changelog."), "{out}");
         assert!(!out.contains("description:"), "frontmatter is stripped: {out}");

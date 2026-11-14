@@ -314,10 +314,8 @@ pub fn known_context_window(model: &str) -> u32 {
         } else {
             128_000 // V3 / chat / reasoner
         }
-    } else if m.contains("glm-5") {
-        1_000_000 // GLM-5 / 5.1 / 5.2 all advertise 1M
-    } else if m.contains("glm-4-plus") {
-        1_000_000 // GLM-4-Plus advertises 1M
+    } else if m.contains("glm-5") || m.contains("glm-4-plus") {
+        1_000_000 // GLM-5 / 5.1 / 5.2 / 4-plus all advertise 1M
     } else if m.contains("glm") {
         128_000 // GLM-4-Flash / GLM-4-Air / etc.
     } else if m.contains("claude") {
@@ -1094,6 +1092,7 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

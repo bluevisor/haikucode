@@ -333,9 +333,10 @@ cargo test --bins         # unit tests (run on Haiku and on the Mac)
 cargo test -- --ignored   # also runs the live MCP / web tests
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite on Linux;
-Haiku itself is covered by running the suite on the VM, and macOS by running
-it on the Mac.
+GitHub Actions (`.github/workflows/ci.yml`) runs the host test suite and
+clippy (`-D warnings`) on Linux; Haiku itself is covered by running the suite
+on the VM, and macOS by running it on the Mac. Contributor notes (adding a
+tool, the thread model, conventions) are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## Configuration
 
