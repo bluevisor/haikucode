@@ -842,6 +842,8 @@ impl Config {
         }
         // Resolve the effective key from the per-provider map.
         cfg.resolve_key();
+        // The top-level price fields mirror the active provider's list.
+        cfg.sync_prices();
         cfg
     }
 
