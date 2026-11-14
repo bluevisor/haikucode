@@ -28,11 +28,13 @@ ln -s haikucode "$stage/bin/hc"
 app="$stage/apps/Haiku Code"
 install -m 755 haiku/launcher.sh "$app"
 # An executable type makes Deskbar/Tracker run the script instead of opening
-# it in an editor. The icon is Terminal's, since that's the window it opens.
+# it in an editor.
 settype -t application/x-vnd.Be-elfexecutable "$app"
-catattr -r BEOS:ICON /boot/system/apps/Terminal > "$stage/icon"
-addattr -f "$stage/icon" -c VICN BEOS:ICON "$app"
-rm "$stage/icon"
+# Haiku Code's own vector icon (haiku/mkicon.py from assets/icon.svg), on the
+# launcher and on the binary. addattr's "icon" type is 'VICN', which is what
+# Tracker reads as a vector icon.
+addattr -f haiku/haikucode.hvif -t icon BEOS:ICON "$app"
+addattr -f haiku/haikucode.hvif -t icon BEOS:ICON "$stage/bin/haikucode"
 ln -s "../../../../apps/Haiku Code" "$stage/data/deskbar/menu/Applications/Haiku Code"
 
 cp README.md LICENSE "$stage/documentation/packages/haikucode/"

@@ -15,12 +15,23 @@ with `cargo build --release` — see "Building" below.
 ```
 Cargo.toml            deps + release profile; Haiku-only crossterm use-dev-tty feature
 haiku/package.sh      on Haiku: build + wrap dist/haikucode-<ver>-<rev>-<arch>.hpkg
+haiku/mkicon.py       assets/icon.svg → haiku/haikucode.hvif (Haiku vector icon; package.sh
+                      sets it as BEOS:ICON on the launcher and the binary)
+haiku/hvifpng.cpp     on Haiku: renders an HVIF, or a file's BEOS:ICON, to a PNG the way
+                      Tracker does — the check that the icon is valid
 haiku/deploy.sh       on the Mac: sync source to $HAIKU_HOST, build + package there, activate
 haiku/launcher.sh     "apps/Haiku Code": Deskbar entry that opens haikucode in Terminal
 haiku/PackageInfo.in  .PackageInfo template (version/revision/arch filled in)
 haiku/release.sh      publish v<version> with the three Haiku packages
 .github/workflows/release.yml  on publish: attach macOS + Linux (musl) tarballs
 install.sh            curl | sh installer for macOS/Linux (→ ~/.local/bin)
+macos/dmg.sh          macOS disk images per arch: sign, volume icon, notarize, staple
+assets/icon.svg       the app icon: a prompt chevron in Haiku's leaf colors and a
+                      peach cursor on the dark desktop blue. assets/render.py renders
+                      the PNGs and haikucode.icns from it (macos/dmg.sh gives a DMG
+                      that as its volume icon); icon-mono.svg (-mono-64.png) is the
+                      mark alone in one color, for tinting — Temino's pane banner
+                      draws it
 src/
   main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
   config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
@@ -77,10 +88,12 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   messages that send in order as turns finish (Esc interrupts and restores them).
 - One-shot `--output FILE` writes the final reply to disk after the run.
 - Status bar: model · session tokens + cost · context-window bar · account
-  balance. `money.rs` tags both figures with their ISO code whenever the
-  account's billing currency differs from `price_currency` (a CNY DeepSeek
-  account using the USD price list), and a one-time notice says how to align
-  them; prices are never converted across currencies.
+  balance. The cost counter follows the active provider (each preset has its
+  own price list; user-set lists are stored per provider as `prices` in
+  config.json) — a custom server without one hides the cost. `money.rs` tags
+  both money figures with their ISO code whenever the account's billing
+  currency differs from `price_currency` (a CNY DeepSeek account using the
+  USD price list); prices are never converted across currencies.
 - Permission modes via Shift+Tab (also Ctrl+P, which the Pi's framebuffer console
   needs since it can't report Shift+Tab): ask / YOLO / plan (read-only), saved for the next session; colored
   diff before write/edit. Handled in every mode, and never confused with the
@@ -123,10 +136,21 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
 - Transcript scrolling: Ctrl/Alt+↑/↓ roll the output 3 lines, PgUp/PgDn a whole
   viewport, the mouse wheel a notch (where capture is on). Scrolling up pins the
   view and turns on a "↓ new" hint; sending a message snaps back to the live
-  end. Scrolling has a keyboard gesture rather than only the wheel because Warp
-  skips mouse capture (below) and would otherwise have no way to scroll.
-- Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) so click-drag
-  text selection keeps working; `HAIKUCODE_MOUSE=1`/`0` overrides either way.
+  end. Keyboard scrolling also works when mouse capture is disabled.
+- Mouse capture is enabled in every terminal, including Warp, so wheel events
+  only scroll output instead of navigating input history. `HAIKUCODE_MOUSE=0`
+  opts out; app-managed click-drag selection remains available with capture on.
+- Selecting text: drag across the transcript and the cells under the drag are
+  reversed as you go; letting go copies them. The copy is read back out of the
+  frame ratatui just drew (`helpers::selected_text`), so it is exactly what was
+  on screen — wrapped where it wrapped, diffs and tool output included, wide
+  characters once — with no second model of the layout to keep in sync. The
+  composer selects too, but copies its own input text rather than cells, so the
+  prompt, the wrap points and the block cursor never come along; a plain click
+  in it puts the caret where it landed. It goes to `pbcopy` (macOS),
+  `clipboard -i` (Haiku), `wl-copy`/`xclip`/`xsel` (Linux), or OSC 52 where the
+  terminal has no such tool, and the status bar flashes how much went. A click
+  in the transcript, or a drag over blanks, copies nothing.
 - ASCII fallback + clear-on-exit for the Pi's framebuffer console (`TERM=linux`),
   whose 16-color palette can't show a theme's RGB shades: the palette is snapped
   to the nearest ANSI color there (`palette::for_16color`), since the console
@@ -182,12 +206,18 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   permission mode (ask/yolo/plan — applies live and saves for new sessions),
   auto-commit, theme, context window, max tool calls, price currency. Changes
   apply immediately and persist.
-- Costs and balance: `src/money.rs` formats both, tagging each with its ISO code
-  when the account's billing currency differs from `price_currency`. DeepSeek
-  reports CNY for China-region accounts, so a CNY account on the default USD
-  prices sees `$0.03 USD · … │ bal ¥135.70 CNY` plus a one-time hint to set
-  `price_currency` (and CNY prices) if they want a single unit. Nothing is ever
-  converted — an exchange rate would be a guess.
+- Costs and balance: the cost counter follows the active provider — switching
+  providers switches the price list (the built-in `PRICES` table in config.rs
+  for the presets, or the user's `prices.<provider>` entry in config.json,
+  which wins and survives a provider round trip). A custom server without a
+  price list hides the cost: the status segment drops out, `/cost` drops the
+  figure, and the one-shot JSON reports `cost: null`. `src/money.rs` formats
+  both money readouts, tagging each with its ISO code when the account's
+  billing currency differs from `price_currency`. DeepSeek reports CNY for
+  China-region accounts, so a CNY account on the default USD prices sees
+  `$0.03 USD · … │ bal ¥135.70 CNY`; set `price_currency` (and CNY prices)
+  for that provider if you want a single unit. Nothing is ever converted —
+  an exchange rate would be a guess.
 
 ## Building (natively on Haiku)
 

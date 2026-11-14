@@ -663,9 +663,166 @@ pub fn parse_max_tool_calls(s: &str) -> u32 {
     s.parse().unwrap_or(0)
 }
 
+/// The text under a screen-cell selection, read back from the frame that was
+/// drawn: rows `a` to `b` in either order, clipped to `area` (the transcript,
+/// so a row never picks up the box's border), each stripped of trailing blanks
+/// and joined with newlines. Reading the cells rather than the transcript
+/// means the copy is exactly what the user saw — wrapped where it wrapped,
+/// tool output and diffs included — without the renderer having to expose its
+/// layout. A wide character's second cell carries an empty symbol and is
+/// skipped, so CJK text isn't doubled.
+pub fn selected_text(
+    buf: &ratatui::buffer::Buffer,
+    area: Rect,
+    a: (u16, u16),
+    b: (u16, u16),
+) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let (start, end) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+    let last_col = area.right().saturating_sub(1);
+    let last_row = area.bottom().saturating_sub(1);
+    let mut rows = Vec::new();
+    for row in start.1..=end.1.min(last_row) {
+        // Continuation rows run the transcript's width; the first and last
+        // start and stop where the drag did, all of it inside `area`.
+        let from = (if row == start.1 { start.0.max(area.x) } else { area.x }).min(last_col);
+        let to = (if row == end.1 { end.0 } else { last_col }).min(last_col);
+        let mut line = String::new();
+        // Cells covered by the second half of a wide character keep a blank
+        // symbol of their own: stepping over them is what keeps 世界 from
+        // copying as "世 界".
+        let mut skip = 0;
+        for col in from..=to {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if let Some(cell) = buf.cell((col, row)) {
+                let symbol = cell.symbol();
+                line.push_str(symbol);
+                skip = symbol.width().saturating_sub(1);
+            }
+        }
+        rows.push(line.trim_end().to_string());
+    }
+    let mut out = String::new();
+    for (i, line) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out.trim_end().to_string()
+}
+
+/// Put `text` on the system clipboard. Each platform has its own tool — Haiku's
+/// `clipboard -i` takes the text on stdin, macOS has `pbcopy`, Wayland/X11 have
+/// `wl-copy`/`xclip`/`xsel` — and when none is there (ssh to a box without them,
+/// a bare console) OSC 52 asks the terminal itself, which iTerm, Kitty, WezTerm,
+/// Alacritty and Ghostty honour.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(target_os = "haiku")]
+    let candidates: &[(&str, &[&str])] = &[("clipboard", &["-i"])];
+    #[cfg(not(any(target_os = "macos", target_os = "haiku")))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    for (program, args) in candidates {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(), // dropped: EOF
+            None => false,
+        };
+        if wrote && child.wait().is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+
+    let sequence = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(sequence.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("clipboard: {e}"))
+}
+
+/// Standard base64 with padding, for OSC 52 (the clipboard escape carries the
+/// text as base64).
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selection copies the cells that were drawn: wide characters once
+    /// (their second cell is empty), trailing blanks trimmed, rows in reading
+    /// order whichever end the drag started from.
+    #[test]
+    fn selected_text_is_exactly_what_was_drawn() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 14, 3));
+        Paragraph::new("hello 世界").render(Rect::new(0, 0, 14, 1), &mut buf);
+        Paragraph::new("  indent  ").render(Rect::new(0, 1, 14, 1), &mut buf);
+
+        let area = Rect::new(0, 0, 14, 3);
+        assert_eq!(selected_text(&buf, area, (0, 0), (13, 1)), "hello 世界\n  indent");
+        // Bottom-right to top-left is the same selection.
+        assert_eq!(selected_text(&buf, area, (13, 1), (0, 0)), "hello 世界\n  indent");
+        // Partial rows, from either end of the drag.
+        assert_eq!(selected_text(&buf, area, (7, 1), (2, 0)), "llo 世界\n  indent");
+        assert_eq!(selected_text(&buf, area, (2, 0), (7, 1)), "llo 世界\n  indent");
+        // A blank row copies nothing at all, not a run of spaces.
+        assert_eq!(selected_text(&buf, area, (0, 2), (13, 2)), "");
+
+        // Clipped to the transcript: a row inside a box stops at its last
+        // column, so the border never comes along.
+        let inner = Rect::new(1, 0, 12, 3);
+        assert_eq!(selected_text(&buf, inner, (0, 0), (13, 1)), "ello 世界\n indent");
+    }
+
+    /// OSC 52 carries the clipboard text as standard base64.
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64("hé".as_bytes()), "aMOp");
+    }
 
     /// Haiku Terminal drew `█` wider than a cell and smeared the logo, so cell
     /// rows reach the screen as background-colored spaces.

@@ -119,7 +119,10 @@ pub struct Config {
     /// never overwritten or rewritten to disk by auto-detection.
     #[serde(skip)]
     pub context_window_explicit: bool,
-    /// USD per 1M tokens, for the session cost readout (DeepSeek defaults).
+    /// USD per 1M tokens, for the session cost readout. Mirrors the active
+    /// provider's price list (re-derived on load and every provider switch);
+    /// the per-provider store is `prices`, with `PRICES` as the built-in
+    /// fallback (DeepSeek defaults).
     #[serde(default = "default_price_in")]
     pub price_in: f64,
     #[serde(default = "default_price_out")]
@@ -138,8 +141,8 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub auto_commit: bool,
     /// Show the model's full reasoning, tool output and diffs in the
-    /// transcript. Off (the default), each run of work is collapsed into a
-    /// brief summary; Ctrl+T or `/thinking` flips it.
+    /// transcript. Off (the default), thoughts stay as list entries and tool
+    /// activity appears only as a live status; Ctrl+T or `/thinking` flips it.
     #[serde(default)]
     pub show_thinking: bool,
     /// The first status row's segments, in order (`/statusline`). Empty means
@@ -172,9 +175,8 @@ pub struct Config {
     /// `api_kind`).
     #[serde(default)]
     pub api: Option<String>,
-    /// Price per 1M cached (cache-hit) input tokens. Unset: DeepSeek's cache-hit
-    /// price with the DeepSeek price list, else a tenth of `price_in` (see
-    /// `price_cached`).
+    /// Price per 1M cached (cache-hit) input tokens. Unset: a tenth of
+    /// `price_in`, the usual cache-read discount (see `PriceList::price_cached`).
     #[serde(default)]
     pub price_cached_in: Option<f64>,
     /// True when the current provider's key came from the environment; we never
@@ -185,6 +187,11 @@ pub struct Config {
     /// like the presets. Their keys live in `api_keys` under their name.
     #[serde(default)]
     pub custom_providers: Vec<CustomProvider>,
+    /// User-set price lists, per provider (the cost counter follows the active
+    /// provider). Built-ins fall back to `PRICES`; a custom provider without
+    /// one has no known cost and its readout is hidden.
+    #[serde(default)]
+    pub prices: BTreeMap<String, PriceList>,
     /// Settings blocks haikucode doesn't model as fields (`permissions`, `hooks`)
     /// carried through verbatim so a model/theme rewrite can't drop them.
     #[serde(skip)]
@@ -198,6 +205,41 @@ pub struct CustomProvider {
     pub name: String,
     pub base_url: String,
     pub model: String,
+}
+
+/// One provider's price list, per 1M tokens. Stored per provider (the
+/// `prices` map in config.json) so the cost counter follows the active
+/// provider; the built-in `PRICES` table covers the presets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PriceList {
+    pub price_in: f64,
+    pub price_out: f64,
+    /// Price per 1M cached (cache-hit) input tokens. Unset: a tenth of
+    /// `price_in`, the usual cache-read discount (see `price_cached`).
+    #[serde(default)]
+    pub price_cached_in: Option<f64>,
+    /// ISO code the prices are quoted in.
+    #[serde(default = "default_price_currency")]
+    pub price_currency: String,
+}
+
+impl Default for PriceList {
+    fn default() -> Self {
+        PriceList {
+            price_in: 0.0,
+            price_out: 0.0,
+            price_cached_in: None,
+            price_currency: default_price_currency(),
+        }
+    }
+}
+
+impl PriceList {
+    /// Price per 1M cached input tokens: the configured one, else a tenth of
+    /// `price_in`, the usual cache-read discount (Anthropic, OpenAI).
+    pub fn price_cached(&self) -> f64 {
+        self.price_cached_in.unwrap_or(self.price_in * 0.1)
+    }
 }
 
 /// Is `name` one of the built-in presets in `PROVIDERS`?
@@ -246,6 +288,35 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("zai", "https://api.z.ai/api/paas/v4", "glm-5.2"),
     ("vercel", "https://ai-gateway.vercel.sh/v1", "anthropic/claude-sonnet-5.5"),
 ];
+
+/// Built-in price lists for the presets: (name, in, out, cached, currency),
+/// per 1M tokens, for each preset's default model. The cost counter follows
+/// the active provider, so each preset carries its own list; a custom
+/// provider without a user-set `prices` entry has no known price here and its
+/// cost readout is hidden.
+pub const PRICES: &[(&str, f64, f64, f64, &str)] = &[
+    ("deepseek", 0.15, 0.60, DEEPSEEK_CACHE_HIT_PRICE, "USD"),
+    ("openai", 0.15, 0.60, 0.075, "USD"),
+    ("anthropic", 15.0, 75.0, 1.50, "USD"),
+    ("groq", 0.59, 0.79, 0.059, "USD"),
+    ("openrouter", 0.15, 0.60, 0.075, "USD"),
+    ("google", 0.30, 2.50, 0.03, "USD"),
+    ("zai", 0.60, 2.20, 0.06, "USD"),
+    ("vercel", 3.00, 15.0, 0.30, "USD"),
+];
+
+/// The built-in price list for a preset name, if it has one.
+pub fn built_in_prices(name: &str) -> Option<PriceList> {
+    PRICES
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(_, i, o, c, cur)| PriceList {
+            price_in: *i,
+            price_out: *o,
+            price_cached_in: Some(*c),
+            price_currency: cur.to_string(),
+        })
+}
 
 /// Env vars that may supply the API key for `provider`, highest priority
 /// first — only the configured provider's key is ever picked up, so a machine
@@ -408,6 +479,7 @@ impl Default for Config {
             price_cached_in: None,
             key_from_env: false,
             custom_providers: Vec::new(),
+            prices: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
@@ -691,6 +763,27 @@ impl Config {
         if let Some(p) = v.get("price_cached_in").and_then(|x| x.as_f64()) {
             cfg.price_cached_in = Some(p);
         }
+        // Per-provider price lists (the cost counter follows the provider).
+        // One malformed entry must not take its siblings with it; the raw
+        // block goes to `extra` so a rewrite keeps it verbatim.
+        if let Some(m) = v.get("prices") {
+            let mut broken = false;
+            if let Some(obj) = m.as_object() {
+                for (k, val) in obj {
+                    match serde_json::from_value::<PriceList>(val.clone()) {
+                        Ok(p) => {
+                            cfg.prices.insert(k.clone(), p);
+                        }
+                        Err(_) => broken = true,
+                    }
+                }
+            } else {
+                broken = true;
+            }
+            if broken {
+                cfg.extra.insert("prices".into(), m.clone());
+            }
+        }
         if let Some(list) = v.get("custom_providers").and_then(|x| x.as_array()) {
             for item in list {
                 match serde_json::from_value::<CustomProvider>(item.clone()) {
@@ -703,6 +796,28 @@ impl Config {
             }
         }
         cfg.adopt_active_custom();
+        // Legacy: the single top-level price list belonged to the provider
+        // active when it was written. Fold it into the per-provider map so
+        // switching providers and back keeps it.
+        if !cfg.prices.contains_key(&cfg.provider)
+            && (cfg.price_in != default_price_in()
+                || cfg.price_out != default_price_out()
+                || cfg.price_currency != default_price_currency()
+                || cfg.price_cached_in.is_some())
+        {
+            let mut list = PriceList {
+                price_in: cfg.price_in,
+                price_out: cfg.price_out,
+                price_cached_in: cfg.price_cached_in,
+                price_currency: cfg.price_currency.clone(),
+            };
+            // Legacy files predate the per-provider cache price: keep the
+            // built-in one (e.g. DeepSeek's 0.003 cache-hit price).
+            if list.price_cached_in.is_none() {
+                list.price_cached_in = built_in_prices(&cfg.provider).and_then(|b| b.price_cached_in);
+            }
+            cfg.prices.insert(cfg.provider.clone(), list);
+        }
         for key in [
             "permissions",
             "hooks",
@@ -730,6 +845,8 @@ impl Config {
         }
         // Resolve the effective key from the per-provider map.
         cfg.resolve_key();
+        // The top-level price fields mirror the active provider's list.
+        cfg.sync_prices();
         cfg
     }
 
@@ -825,14 +942,22 @@ impl Config {
         if on_disk.context_window_explicit {
             json["context_window"] = serde_json::json!(on_disk.context_window);
         }
-        if on_disk.price_in != default_price_in() {
-            json["price_in"] = serde_json::json!(on_disk.price_in);
+        // The top-level price fields mirror the active provider's list. Skip
+        // them when the provider has no list (a custom server with a hidden
+        // cost) so a reload doesn't mistake the zeros for a user price list.
+        if on_disk.price_list().is_some() {
+            if on_disk.price_in != default_price_in() {
+                json["price_in"] = serde_json::json!(on_disk.price_in);
+            }
+            if on_disk.price_out != default_price_out() {
+                json["price_out"] = serde_json::json!(on_disk.price_out);
+            }
+            if on_disk.price_currency.to_ascii_uppercase() != default_price_currency() {
+                json["price_currency"] = serde_json::json!(on_disk.price_currency);
+            }
         }
-        if on_disk.price_out != default_price_out() {
-            json["price_out"] = serde_json::json!(on_disk.price_out);
-        }
-        if on_disk.price_currency.to_ascii_uppercase() != default_price_currency() {
-            json["price_currency"] = serde_json::json!(on_disk.price_currency);
+        if !on_disk.prices.is_empty() {
+            json["prices"] = serde_json::to_value(&on_disk.prices).unwrap_or_default();
         }
         if on_disk.permission != default_permission() {
             json["permission"] = serde_json::json!(on_disk.permission);
@@ -889,15 +1014,36 @@ impl Config {
         }
     }
 
-    /// Price per 1M cached input tokens: the configured one; with the default
-    /// (DeepSeek) price list, DeepSeek's cache-hit price; otherwise a tenth of
-    /// `price_in`, the usual cache-read discount (Anthropic, OpenAI).
-    pub fn price_cached(&self) -> f64 {
-        self.price_cached_in.unwrap_or(if self.price_in == default_price_in() {
-            DEEPSEEK_CACHE_HIT_PRICE
-        } else {
-            self.price_in * 0.1
-        })
+    /// The price list that applies to `provider`: the user-set one from
+    /// `prices`, else the built-in `PRICES` table. `None` for a custom server
+    /// with no known price (its cost readout is hidden).
+    pub fn price_list_for(&self, provider: &str) -> Option<PriceList> {
+        self.prices.get(provider).cloned().or_else(|| built_in_prices(provider))
+    }
+
+    /// The active provider's price list (see `price_list_for`).
+    pub fn price_list(&self) -> Option<PriceList> {
+        self.price_list_for(&self.provider)
+    }
+
+    /// Re-derive the single top-level `price_*` fields from the active
+    /// provider's list, so they always mirror it. A custom server without a
+    /// list zeros them (and the cost readout is hidden — see `price_list`).
+    pub fn sync_prices(&mut self) {
+        match self.price_list() {
+            Some(p) => {
+                self.price_in = p.price_in;
+                self.price_out = p.price_out;
+                self.price_cached_in = p.price_cached_in;
+                self.price_currency = p.price_currency;
+            }
+            None => {
+                self.price_in = 0.0;
+                self.price_out = 0.0;
+                self.price_cached_in = None;
+                self.price_currency = default_price_currency();
+            }
+        }
     }
 
     /// Update only the model field on disk, preserving the rest of the file.
@@ -1035,6 +1181,9 @@ impl Config {
                 self.model = model.clone();
                 // Swap to the new provider's saved key (or empty).
                 self.resolve_key();
+                // The cost counter follows the provider: its price list (the
+                // user-set one, else the built-in table, else hidden).
+                self.sync_prices();
             }
             ConfigPatch::AddProvider(cp) => {
                 self.custom_providers.retain(|c| c.name != cp.name);
@@ -1074,11 +1223,18 @@ impl Config {
             }
             ConfigPatch::PriceCurrency(c) => {
                 let c = c.trim().to_ascii_uppercase();
-                self.price_currency = if c.is_empty() {
+                let c = if c.is_empty() {
                     default_price_currency()
                 } else {
                     c
                 };
+                // The currency belongs to the active provider's list: the
+                // user-set one, else the built-in table, else a fresh list
+                // (a custom server whose currency was cycled in /config).
+                let mut list = self.price_list().unwrap_or_default();
+                list.price_currency = c;
+                self.prices.insert(self.provider.clone(), list);
+                self.sync_prices();
             }
         }
     }
@@ -1254,6 +1410,142 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"{"price_currency": "cny"}"#).unwrap();
         let code = v.get("price_currency").and_then(|x| x.as_str()).unwrap();
         assert_eq!(crate::money::Currency::parse(code).symbol, "¥");
+    }
+
+    /// The cost counter follows the provider: switching presets takes their
+    /// built-in price lists with them; a custom server without a list has no
+    /// known cost (and the top-level mirror zeros out).
+    #[test]
+    fn the_price_list_follows_the_active_provider() {
+        let mut c = Config::default();
+        let ds = c.price_list().unwrap();
+        assert!((ds.price_in - 0.15).abs() < 1e-9 && (ds.price_out - 0.6).abs() < 1e-9);
+        assert_eq!(ds.price_currency, "USD");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        let o = c.price_list().unwrap();
+        assert!((o.price_in - 0.15).abs() < 1e-9 && (o.price_out - 0.6).abs() < 1e-9);
+        assert!((o.price_cached() - 0.075).abs() < 1e-9, "OpenAI's cache-read price");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5-5".into(),
+        });
+        let a = c.price_list().unwrap();
+        assert!((a.price_in - 15.0).abs() < 1e-9 && (a.price_out - 75.0).abs() < 1e-9);
+        // The top-level fields mirror the active provider's list.
+        assert!((c.price_in - 15.0).abs() < 1e-9 && (c.price_out - 75.0).abs() < 1e-9);
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        assert!(c.price_list().is_none(), "a custom server has no known price");
+        assert_eq!(c.price_in, 0.0, "the mirror zeros out");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            model: "claude-opus-5-5".into(),
+        });
+        assert!((c.price_list().unwrap().price_in - 15.0).abs() < 1e-9, "switching back keeps the table's list");
+    }
+
+    /// A user-set price list wins over the built-in table and survives
+    /// switching providers and back.
+    #[test]
+    fn a_user_price_list_overrides_the_table_and_survives_a_round_trip() {
+        let mut c = Config::default();
+        c.prices.insert(
+            "deepseek".into(),
+            PriceList {
+                price_in: 1.0,
+                price_out: 4.0,
+                price_cached_in: None,
+                price_currency: "CNY".into(),
+            },
+        );
+        c.sync_prices();
+        assert_eq!(c.price_list().unwrap().price_currency, "CNY");
+        assert_eq!(c.price_currency, "CNY", "the mirror follows the user's list");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        assert_eq!(c.price_list().unwrap().price_currency, "USD", "openai gets its own list");
+
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+        });
+        let back = c.price_list().unwrap();
+        assert!((back.price_in - 1.0).abs() < 1e-9 && back.price_currency == "CNY", "the CNY list comes back");
+    }
+
+    /// A pre-per-provider file carries one top-level price list; it belongs
+    /// to the provider that was active when it was written, and the built-in
+    /// cache-hit price fills in where the file has none.
+    #[test]
+    fn a_legacy_top_level_price_list_folds_into_the_active_provider() {
+        let v = serde_json::json!({
+            "provider": "deepseek",
+            "price_in": 1.0,
+            "price_out": 4.0,
+            "price_currency": "cny",
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        c.sync_prices();
+        let list = c.price_list().unwrap();
+        assert!((list.price_in - 1.0).abs() < 1e-9 && list.price_currency == "CNY");
+        assert!((list.price_cached() - DEEPSEEK_CACHE_HIT_PRICE).abs() < 1e-9, "the built-in cache-hit price carries over");
+        // Switching to another preset and back keeps the folded list.
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+        });
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+        });
+        assert!((c.price_list().unwrap().price_in - 1.0).abs() < 1e-9);
+    }
+
+    /// A custom server without a price list stays hidden across save/reload:
+    /// the zeroed top-level mirror must not be written as a user price list.
+    #[test]
+    fn a_custom_provider_without_a_list_keeps_its_cost_hidden() {
+        let mut c = Config::default();
+        c.custom_providers.push(CustomProvider {
+            name: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        c.apply_patch(&ConfigPatch::Provider {
+            provider: "mylocal".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "qwen3".into(),
+        });
+        assert!(c.price_list().is_none());
+        let json = c.to_disk_json();
+        assert!(json.get("price_in").is_none() && json.get("price_currency").is_none(), "{json}");
+
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        back.sync_prices();
+        assert!(back.price_list().is_none(), "still hidden after a round trip");
+        assert_eq!(back.price_in, 0.0);
     }
 
     /// The old `thinking: true` did something only on DeepSeek/GLM. Elsewhere

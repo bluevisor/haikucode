@@ -203,6 +203,8 @@ struct Worker {
     turns: Vec<TurnMark>,
     /// When the session was last written mid-turn (see run_loop).
     last_save: std::time::Instant,
+    /// Generation across all main-model calls for one user prompt.
+    generation: GenerationStats,
 }
 
 /// A user prompt `/rewind` can go back to: its index in `messages` and the
@@ -311,6 +313,7 @@ pub fn spawn(
             ctx_detected: Arc::new(Mutex::new(None)),
             turns: Vec::new(),
             last_save: std::time::Instant::now(),
+            generation: GenerationStats::default(),
         };
         let _ = w.ui.send(UiEvent::SessionLabel(w.session_label()));
         w.ensure_oauth_fresh(); // keep a resumed subscription login authenticated
@@ -563,6 +566,11 @@ pub fn spawn(
                     }
                     w.save_session();
                     w.refresh_balance(); // reflect spend after the turn
+                    if result.is_ok() && !w.cancel.load(Ordering::Relaxed) {
+                        if let Some(rate) = w.generation.rate() {
+                            let _ = w.ui.send(UiEvent::Notice(format!("{rate:.1} tok/s")));
+                        }
+                    }
                     let _ = w.ui.send(UiEvent::TurnDone);
                     // Fire a cheap follow-up suggestion call in the background.
                     // Uses its own cancel flag so a mid-turn Esc in the next turn
@@ -1050,6 +1058,7 @@ impl Worker {
     }
 
     fn run_turn(&mut self, text: String, images: Vec<String>, typed: String) {
+        self.generation = GenerationStats::default();
         // Drop images a previous interrupted turn queued but never consumed,
         // so they can't surface mid-way through an unrelated turn.
         self.pending_images.clear();
@@ -1198,6 +1207,15 @@ impl Worker {
             let ui = self.ui.clone();
             let ui2 = self.ui.clone();
             let ui3 = self.ui.clone();
+            // Time generation on the worker, excluding the wait for first
+            // content and any tool/approval time. Reset on request retries.
+            let generation_start = std::cell::Cell::new(None);
+            let started = &generation_start;
+            let record_start = move |t: &str| {
+                if !t.is_empty() && started.get().is_none() {
+                    started.set(Some(std::time::Instant::now()));
+                }
+            };
             let res = api::chat_resilient(
                 &self.http,
                 &self.cfg,
@@ -1205,16 +1223,19 @@ impl Worker {
                 &self.tools,
                 &self.cancel,
                 move |t| {
+                    record_start(t);
                     if !quiet {
                         let _ = ui.send(UiEvent::Token(t.to_string()));
                     }
                 },
                 move |t| {
+                    record_start(t);
                     if !quiet {
                         let _ = ui2.send(UiEvent::Reasoning(t.to_string()));
                     }
                 },
                 move |m| {
+                    started.set(None);
                     let _ = ui3.send(UiEvent::ResetLive);
                     let _ = ui3.send(UiEvent::Notice(m.to_string()));
                 },
@@ -1232,6 +1253,11 @@ impl Worker {
             }
             if !quiet {
                 let _ = self.ui.send(UiEvent::AssistantCommit);
+                if !self.cancel.load(Ordering::Relaxed) {
+                    if let (Some(u), Some(start)) = (usage, generation_start.get()) {
+                        self.generation.add(u.completion_tokens, start.elapsed());
+                    }
+                }
             }
 
             // Esc during streaming: chat_stream stops early and returns what
@@ -2026,6 +2052,28 @@ fn spend(u: &api::Usage) -> UiEvent {
     UiEvent::Spend(u.spent())
 }
 
+/// Aggregate generation time rather than averaging per-call speeds. Waiting
+/// for the first token, tool execution, and approvals do not enter this clock.
+#[derive(Default)]
+struct GenerationStats {
+    tokens: u64,
+    elapsed: std::time::Duration,
+}
+
+impl GenerationStats {
+    fn add(&mut self, tokens: u32, elapsed: std::time::Duration) {
+        // Buffered/instantaneous responses have no useful streaming rate.
+        if tokens > 0 && elapsed.as_millis() >= 100 {
+            self.tokens += tokens as u64;
+            self.elapsed += elapsed;
+        }
+    }
+
+    fn rate(&self) -> Option<f64> {
+        (self.tokens > 0).then(|| self.tokens as f64 / self.elapsed.as_secs_f64())
+    }
+}
+
 fn estimate_tokens(messages: &[Message]) -> u32 {
     let chars: usize = messages
         .iter()
@@ -2183,6 +2231,21 @@ mod tests {
         let before = msgs.len();
         repair_orphans(&mut msgs);
         assert_eq!(msgs.len(), before);
+    }
+
+    #[test]
+    fn generation_speed_aggregates_the_whole_prompt_and_resets() {
+        use std::time::Duration;
+        let mut stats = super::GenerationStats::default();
+        assert_eq!(stats.rate(), None);
+        stats.add(80, Duration::from_secs(2));
+        stats.add(120, Duration::from_secs(6));
+        assert_eq!(stats.rate(), Some(25.0)); // 200 tokens / 8s, not mean(40, 20)
+        stats.add(0, Duration::from_secs(10));
+        stats.add(80, Duration::from_millis(5));
+        assert_eq!(stats.rate(), Some(25.0));
+        stats = super::GenerationStats::default();
+        assert_eq!(stats.rate(), None);
     }
 
     #[test]

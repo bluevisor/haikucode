@@ -94,7 +94,9 @@ memory, sessions, skills) into `~/.config/haikucode`.
   attach instead of pasting as bare paths.
 - **Streaming TUI** — a Claude-style composer with a reverse-block cursor,
   live token streaming, and colored unified diffs previewed before every
-  write/edit.
+  write/edit. Drag across the output — or the composer — to select text:
+  releasing copies the cells you covered (in the composer, the input text
+  itself) to the clipboard and the status bar says how much went.
 - **Context compaction** — `/compact [focus]` summarizes older turns to free
   the window (the optional focus tells the summary what to preserve); triggers
   automatically at 80% full, including mid-turn during long tool loops. The
@@ -513,6 +515,8 @@ Type `/` in the composer for the ranked palette, or `/help` for the full list.
 | `Home` / `End` | start / end of the composer line |
 | `PgUp` / `PgDn` | scroll the output a page |
 | mouse wheel | scroll the output (when mouse capture is on) |
+| drag | select output or composer text; letting go copies it to the clipboard |
+| click | in the composer: put the caret there |
 | `Ctrl` / `Alt + ↑` / `↓` | scroll the output (3 lines) |
 | `Alt`/`Ctrl`/`Cmd + ←/→` | word / line motion |
 | `Option`/`Alt + Backspace` | delete word backward |
@@ -528,11 +532,15 @@ when the terminal supports it, so modified keys are reported unambiguously.
 Without it, some terminals (e.g. Warp in full-screen mode) flatten
 `Option+Backspace` to a plain Backspace.
 
-Mouse capture is skipped on Warp (`TERM_PROGRAM=WarpTerminal`) because it grabs
-click-drag text selection with no modifier to bypass it — Warp users scroll with
-`Ctrl`+`↑`/`↓` and `PgUp`/`PgDn` instead. Set `HAIKUCODE_MOUSE=1` to force capture on
-(wheel scrolling, at the cost of native selection), or `HAIKUCODE_MOUSE=0` to turn
-it off everywhere.
+Mouse capture is enabled by default in all terminals, including Warp, so the
+wheel scrolls only the output and cannot navigate input history. Haikucode
+handles selection itself:
+drag across the transcript (or the composer) and the text under the drag is
+copied when you let go (and the status bar says how much), to `pbcopy`, Haiku's
+`clipboard`, or `wl-copy`/`xclip`/`xsel`, falling back to OSC 52 where the
+terminal offers no such tool. In the composer a plain click also puts the
+caret where it landed. Set `HAIKUCODE_MOUSE=0` to turn capture off and let the
+terminal handle the mouse. `HAIKUCODE_MOUSE=1` forces capture on.
 
 ## Architecture
 

@@ -31,7 +31,7 @@ use helpers::{
 use palette::{Palette, palette_by_name};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -121,6 +121,10 @@ pub struct App {
     banner_status: Vec<String>,
     live: String,
     live_reasoning: String,
+    /// Current activity only; never retained as a status history.
+    current_activity: Option<String>,
+    /// Immediate acknowledgement until this turn produces its first content.
+    awaiting_response: bool,
     input: String,
     cursor: usize, // char index
     /// Terminal size at the last render, so key handlers can lay the composer
@@ -163,6 +167,27 @@ pub struct App {
     scroll: usize,
     max_top: usize,
     view_h: usize,
+    /// A mouse drag: what it is over and its two corners, in screen cells,
+    /// clamped to that box. Released, it is copied and cleared.
+    select: Option<Select>,
+    /// Where the output box was last drawn, so a drag that runs past it can't
+    /// grab the composer or the status bar.
+    output_area: Rect,
+    /// The same for the composer's text, and zero when no composer is on
+    /// screen (an approval prompt, say).
+    composer_area: Rect,
+    /// The layout row drawn on the composer's first screen row: the text
+    /// scrolls to the caret once it outgrows the box, so a cell only maps back
+    /// to a char if the offset it was drawn at is known.
+    composer_first: usize,
+    /// A short note the status bar shows for a moment ("copied 214 chars"), for
+    /// actions that shouldn't write a line into the transcript.
+    flash: Option<(String, Instant)>,
+    /// The cells of the frame drawn last while a selection is up, so releasing
+    /// it can read them back. Kept only while selecting: after `draw` returns,
+    /// ratatui's own buffers have already been swapped, so the frame that was
+    /// drawn is the one it hands back, not the one `current_buffer_mut` holds.
+    screen: Option<ratatui::buffer::Buffer>,
     spinner: usize,
     spin_counter: usize,
     /// Clock time when the agent last entered Busy; used to show an elapsed timer.
@@ -213,8 +238,13 @@ pub struct App {
     ctx_limit: u32,
     price_in: f64,
     price_out: f64,
+    /// Price per 1M cached input tokens for the active provider's list.
+    price_cached_in: Option<f64>,
     /// Unit the prices above are quoted in; the account balance carries its own.
     price_currency: money::Currency,
+    /// False when the active server's price is unknown (a custom provider
+    /// without a price list): the cost readout is hidden.
+    cost_known: bool,
     last_prompt_tokens: u32,
     sess_prompt: u64,
     sess_completion: u64,
@@ -254,6 +284,55 @@ pub struct App {
 
 /// Lines moved per arrow key / wheel notch. PgUp/PgDn move a full viewport.
 const SCROLL_STEP: isize = 3;
+
+/// How long a status-bar flash note ("copied 214 chars") stays up.
+const FLASH_TIME: Duration = Duration::from_millis(2200);
+
+/// Which pane of the UI a drag is over: the two select differently, because
+/// the transcript is copied from the cells that were drawn and the composer
+/// from the input text itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectKind {
+    /// The transcript.
+    Output,
+    /// The composer's text.
+    Composer,
+}
+
+/// A drag in progress: what it is over, how far it may reach, and its two
+/// corners — where the button went down and where it is now.
+#[derive(Clone, Copy, Debug)]
+struct Select {
+    kind: SelectKind,
+    /// The rect the drag is confined to (the transcript's inner box, or the
+    /// composer).
+    area: Rect,
+    /// Leftmost column a cell may be in: the composer's text starts past its
+    /// prompt, and the prompt is not selectable.
+    left: u16,
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+}
+
+impl Select {
+    /// The corners in reading order, top-left first.
+    fn corners(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, b) = (self.anchor, self.cursor);
+        if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
+    }
+}
+
+/// What a mouse event asks the event loop to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseAction {
+    /// Nothing changed: no repaint.
+    None,
+    /// Repaint (the wheel scrolled, or the selection moved).
+    Redraw,
+    /// Copy this range of cells (top-left first) out of the frame just drawn,
+    /// and repaint. The selection itself is already gone.
+    Copy(SelectKind, (u16, u16), (u16, u16)),
+}
 
 /// Whether a blank separator line should precede an entry of kind `next` given
 /// the previous entry's kind. The transcript is made of distinct blocks — a
@@ -304,6 +383,8 @@ impl App {
             banner_status: Vec::new(),
             live: String::new(),
             live_reasoning: String::new(),
+            current_activity: None,
+            awaiting_response: false,
             input: String::new(),
             cursor: 0,
             term_w: 80,
@@ -329,6 +410,12 @@ impl App {
             scroll: 0,
             max_top: 0,
             view_h: 0,
+            select: None,
+            output_area: Rect::new(0, 0, 0, 0),
+            composer_area: Rect::new(0, 0, 0, 0),
+            composer_first: 0,
+            flash: None,
+            screen: None,
             spinner: 0,
             spin_counter: 0,
             busy_since: None,
@@ -357,7 +444,9 @@ impl App {
             ctx_limit: cfg.ctx_limit.max(1),
             price_in: cfg.price_in,
             price_out: cfg.price_out,
+            price_cached_in: cfg.price_cached_in,
             price_currency: cfg.price_currency.clone(),
+            cost_known: cfg.cost_known,
             last_prompt_tokens: 0,
             sess_prompt: 0,
             sess_completion: 0,
@@ -509,11 +598,15 @@ impl App {
     pub fn handle_event(&mut self, ev: UiEvent, h: &Handles) {
         match ev {
             UiEvent::Token(t) => {
+                if !t.is_empty() { self.awaiting_response = false; }
+                self.current_activity = Some("responding…".into());
                 self.tool_running = None;
                 self.live.push_str(&t);
                 self.dirty();
             }
             UiEvent::Reasoning(t) => {
+                if !t.is_empty() { self.awaiting_response = false; }
+                self.current_activity = Some("thinking…".into());
                 self.live_reasoning.push_str(&t);
                 self.dirty();
             }
@@ -534,8 +627,10 @@ impl App {
                 }
             }
             UiEvent::ToolStart { name, summary } => {
+                self.awaiting_response = false;
                 self.tool_running = Some(name.clone());
                 self.flush_live();
+                self.current_activity = Some(format!("{name} {summary}"));
                 self.push(Kind::Tool, format!("{name} {summary}"));
             }
             UiEvent::Diff(d) => {
@@ -555,6 +650,7 @@ impl App {
                 self.after_push();
             }
             UiEvent::ToolResult { ok, preview } => {
+                self.current_activity = None;
                 self.tool_running = None;
                 self.flush_live();
                 if preview.is_empty() {
@@ -687,12 +783,17 @@ impl App {
                 self.push(Kind::Notice, msg);
             }
             UiEvent::Progress(msg) => {
+                self.current_activity = Some(msg.clone());
                 self.push(Kind::Progress, msg);
             }
             UiEvent::Error(msg) => {
+                self.awaiting_response = false;
+                self.current_activity = None;
                 self.push(Kind::ErrorK, msg);
             }
             UiEvent::TurnDone => {
+                self.awaiting_response = false;
+                self.current_activity = None;
                 self.flush_live();
                 // Keep an open picker alive: the worker sends TurnDone right
                 // after ModelList, and clear_busy would drop back to Idle.
@@ -1092,6 +1193,10 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, h: &Handles) {
+        // Any key gives up a mouse selection: it is a momentary view of the
+        // text, and keeping the highlight after the user moves on only
+        // confuses the next frame.
+        self.select = None;
         // Cycle the permission mode in any state, except while a masked prompt
         // or an ask_user question is capturing every key. Shift+Tab is the
         // primary binding: it arrives as BackTab on ANSI terminals, or as
@@ -1383,13 +1488,13 @@ impl App {
             }
             9 => self.mode = edit_with(self.settings.context_window.to_string()),
             10 => self.mode = edit_with(setting_max_tool_calls(self.settings.max_tool_calls)),
-            // A pick-list, USD first. It names the currency price_in/price_out
-            // are quoted in: switching it relabels the cost, it doesn't convert.
+            // A pick-list, USD first. The currency belongs to the active
+            // provider's price list: cycling it relabels the cost, it doesn't
+            // convert, and it patches that provider's list (not a global one).
             11 => {
                 let code = money::cycle_code(&self.settings.price_currency, dir);
-                self.settings.price_currency = code.clone();
-                self.price_currency = money::Currency::parse(&code);
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::PriceCurrency(code)));
+                self.patch(ConfigPatch::PriceCurrency(code), h);
+                self.sync_prices();
             }
             _ => {}
         }
@@ -1894,7 +1999,7 @@ impl App {
             KeyCode::Delete => self.on_key_edit(key),
             // Modified arrows: Alt/Ctrl+←/→ move by word, Alt/Ctrl+↑/↓ roll the
             // transcript a few lines — the scroll gesture that works on every
-            // terminal (Warp, and any terminal without mouse capture, sends no
+            // terminal (any terminal without mouse capture sends no
             // wheel events). Plain ↑/↓ are the draft rows and history below.
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::ALT)
@@ -2085,6 +2190,215 @@ impl App {
         }
     }
 
+    /// Handle a mouse event and say what the loop should do about it: the
+    /// wheel scrolls (dropping any selection), a left drag selects in the
+    /// transcript or the composer, and letting go asks for a copy. Kept apart
+    /// from the event loop so the mapping is tested; reading the drawn frame
+    /// and repainting stay the loop's job.
+    pub fn on_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) -> MouseAction {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.select_clear();
+                self.mouse_scroll(true);
+                MouseAction::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_clear();
+                self.mouse_scroll(false);
+                MouseAction::Redraw
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.select_begin(col, row) { MouseAction::Redraw } else { MouseAction::None }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.select_drag(col, row) { MouseAction::Redraw } else { MouseAction::None }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Letting go ends the selection either way.
+                let Some(select) = self.select.take() else {
+                    return MouseAction::None;
+                };
+                let (start, end) = select.corners();
+                if start == end {
+                    // A click: in the composer it puts the caret where it
+                    // landed (the transcript has nothing to put it in).
+                    if select.kind == SelectKind::Composer {
+                        self.place_caret(end.0, end.1);
+                        return MouseAction::Redraw;
+                    }
+                    return MouseAction::None;
+                }
+                MouseAction::Copy(select.kind, start, end)
+            }
+            _ => MouseAction::None,
+        }
+    }
+
+    /// Start a drag at a screen cell: in the transcript, or in the composer's
+    /// text. A press anywhere else starts nothing. Returns whether one began
+    /// (so the caller repaints).
+    pub fn select_begin(&mut self, col: u16, row: u16) -> bool {
+        let pos = Position::new(col, row);
+        let (kind, area, left) = if self.output_area.contains(pos) {
+            (SelectKind::Output, self.output_area, self.output_area.x)
+        } else if self.composer_area.contains(pos) {
+            // The prompt isn't text: the drag starts at the first input column.
+            let left = self.composer_area.x + self.prompt_w() as u16;
+            (SelectKind::Composer, self.composer_area, left.min(self.composer_area.right() - 1))
+        } else {
+            return false;
+        };
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+        let at = (col.clamp(left, area.right() - 1), row.clamp(area.y, area.bottom() - 1));
+        self.select = Some(Select { kind, area, left, anchor: at, cursor: at });
+        true
+    }
+
+    /// Extend the drag to a screen cell: past the box's edge the selection
+    /// stops at the edge rather than running into the rest of the screen.
+    pub fn select_drag(&mut self, col: u16, row: u16) -> bool {
+        let Some(select) = self.select.as_mut() else {
+            return false;
+        };
+        select.cursor = (
+            col.clamp(select.left, select.area.right().saturating_sub(1)),
+            row.clamp(select.area.y, select.area.bottom().saturating_sub(1)),
+        );
+        true
+    }
+
+    /// The selection in reading order — top-left cell first — for the copy and
+    /// the highlight alike.
+    pub fn selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        self.select.map(|s| s.corners())
+    }
+
+    /// Forget the selection (the view scrolled, the user typed).
+    pub fn select_clear(&mut self) {
+        self.select = None;
+        self.screen = None;
+    }
+
+    /// Copy a range of screen cells out of the frame that was drawn and put it
+    /// on the system clipboard. A cell read back from the buffer is exactly what
+    /// the user saw, so wrapped paragraphs, diffs and tool output all copy as
+    /// written on screen — the renderer's layout never has to be reconstructed.
+    pub fn copy_range(&mut self, start: (u16, u16), end: (u16, u16)) {
+        let Some(buf) = self.screen.take() else {
+            return;
+        };
+        let text = helpers::selected_text(&buf, self.output_area, start, end);
+        self.copy_text(text);
+    }
+
+    /// Copy the composer's text between two cells of it: the input string, not
+    /// the cells, so the prompt, the wrap points and the block cursor stay out
+    /// of what lands on the clipboard.
+    pub fn copy_input_range(&mut self, start: (u16, u16), end: (u16, u16)) {
+        let text = self.input_text(start, end);
+        self.copy_text(text);
+    }
+
+    /// The input text a cell range covers. Char indices, so a wide character or
+    /// a tab can't shift the result.
+    fn input_text(&self, a: (u16, u16), b: (u16, u16)) -> String {
+        let chars: Vec<char> = self.input.chars().collect();
+        let (Some(from), Some(to)) = (self.composer_index(a), self.composer_index(b)) else {
+            return String::new();
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        if chars.is_empty() {
+            return String::new();
+        }
+        // The cell past a row's last character selects up to it, not past the
+        // end of the input.
+        let hi = hi.min(chars.len() - 1);
+        if lo > hi {
+            return String::new();
+        }
+        chars[lo..=hi].iter().collect()
+    }
+
+    /// Put the caret where a click landed in the composer.
+    fn place_caret(&mut self, col: u16, row: u16) {
+        if let Some(index) = self.composer_index((col, row)) {
+            self.cursor = index.min(self.input.chars().count());
+        }
+    }
+
+    /// The char of the input a composer cell maps to, laid out exactly as the
+    /// composer was drawn (same wrap width, same scrolled-to-the-caret offset).
+    /// Past the end of a row it is the position after that row's last char;
+    /// below the last row, the end of the input.
+    fn composer_index(&self, at: (u16, u16)) -> Option<usize> {
+        let area = self.composer_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let pw = self.prompt_w();
+        let width = (area.width as usize).saturating_sub(pw).max(1);
+        let layout = self.layout_input(width);
+        let offset = at.1.saturating_sub(area.y) as usize;
+        let row = self.composer_first + offset;
+        let Some(line) = layout.rows.get(row) else {
+            return Some(self.input.chars().count());
+        };
+        // Columns are measured from the first cell of the input on that row.
+        let mut want = (at.0.saturating_sub(area.x) as usize).saturating_sub(pw);
+        let mut chars = 0;
+        for c in line.chars() {
+            let cells = self.cell_w(c).max(1);
+            if want < cells {
+                return Some(layout.starts[row] + chars);
+            }
+            want -= cells;
+            chars += 1;
+        }
+        Some(layout.starts[row] + chars)
+    }
+
+    /// Hand `text` to the clipboard and say how much went, or why it couldn't.
+    fn copy_text(&mut self, text: String) {
+        if text.trim().is_empty() {
+            self.flash_note("nothing to copy".to_string());
+            return;
+        }
+        match helpers::copy_to_clipboard(&text) {
+            Ok(()) => {
+                let chars = text.chars().count();
+                let lines = text.lines().count().max(1);
+                let what = if lines > 1 {
+                    format!("{chars} chars, {lines} lines")
+                } else {
+                    format!("{chars} chars")
+                };
+                self.flash_note(format!("copied {what}"));
+            }
+            Err(e) => self.flash_note(format!("copy failed: {e}")),
+        }
+    }
+
+    /// Keep the frame just drawn, for the copy a release will make.
+    pub fn capture_frame(&mut self, buf: &ratatui::buffer::Buffer) {
+        self.screen = Some(buf.clone());
+    }
+
+    /// A one-line note in the status bar, in place for a moment.
+    fn flash_note(&mut self, text: String) {
+        self.flash = Some((text, Instant::now()));
+    }
+
+    /// Drop an expired flash note; true when it went, so the loop repaints.
+    pub fn flash_due(&mut self) -> bool {
+        if self.flash.as_ref().is_some_and(|(_, at)| at.elapsed() > FLASH_TIME) {
+            self.flash = None;
+            return true;
+        }
+        false
+    }
+
     /// Scroll the transcript by `n` lines (negative scrolls up). Scrolling up
     /// pins the view (`follow = false`); coming back to the bottom resumes
     /// following the live end.
@@ -2173,6 +2487,8 @@ impl App {
 
 
     fn set_busy(&mut self) {
+        self.awaiting_response = false;
+        self.current_activity = None;
         self.mode = Mode::Busy;
         self.busy_since = Some(Instant::now());
     }
@@ -2187,6 +2503,8 @@ impl App {
     }
 
     fn clear_busy(&mut self) {
+        self.awaiting_response = false;
+        self.current_activity = None;
         self.mode = Mode::Idle;
         self.busy_since = None;
         self.tool_running = None;
@@ -2237,6 +2555,8 @@ impl App {
             self.push(Kind::Notice, format!("attached: {}", all.join(", ")));
         }
         self.set_busy();
+        self.awaiting_response = true;
+        self.current_activity = Some("waiting for model…".into());
         let _ = h.cmd_tx.send(WorkerCmd::User { text: task_text, images, typed: shown_typed });
     }
 
@@ -2590,15 +2910,20 @@ impl App {
         self.sess_written += s.written;
     }
 
-    /// Session cost so far, cache hits at the cached-input price.
-    fn session_cost(&self) -> f64 {
+    /// Session cost so far, cache hits at the cached-input price; `None` when
+    /// the active server's price is unknown (a custom provider without a
+    /// price list) — the cost readout is hidden.
+    fn session_cost(&self) -> Option<f64> {
+        if !self.cost_known {
+            return None;
+        }
         let spent = money::Spent {
             prompt: self.sess_prompt,
             completion: self.sess_completion,
             cached: self.sess_cached,
             written: self.sess_written,
         };
-        spent.cost(self.price_in, self.settings.price_cached(), self.price_out)
+        Some(spent.cost(self.price_in, self.price_cached_in.unwrap_or(self.price_in * 0.1), self.price_out))
     }
 
     /// Change the reasoning setting: live in the worker, persisted, and shown.
@@ -2609,13 +2934,17 @@ impl App {
 
     fn cost_lines(&self) -> Vec<String> {
         let tokens = self.sess_prompt + self.sess_completion;
-        let cost = self.session_cost();
+        // A custom server without a price list: the cost is hidden.
+        let cost = match self.session_cost() {
+            Some(c) => format!(" · {}", money::fmt_cost_tagged(c, &self.price_currency)),
+            None => String::new(),
+        };
         let mut v = vec![format!(
-            "session: {} tokens ({} in / {} out) · {}",
+            "session: {} tokens ({} in / {} out){}",
             humanize(tokens),
             humanize(self.sess_prompt),
             humanize(self.sess_completion),
-            money::fmt_cost_tagged(cost, &self.price_currency)
+            cost
         )];
         if self.sess_cached + self.sess_written > 0 {
             v.push(format!(
@@ -2933,7 +3262,24 @@ impl App {
         self.settings.base_url = base_url.clone();
         self.settings.model = model.clone();
         self.settings.resolve_key();
+        self.sync_prices(); // the cost counter follows the provider
         let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider { provider, base_url, model }));
+    }
+
+    /// The cost counter follows the active provider: take its price list (the
+    /// user-set one, else the built-in table) or hide the cost (a custom
+    /// server with no known price).
+    fn sync_prices(&mut self) {
+        match self.settings.price_list() {
+            Some(p) => {
+                self.price_in = p.price_in;
+                self.price_out = p.price_out;
+                self.price_cached_in = p.price_cached_in;
+                self.price_currency = money::Currency::parse(&p.price_currency);
+                self.cost_known = true;
+            }
+            None => self.cost_known = false,
+        }
     }
 
     /// Apply a settings change here and in the worker (which saves it).
@@ -3063,13 +3409,15 @@ impl App {
         self.push(Kind::Notice, "   and tmux/screen keep Ctrl+B/Ctrl+A for themselves)");
         self.push(Kind::Notice, "  PgUp/PgDn   scroll the output a page");
         self.push(Kind::Notice, "  Ctrl/Alt+↑/↓  scroll the output 3 lines");
+        self.push(Kind::Notice, "  drag        select output or input text (releasing copies it)");
+        self.push(Kind::Notice, "  click       in the input: put the caret there");
         self.push(Kind::Notice, String::from("  Tab         autocomplete"));
         self.push(Kind::Notice, String::from("  Shift+Tab   cycle permissions (ask / YOLO / plan; remembered)"));
         self.push(Kind::Notice, String::from("  approvals   Y yes · N no · P don't ask again for this pattern · A YOLO (approve everything)"));
         self.push(Kind::Notice, String::from("  Esc         interrupt the agent / clear the line"));
         self.push(Kind::Notice, String::from("  Ctrl+C      clear the line (twice = quit)"));
         self.push(Kind::Notice, String::from("  Ctrl+L      force clear/repaint"));
-        self.push(Kind::Notice, String::from("  Ctrl+T      show full thinking / brief summaries"));
+        self.push(Kind::Notice, String::from("  Ctrl+T      show full thinking / thoughts and live status"));
     }
 
     /// Add the launch banner. Only a placeholder goes into the transcript; the
@@ -3120,7 +3468,7 @@ impl App {
         self.show_thinking = !self.show_thinking;
         self.settings.show_thinking = self.show_thinking;
         Config::persist_show_thinking(self.show_thinking);
-        let what = if self.show_thinking { "full thinking and tool output" } else { "brief summaries (ctrl+t for details)" };
+        let what = if self.show_thinking { "full thinking and tool output" } else { "thoughts and live status (ctrl+t for details)" };
         self.push(Kind::Notice, format!("showing {what}"));
     }
 
@@ -3254,6 +3602,29 @@ impl App {
         self.render_rule(f, chunks[3]);
         self.render_status1(f, pad1(chunks[4]));
         self.render_status2(f, pad1(chunks[5]));
+        self.render_selection(f);
+    }
+
+    /// Tint the cells a drag covers, whatever they hold — prose, a diff, a
+    /// wrapped long line. Reversing them keeps each cell's own color readable
+    /// on any theme, and it needs nothing from the renderer but the box.
+    fn render_selection(&self, f: &mut Frame) {
+        let Some(select) = self.select else {
+            return;
+        };
+        let (start, end) = select.corners();
+        let right = select.area.right().saturating_sub(1);
+        let buf = f.buffer_mut();
+        for row in start.1..=end.1 {
+            let from = if row == start.1 { start.0 } else { select.left };
+            let to = if row == end.1 { end.0 } else { right };
+            for col in from.min(right)..=to.min(right) {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    let style = cell.style().add_modifier(Modifier::REVERSED);
+                    cell.set_style(style);
+                }
+            }
+        }
     }
 
     /// Display value for one `/config` row.
@@ -3298,9 +3669,11 @@ impl App {
             9 => s.context_window.to_string(),
             10 => setting_max_tool_calls(s.max_tool_calls),
             11 => {
-                let defaults = Config::default();
-                if s.price_currency != "USD" && self.price_in == defaults.price_in && self.price_out == defaults.price_out {
-                    format!("{} (the price list is still USD: set price_in/price_out)", s.price_currency)
+                // Cycled off USD while the active provider still runs the
+                // built-in (USD-quoted) list: the prices are relabelled, not
+                // converted, so say where the real ones go.
+                if s.price_currency != "USD" && !s.prices.contains_key(&s.provider) {
+                    format!("{} (built-in list is still USD: set prices.{} in config.json)", s.price_currency, s.provider)
                 } else {
                     s.price_currency.clone()
                 }
@@ -3413,6 +3786,9 @@ impl App {
             .title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
+        // Remembered for drag-selections: a selection is a range of screen
+        // cells in this box, and nothing outside it.
+        self.output_area = inner;
 
         let width = inner.width as usize;
         self.ensure_display_cache(width);
@@ -3469,6 +3845,17 @@ impl App {
         // the answer, with the same separators), so nothing on screen moves
         // the moment the live text becomes transcript.
         let mut out: Vec<Line<'static>> = Vec::new();
+        if self.awaiting_response && self.mode == Mode::Busy {
+            // Fixed-width ASCII pulse: a short trail glides through the track
+            // without shifting the label or growing a line of punctuation.
+            const PULSE: [&str; 10] = [
+                ".      ", "..     ", "...    ", " ...   ", "  ...  ",
+                "   ... ", "    ...", "     ..", "      .", "       ",
+            ];
+            let pulse = PULSE[(self.spin_counter / 6) % PULSE.len()];
+            let text = brief::clip(&format!("Waiting for model  [{pulse}]"), width);
+            out.push(Line::from(Span::styled(text, Style::default().fg(self.dim_text()))));
+        }
         let mut prev = self.transcript.last().map(|t| t.kind);
         if !self.live_reasoning.trim().is_empty() {
             // In brief view a blank between work entries is absorbed into the
@@ -3480,7 +3867,7 @@ impl App {
             if self.show_thinking {
                 render_tline(&mut out, Kind::Reasoning, &self.live_reasoning, true, None, width, self.glyphs, &self.palette, self.single_width);
             } else {
-                out.push(self.brief_row("thinking…", self.live_reasoning.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), width, true));
+                out.push(self.brief_row("", &self.live_reasoning, width, true));
             }
             prev = Some(Kind::Reasoning);
         }
@@ -3493,25 +3880,40 @@ impl App {
         out
     }
 
-    /// One brief-view row, always exactly one screen line: `label` padded to a
-    /// fixed column, then `text` (its first sentence when `gist`) clipped to fit.
+    /// One brief-view list entry, clipped to one screen line. Thoughts have
+    /// no label; failures carry an explicit error label.
     fn brief_row(&self, label: &str, text: &str, width: usize, gist: bool) -> Line<'static> {
-        let room = width.saturating_sub(2 + 12).max(4);
+        let prefix = if label.is_empty() { String::new() } else { format!("{label}  ") };
+        let room = width.saturating_sub(2 + prefix.len());
         let text = if gist { brief::gist(text, room) } else { brief::clip(text, room) };
         let mut out = Vec::new();
-        render_tline(&mut out, Kind::Reasoning, &format!("{label:<11} {text}"), true, None, width, self.glyphs, &self.palette, self.single_width);
+        render_tline(&mut out, Kind::Reasoning, &format!("{prefix}{text}"), true, None, width, self.glyphs, &self.palette, self.single_width);
         out.truncate(1);
         out.pop().unwrap_or_default()
     }
 
-    fn render_inputline(&self, f: &mut Frame, area: Rect) {
+    fn render_inputline(&mut self, f: &mut Frame, area: Rect) {
+        // Whatever the mode, forget where the last frame's composer was: only
+        // a composer drawn this frame may be dragged in.
+        self.composer_area = Rect::new(0, 0, 0, 0);
+        self.composer_first = 0;
         match &self.mode {
             Mode::Idle => self.render_composer(f, area),
             Mode::Busy => {
+                // The activity text shares its line with the spinner and this
+                // hint, so clip it to the room left: spinner glyph + space,
+                // the activity's own trailing space, and the hint.
+                const BUSY_HINT: &str = "(Esc to interrupt · Enter queues)";
+                let reserved = 3 + BUSY_HINT.chars().count();
                 let mut lines = vec![Line::from(vec![
                     Span::styled(format!("{} ", self.spin_frame()), Style::default().fg(self.palette.accent)),
-                    Span::styled(self.working_timer(), Style::default().fg(self.dim_text())),
-                    Span::styled("(Esc to interrupt · Enter queues)", Style::default().fg(self.dim_text())),
+                    Span::styled(
+                        self.current_activity.as_deref().map(|s| {
+                            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                            format!("{} ", brief::clip(&s, (area.width as usize).saturating_sub(reserved)))
+                        }).unwrap_or_else(|| self.working_timer()),
+                        Style::default().fg(self.dim_text())),
+                    Span::styled(BUSY_HINT, Style::default().fg(self.dim_text())),
                 ])];
                 let mark = if self.ascii { "->" } else { "↳" };
                 for q in &self.queued {
@@ -3768,7 +4170,10 @@ impl App {
         }
     }
 
-    fn render_composer(&self, f: &mut Frame, inner: Rect) {
+    fn render_composer(&mut self, f: &mut Frame, inner: Rect) {
+        // Remembered for mouse selections: a drag in the composer is a range
+        // of its cells, mapped back to chars by the same layout.
+        self.composer_area = inner;
         let pw = self.prompt_w();
         let w = (inner.width as usize).saturating_sub(pw).max(1);
         let empty = self.input.is_empty();
@@ -3776,6 +4181,7 @@ impl App {
         let total_rows = rows.len();
         let max_rows = inner.height as usize;
         let start_row = if cur_row >= max_rows { cur_row - max_rows + 1 } else { 0 };
+        self.composer_first = start_row;
 
         let prompt = self.prompt_str();
         let cursor = self.palette.cursor;
@@ -3909,7 +4315,10 @@ impl App {
                 vec![Span::styled(format!("effort:{}", self.settings.reasoning), gray)]
             }
             "cost" if tokens > 0 => {
-                let cost = self.session_cost();
+                // A custom server without a price list has nothing to show.
+                let Some(cost) = self.session_cost() else {
+                    return Vec::new();
+                };
                 let cost = if aligned {
                     money::fmt_cost(cost, &self.price_currency)
                 } else {
@@ -3998,7 +4407,17 @@ impl App {
             Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(text, Style::default().fg(color)),
         ];
-        spans.extend(hint);
+        // A flash ("copied 214 chars") takes the hint's place for a moment, so
+        // the line never grows a second one.
+        match &self.flash {
+            Some((note, _)) => spans.push(Span::styled(
+                format!("  {note}"),
+                Style::default()
+                    .fg(self.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None => spans.extend(hint),
+        }
         spans.push(Span::styled("  (shift+tab/ctrl+p to cycle)", Style::default().fg(self.dim_text())));
         spans.push(Span::styled(format!("   Haiku Code v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(self.dim_text())));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -4012,7 +4431,8 @@ mod tests {
     use super::palette::palette_by_name;
     use super::{
         echo_excerpt, palette_for, want_mouse_capture, App, ConfigPatch, Handles, KeyCode, KeyEvent,
-        KeyModifiers, Mode, ECHO_LINES, TAB_W, THEMES, UiConfig, UiEvent, WorkerCmd,
+        KeyModifiers, Mode, MouseAction, MouseButton, MouseEventKind, SelectKind, ECHO_LINES,
+        TAB_W, THEMES, UiConfig, UiEvent, WorkerCmd,
     };
 
     #[test]
@@ -4168,15 +4588,15 @@ mod tests {
 
         app.mode = Mode::Approval("edit src/ui.rs".into());
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("considered  Check the config loader first."), "{screen}");
-        assert!(screen.contains("explored    read 1 file"), "{screen}");
+        assert!(screen.contains("Check the config loader first."), "{screen}");
+        assert!(!screen.contains("explored") && !screen.contains("considered"), "{screen}");
         assert!(!screen.contains("SECRET_TOOL_OUTPUT"), "{screen}");
         assert!(screen.contains("added_line"), "pending edit's diff stays visible:\n{screen}");
 
         app.mode = Mode::Idle;
         app.push(Kind::ToolResult, "OK".to_string());
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("changed     src/ui.rs +1"), "{screen}");
+        assert!(!screen.contains("changed") && !screen.contains("read_file"), "{screen}");
         assert!(!screen.contains("added_line"), "{screen}");
 
         app.show_thinking = true;
@@ -4185,7 +4605,7 @@ mod tests {
     }
 
     /// Committing live thinking (and the answer streaming after it) must not
-    /// move anything: the brief `thinking…` row becomes the `considered` row on
+    /// move anything: the brief thought stays on
     /// the same screen line, and the answer keeps its line too.
     #[test]
     fn committing_live_thinking_does_not_shift_the_screen() {
@@ -4210,14 +4630,72 @@ mod tests {
                 let before = draw(&mut app, &mut term);
                 app.flush_live();
                 let after = draw(&mut app, &mut term);
-                let thought = if show { "Look at the banner first." } else { "thinking…" };
-                let committed = if show { "Look at the banner first." } else { "considered  Look at the banner first." };
+                let thought = "Look at the banner first.";
+                let committed = thought;
                 let ctx = format!("show={show} after_tool={after_tool}\n--before--\n{before}\n--after--\n{after}");
                 assert!(row_of(&before, thought).is_some(), "{ctx}");
                 assert_eq!(row_of(&before, thought), row_of(&after, committed), "{ctx}");
                 assert_eq!(row_of(&before, "Here is the answer."), row_of(&after, "Here is the answer."), "{ctx}");
             }
         }
+    }
+
+    #[test]
+    fn prompt_is_acknowledged_before_the_first_model_token() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.transcript.clear();
+        app.show_thinking = false;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        app.send_prompt("hi".into(), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Waiting for model  [.      ]"), "{screen}");
+        app.spin_counter = 30;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Waiting for model  [   ... ]"), "{screen}");
+        app.handle_event(UiEvent::Reasoning("A greeting.".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Waiting for model") && screen.contains("A greeting."), "{screen}");
+        app.handle_event(UiEvent::TurnDone, &h);
+        app.send_prompt("hello again".into(), &h);
+        app.handle_event(UiEvent::Token("Hello!".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Waiting for model") && screen.contains("Hello!"), "{screen}");
+        app.handle_event(UiEvent::TurnDone, &h);
+        app.send_prompt("cancel this".into(), &h);
+        app.clear_busy();
+        assert!(!draw(&mut app, &mut term).contains("Waiting for model"));
+        assert!(!app.transcript.iter().any(|t| t.text.contains("Waiting for model")));
+    }
+
+    #[test]
+    fn current_activity_is_replaced_and_removed_without_losing_thoughts() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, _rx) = test_handles();
+        app.transcript.clear();
+        app.show_thinking = false;
+        app.set_busy();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        app.handle_event(UiEvent::Reasoning("Check the renderer first.".into()), &h);
+        app.handle_event(UiEvent::ToolStart { name: "read_file".into(), summary: "src/ui.rs".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the renderer first.") && screen.contains("read_file src/ui.rs"), "{screen}");
+        app.handle_event(UiEvent::Progress("Checking layout".into()), &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Checking layout") && !screen.contains("read_file src/ui.rs"), "{screen}");
+        app.handle_event(UiEvent::ToolResult { ok: true, preview: "ok".into() }, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(!screen.contains("Checking layout"), "{screen}");
+        app.handle_event(UiEvent::ToolStart { name: "bash".into(), summary: "cargo test".into() }, &h);
+        app.handle_event(UiEvent::TurnDone, &h);
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("Check the renderer first."), "{screen}");
+        assert!(!screen.contains("bash cargo test") && !screen.contains("considered"), "{screen}");
+        app.show_thinking = true;
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("read_file src/ui.rs") && screen.contains("bash cargo test"), "{screen}");
     }
 
     /// A tool result with newlines keeps its line structure. The transcript used
@@ -4587,7 +5065,9 @@ mod tests {
             ctx_limit: 128_000,
             price_in: 0.0,
             price_out: 0.0,
+            price_cached_in: None,
             price_currency: crate::money::Currency::default(),
+            cost_known: true,
             perm: Arc::new(AtomicU8::new(0)),
             settings: crate::config::Config::default(),
         }
@@ -5361,19 +5841,281 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_defaults_to_on_except_on_warp_and_honours_the_override() {
+    fn mouse_capture_defaults_to_on_everywhere_and_honours_the_override() {
         assert!(want_mouse_capture("iTerm.app", None));
         assert!(want_mouse_capture("", None));
-        assert!(!want_mouse_capture("WarpTerminal", None));
+        assert!(want_mouse_capture("WarpTerminal", None));
 
         assert!(want_mouse_capture("WarpTerminal", Some("1")));
         assert!(want_mouse_capture("WarpTerminal", Some("true")));
         assert!(want_mouse_capture("WarpTerminal", Some("ON")));
         assert!(!want_mouse_capture("iTerm.app", Some("0")));
         assert!(!want_mouse_capture("iTerm.app", Some("off")));
-        // Unrecognised value: fall back to the terminal-based default.
-        assert!(!want_mouse_capture("WarpTerminal", Some("maybe")));
+        // Unrecognised value: keep application mouse handling enabled.
+        assert!(want_mouse_capture("WarpTerminal", Some("maybe")));
         assert!(want_mouse_capture("iTerm.app", Some("maybe")));
+    }
+
+    /// A drag is a range of screen cells in the output box: it can't start
+    /// outside it, and dragging past an edge stops at the edge (otherwise the
+    /// composer would get selected too).
+    #[test]
+    fn a_drag_selection_stays_inside_the_transcript_and_reads_forwards() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(2, 1, 20, 4);
+
+        assert!(!app.select_begin(0, 0), "a press outside the box selects nothing");
+        assert!(app.selection().is_none());
+
+        assert!(app.select_begin(10, 3));
+        assert!(app.select_drag(99, 99), "dragging past the corner still extends");
+        assert_eq!(app.selection(), Some(((10, 3), (21, 4))), "clamped to the box's last cell");
+
+        // Anchored at the bottom right, the same drag still reads top-left first.
+        app.select_clear();
+        assert!(app.select_begin(21, 4));
+        assert!(app.select_drag(4, 1));
+        assert_eq!(app.selection(), Some(((4, 1), (21, 4))));
+
+        // A key gives the selection up.
+        app.select_drag(4, 2);
+        app.select_clear();
+        assert!(app.selection().is_none());
+    }
+
+    /// A composer drag selects the input's characters, not the cells: tabs and
+    /// wide characters can't shift the result, and the prompt stays out of it.
+    #[test]
+    fn a_drag_in_the_composer_copies_input_text() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.composer_area = Rect::new(0, 20, 60, 2);
+        let pw = app.prompt_w() as u16;
+        let row = 20;
+
+        app.input = "git commit -m wip".to_string();
+        assert_eq!(app.input_text((pw + 4, row), (pw + 9, row)), "commit");
+        // Either direction is the same selection.
+        assert_eq!(app.input_text((pw + 9, row), (pw + 4, row)), "commit");
+        // The cell past a row's last character stops there, not past the end.
+        assert_eq!(app.input_text((pw, row), (pw + 40, row)), "git commit -m wip");
+
+        // A tab is one char in the buffer however many cells it draws over.
+        app.input = "a\tb".to_string();
+        assert_eq!(app.input_text((pw + 1, row), (pw + 2, row)), "\t");
+        assert_eq!(app.input_text((pw, row), (pw + 5, row)), "a\tb");
+
+        // Wide characters map to their own char, not to two cells of it.
+        app.input = "世界 x".to_string();
+        assert_eq!(app.input_text((pw, row), (pw + 3, row)), "世界");
+        assert_eq!(app.input_text((pw + 5, row), (pw + 5, row)), "x");
+
+        // A click in the prompt selects from the first input column.
+        app.input = "abc".to_string();
+        assert!(app.select_begin(0, row));
+        let select = app.select.expect("a selection started");
+        assert_eq!(select.kind, SelectKind::Composer);
+        assert_eq!(select.anchor, (pw, row), "clamped past the prompt");
+        assert_eq!(app.input_text(select.anchor, (pw + 2, row)), "abc");
+    }
+
+    /// A click (no drag) in the composer puts the caret where it landed, which
+    /// is what a text field is expected to do; the transcript ignores clicks.
+    #[test]
+    fn a_click_in_the_composer_places_the_caret() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.input = "hello world".to_string();
+        app.cursor = 0;
+        app.output_area = Rect::new(0, 0, 60, 3);
+        app.composer_area = Rect::new(0, 8, 60, 1);
+        let pw = app.prompt_w() as u16;
+
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), pw + 6, 8),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), pw + 6, 8),
+            MouseAction::Redraw
+        );
+        assert_eq!(app.cursor, 6, "the caret goes before the word clicked on");
+        assert!(app.select.is_none(), "a click leaves no selection behind");
+
+        // A drag in the composer asks for the copy instead.
+        assert!(app.select_begin(pw + 2, 8));
+        assert!(app.select_drag(pw + 6, 8));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), pw + 6, 8),
+            MouseAction::Copy(SelectKind::Composer, (pw + 2, 8), (pw + 6, 8))
+        );
+        assert_eq!(app.cursor, 6, "a selection never moves the caret");
+    }
+
+    /// The composer that was drawn is the one drags map to: the box the mouse
+    /// is over, the row the text sits on, and the cells the highlight covers.
+    #[test]
+    fn the_composer_drawn_on_screen_is_the_one_drags_map_to() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.input = "select me please".to_string();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let screen = draw(&mut app, &mut term);
+
+        let row = app.composer_area.y;
+        let line = screen.lines().nth(row as usize).unwrap();
+        assert!(line.contains("select me please"), "{screen}");
+        let col = |byte: usize| line[..byte].chars().count() as u16;
+        let from = col(line.find("me please").unwrap());
+        let to = from + 1;
+
+        assert!(app.select_begin(from, row), "the press lands in the composer");
+        assert!(app.select_drag(to, row));
+        draw(&mut app, &mut term);
+
+        let buf = term.backend().buffer();
+        for c in from..=to {
+            assert!(
+                buf.cell((c, row)).unwrap().modifier.contains(Modifier::REVERSED),
+                "column {c} of the composer is not highlighted"
+            );
+        }
+        assert_eq!(app.input_text((from, row), (to, row)), "me");
+    }
+
+    /// A wrapped composer maps the second and later rows back to the chars
+    /// drawn on them, and pulls up to the caret when the text outgrows a box
+    /// that is only two rows tall.
+    #[test]
+    fn a_wrapped_composer_maps_each_row_back_to_its_chars() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.mode = Mode::Idle;
+        app.composer_area = Rect::new(0, 20, 16, 2);
+        let pw = app.prompt_w() as u16;
+        app.input = "abcdefghij klmnopqrstuvwxyz abcd efgh".to_string();
+        app.cursor = app.input.chars().count();
+
+        let layout = app.layout_input((16 - pw) as usize);
+        assert!(layout.rows.len() > 2, "the text needs more rows than the box: {:?}", layout.rows);
+        // The box shows the last two rows, so its first screen row is row 1.
+        app.composer_first = layout.cur_row - 1;
+        let second = layout.rows[app.composer_first + 1].clone();
+        let first_on_screen = layout.starts[app.composer_first];
+        assert_eq!(app.input_text((pw, 20), (pw, 20)).chars().count(), 1);
+        assert_eq!(
+            app.input_text((pw, 20), (pw + 1, 20)),
+            app.input.chars().skip(first_on_screen).take(2).collect::<String>()
+        );
+        assert_eq!(
+            app.input_text((pw, 21), (pw + 1, 21)),
+            second.chars().take(2).collect::<String>()
+        );
+    }
+
+    /// A press outside both boxes starts nothing, and a drag never leaves the
+    /// box it began in.
+    #[test]
+    fn a_drag_stays_in_the_box_it_started_in() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(0, 0, 40, 6);
+        app.composer_area = Rect::new(0, 8, 40, 1);
+
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 5, 7),
+            MouseAction::None,
+            "the rule between the boxes takes no selection"
+        );
+        assert!(app.select_begin(5, 5));
+        assert!(app.select_drag(5, 30));
+        let select = app.select.expect("still dragging");
+        assert_eq!(select.kind, SelectKind::Output);
+        assert_eq!(select.cursor.1, 5, "clamped to the transcript's last row");
+    }
+
+    /// The loop's mouse arms: the wheel scrolls and drops a selection, a left
+    /// drag selects, letting go asks for the copy, and stray motion does
+    /// nothing.
+    #[test]
+    fn mouse_events_map_to_the_loop_actions() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(1, 1, 20, 5);
+
+        assert_eq!(app.on_mouse(MouseEventKind::Moved, 5, 3), MouseAction::None);
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 5, 3),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Drag(MouseButton::Left), 9, 3),
+            MouseAction::Redraw
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
+            MouseAction::Copy(SelectKind::Output, (5, 3), (9, 3))
+        );
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 9, 3),
+            MouseAction::None,
+            "the selection is gone once it has been taken"
+        );
+
+        // The wheel scrolls, and a selection doesn't survive it.
+        assert!(app.select_begin(5, 3));
+        assert!(app.select_drag(9, 3));
+        assert_eq!(app.on_mouse(MouseEventKind::ScrollUp, 0, 0), MouseAction::Redraw);
+        assert!(app.selection().is_none());
+
+        // A press outside the transcript is not a selection.
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Down(MouseButton::Left), 40, 20),
+            MouseAction::None
+        );
+    }
+
+    /// A plain click is not a selection: it must not copy a stray character,
+    /// and must not claim it copied anything.
+    #[test]
+    fn a_click_copies_nothing() {
+        use ratatui::layout::Rect;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.output_area = Rect::new(0, 0, 10, 3);
+        let buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 3));
+
+        assert!(app.select_begin(3, 1));
+        assert_eq!(
+            app.on_mouse(MouseEventKind::Up(MouseButton::Left), 3, 1),
+            MouseAction::None,
+            "a press and release on one cell is a click, not a selection"
+        );
+        assert!(app.selection().is_none(), "the selection is let go");
+        assert!(app.flash.is_none(), "and no note claims a copy");
+
+        // A drag over blank cells says so, rather than copying whitespace.
+        assert!(app.select_begin(1, 0));
+        assert!(app.select_drag(6, 2));
+        app.capture_frame(&buf);
+        app.copy_range((1, 0), (6, 2));
+        assert_eq!(
+            app.flash.as_ref().map(|(note, _)| note.as_str()),
+            Some("nothing to copy")
+        );
     }
 
     /// A balance in another currency is shown as-is (tagged on the status
@@ -5416,6 +6158,59 @@ mod tests {
         app.settings.price_currency = "XYZ".into();
         app.activate_setting(row, 1, &h2);
         assert_eq!(app.settings.price_currency, "USD");
+    }
+
+    /// The cost counter follows the provider: switching presets re-prices the
+    /// same session tokens, and a custom server without a price list hides
+    /// the cost (status line and /cost alike).
+    #[test]
+    fn the_cost_counter_follows_the_provider() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
+        app.mode = Mode::Idle;
+        let (h, _cmd_rx) = test_handles();
+        app.sess_prompt = 100_000;
+        app.sess_completion = 50_000;
+        // test_ui_config zeros the prices; take the default provider's list.
+        app.sync_prices();
+        assert!(app.cost_known);
+        let deepseek_cost = app.session_cost().unwrap();
+        assert!(deepseek_cost > 0.0);
+
+        app.switch_provider(
+            "anthropic".into(),
+            "https://api.anthropic.com/v1".into(),
+            "claude-opus-5-5".into(),
+            &h,
+        );
+        assert!(app.cost_known);
+        let opus_cost = app.session_cost().unwrap();
+        assert!(
+            (opus_cost - deepseek_cost).abs() > 1.0,
+            "150k tokens cost very differently on Opus than on DeepSeek Flash ({deepseek_cost} vs {opus_cost})"
+        );
+
+        app.switch_provider(
+            "mylocal".into(),
+            "http://localhost:11434/v1".into(),
+            "qwen3".into(),
+            &h,
+        );
+        assert!(!app.cost_known, "a custom server has no known price");
+        assert!(app.session_cost().is_none());
+
+        // /cost drops the cost figure but keeps the token counts.
+        let lines = app.cost_lines();
+        assert!(lines[0].starts_with("session: 150.0k tokens (100.0k in / 50.0k out)"), "{lines:?}");
+        assert!(!lines[0].contains('·'), "the cost is hidden:\n{lines:?}");
+
+        // And the status line: tokens stay, the cost segment goes.
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let screen = draw(&mut app, &mut term);
+        assert!(screen.contains("150.0k tok"), "tokens stay on the line:\n{screen}");
+        assert!(!screen.contains('$'), "no cost figure:\n{screen}");
     }
 
     /// Enter on the api key row opens an empty field; saving it empty used to
@@ -5546,6 +6341,47 @@ mod tests {
             .join("\n")
     }
 
+    /// A drag across the output lights up exactly the cells it covers, and the
+    /// copy reads those same cells back: the highlight and the clipboard can't
+    /// disagree about what was selected, because both come from the frame.
+    #[test]
+    fn a_drag_highlights_the_cells_it_covers_and_copies_them() {
+        use crate::ui::helpers;
+        use crate::ui::types::Kind;
+        use ratatui::style::Modifier;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(test_ui_config(), Vec::new());
+        app.transcript.clear();
+        app.push(Kind::Assistant, "the quick brown fox".to_string());
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let screen = draw(&mut app, &mut term);
+
+        let row = screen.lines().position(|l| l.contains("quick brown")).unwrap() as u16;
+        let line = screen.lines().nth(row as usize).unwrap();
+        // Byte offsets are not columns: the assistant's glyph is multibyte.
+        let col = |byte: usize| line[..byte].chars().count() as u16;
+        let from = col(line.find("quick").unwrap());
+        let to = col(line.find("brown").unwrap() + "brown".len() - 1);
+
+        assert!(app.select_begin(from, row), "the press lands in the transcript");
+        assert!(app.select_drag(to, row));
+        // Redraw with the selection up, then read the frame back.
+        draw(&mut app, &mut term);
+
+        let buf = term.backend().buffer();
+        assert_eq!(helpers::selected_text(buf, app.output_area, (from, row), (to, row)), "quick brown");
+        for col in from..=to {
+            let cell = buf.cell((col, row)).unwrap();
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "column {col} is not highlighted: {:?}",
+                cell.modifier
+            );
+        }
+    }
+
     #[test]
     fn the_output_actually_moves_and_the_hint_shows_in_the_rendered_screen() {
         use ratatui::backend::TestBackend;
@@ -5591,6 +6427,37 @@ mod tests {
         let bottom = draw(&mut app, &mut term);
         assert!(bottom.contains("a fresh reply"), "PgDn returns to the live end");
         assert!(!bottom.contains("end") && !bottom.contains("new"));
+    }
+
+    #[test]
+    fn wheel_over_output_or_input_only_scrolls_output() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (mut app, _h) = scrollable_app();
+        for i in 0..80 { app.note(format!("transcript line {i}")); }
+        app.input = "draft first line\ndraft second line".into();
+        app.cursor = app.input.chars().count();
+        let draft = app.input.clone();
+        let cursor = app.cursor;
+        let history = app.hist_idx;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        draw(&mut app, &mut term);
+        let composer_area = app.composer_area;
+        let bottom = app.scroll;
+        for area in [app.output_area, app.composer_area] {
+            app.on_mouse(MouseEventKind::ScrollUp, area.x, area.y);
+            draw(&mut app, &mut term);
+            assert!(app.scroll < bottom);
+            assert_eq!(app.input, draft);
+            assert_eq!(app.cursor, cursor);
+            assert_eq!(app.hist_idx, history);
+            assert_eq!(app.composer_area, composer_area);
+        }
+        for _ in 0..2 { app.on_mouse(MouseEventKind::ScrollDown, composer_area.x, composer_area.y); }
+        draw(&mut app, &mut term);
+        assert_eq!(app.scroll, bottom);
+        assert_eq!(app.input, draft);
+        assert_eq!(app.cursor, cursor);
+        assert_eq!(app.hist_idx, history);
     }
 
     /// The transcript separates blocks with blank lines so turns, prose, and
@@ -5797,16 +6664,16 @@ pub fn run<B: ratatui::backend::Backend>(
                     app.on_paste(s);
                     dirty = true;
                 }
-                Event::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.mouse_scroll(true);
+                Event::Mouse(m) => match app.on_mouse(m.kind, m.column, m.row) {
+                    MouseAction::None => {}
+                    MouseAction::Redraw => dirty = true,
+                    MouseAction::Copy(kind, start, end) => {
+                        match kind {
+                            SelectKind::Output => app.copy_range(start, end),
+                            SelectKind::Composer => app.copy_input_range(start, end),
+                        }
                         dirty = true;
                     }
-                    MouseEventKind::ScrollDown => {
-                        app.mouse_scroll(false);
-                        dirty = true;
-                    }
-                    _ => {}
                 },
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
@@ -5826,33 +6693,33 @@ pub fn run<B: ratatui::backend::Backend>(
         if app.clock_due() {
             dirty = true;
         }
+        if app.flash_due() {
+            dirty = true;
+        }
         if app.force_clear {
             app.force_clear = false;
             terminal.clear()?;
             dirty = true;
         }
         if dirty {
-            terminal.draw(|f| app.render(f))?;
+            let frame = terminal.draw(|f| app.render(f))?;
+            // The frame just drawn is only borrowable here (see `screen`).
+            if app.selection().is_some() {
+                app.capture_frame(frame.buffer);
+            }
         }
     }
     Ok(())
 }
 
-/// Whether to grab the mouse (needed for scroll-wheel events). Capture is on by
-/// default, but skipped on Warp: it grabs click-drag text selection and Warp has
-/// no modifier to bypass a grabbed mouse, so users couldn't copy anything. Other
-/// terminals (iTerm, …) let you hold Option/Fn to select, so capture stays.
-///
-/// `HAIKUCODE_MOUSE` overrides either way: a truthy value (`1`/`true`/`on`/`yes`)
-/// forces wheel scrolling on even under Warp, a falsy one (`0`/`false`/`off`/
-/// `no`) turns capture off everywhere. Anything else means "decide from the
-/// terminal". Scrolling is also on ↑/↓ and PgUp/PgDn, so a terminal without
-/// capture still has a way to move through the transcript.
-pub fn want_mouse_capture(term_program: &str, override_env: Option<&str>) -> bool {
+/// Capture wheel events by default in every terminal, including Warp, so the
+/// terminal cannot translate them into Up/Down keys that navigate input history.
+/// Explicit HAIKUCODE_MOUSE=0/false/off/no opts out of application mouse handling.
+pub fn want_mouse_capture(_term_program: &str, override_env: Option<&str>) -> bool {
     match override_env.map(str::to_ascii_lowercase).as_deref() {
         Some("1") | Some("true") | Some("on") | Some("yes") => true,
         Some("0") | Some("false") | Some("off") | Some("no") => false,
-        _ => term_program != "WarpTerminal",
+        _ => true,
     }
 }
 

@@ -620,8 +620,13 @@ fn run_oneshot(
 ) -> bool {
     let started = std::time::Instant::now();
     let model = cfg.model.clone();
-    let (price_in, price_out, price_currency) = (cfg.price_in, cfg.price_out, cfg.price_currency.clone());
-    let price_cached = cfg.price_cached();
+    // The cost counter follows the provider: a custom server without a price
+    // list has no known cost (null in the JSON summary).
+    let price_list = cfg.price_list();
+    let price_currency = price_list
+        .as_ref()
+        .map(|p| p.price_currency.clone())
+        .unwrap_or_default();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let h = agent::spawn(cfg, messages, perm, session, ui_tx);
     let (task_text, attached) = ui::expand_attachments(&task);
@@ -774,7 +779,7 @@ fn run_oneshot(
     if text_mode && !at_line_start {
         println!();
     }
-    let cost = spent.cost(price_in, price_cached, price_out);
+    let cost = price_list.map(|p| spent.cost(p.price_in, p.price_cached(), p.price_out));
     let result = final_text.trim_end().to_string();
     if mode != OutputMode::Text {
         let summary = serde_json::json!({
@@ -867,7 +872,11 @@ fn run_tui(
     let ctx_limit = cfg.context_window;
     let price_in = cfg.price_in;
     let price_out = cfg.price_out;
+    let price_cached_in = cfg.price_cached_in;
     let price_currency = money::Currency::parse(&cfg.price_currency);
+    // A custom server without a price list has no known cost: the readout is
+    // hidden rather than priced at a guess.
+    let cost_known = cfg.price_list().is_some();
     let settings = cfg.clone();
     let perm_start = start_perm(&cfg, auto);
 
@@ -892,7 +901,9 @@ fn run_tui(
             ctx_limit,
             price_in,
             price_out,
+            price_cached_in,
             price_currency,
+            cost_known,
             perm: h.shared.perm.clone(),
             settings,
         },

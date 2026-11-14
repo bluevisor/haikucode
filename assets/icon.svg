@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Haiku Code</title>
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512">
+      <stop offset="0" stop-color="#24435F"/>
+      <stop offset="1" stop-color="#0E1A28"/>
+    </linearGradient>
+    <!-- Haiku's three leaves, left to right: green, orange, peach. -->
+    <linearGradient id="leaf" gradientUnits="userSpaceOnUse" x1="197" y1="126" x2="197" y2="382">
+      <stop offset="0" stop-color="#5AE202"/>
+      <stop offset="0.5" stop-color="#FFCB00"/>
+      <stop offset="1" stop-color="#FF8203"/>
+    </linearGradient>
+    <linearGradient id="cursor" gradientUnits="userSpaceOnUse" x1="312" y1="276" x2="312" y2="386">
+      <stop offset="0" stop-color="#FFC468"/>
+      <stop offset="1" stop-color="#FF8203"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="114" fill="url(#bg)"/>
+  <path d="M140 162 L254 254 L140 346" fill="none" stroke="url(#leaf)" stroke-width="72"
+    stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="312" y="276" width="96" height="110" rx="26" fill="url(#cursor)"/>
+</svg>

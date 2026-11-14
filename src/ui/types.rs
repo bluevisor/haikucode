@@ -126,7 +126,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "list / allow / deny permission rules"),
     ("/hooks", "list configured lifecycle hooks"),
     ("/commands", "reload and list custom slash commands"),
-    ("/thinking", "toggle full thinking + tool output vs brief summaries (Ctrl+T)"),
+    ("/thinking", "toggle full thinking + tool output vs thoughts and live status (Ctrl+T)"),
     ("/clear", "clear the screen transcript"),
     ("/update", "install the latest Haiku Code release from GitHub"),
     ("/help", "show help"),
@@ -163,7 +163,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/statusline reset", "back to the default status bar"),
     ("/statusline ", "<items…> set them in order, e.g. model git ctx time"),
     ("/thinking full", "show reasoning, tool output and diffs"),
-    ("/thinking brief", "one-line summaries of each stretch of work"),
+    ("/thinking brief", "keep thoughts and show only the current activity"),
     ("/mcp approve ", "<server> trust a project's MCP server"),
     ("/mcp deny ", "<server> refuse a project's MCP server"),
     ("/mcp login ", "<server> sign in to a server that needs OAuth"),
@@ -360,8 +360,13 @@ pub struct UiConfig {
     pub ctx_limit: u32,
     pub price_in: f64,
     pub price_out: f64,
+    /// Price per 1M cached input tokens for the active provider's list.
+    pub price_cached_in: Option<f64>,
     /// Unit `price_in`/`price_out` are quoted in (ISO 4217).
     pub price_currency: crate::money::Currency,
+    /// False when the active server's price is unknown (a custom provider
+    /// without a price list): the cost readout is hidden.
+    pub cost_known: bool,
     pub perm: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Snapshot for the `/config` panel; kept in sync as patches are sent.
     pub settings: crate::config::Config,
