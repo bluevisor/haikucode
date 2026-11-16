@@ -656,9 +656,15 @@ impl Worker {
     /// Set the context window for the current model. The built-in table is
     /// instant; a background call then refines it from the provider's
     /// `/models` metadata for providers that advertise one (see `ctx_limit`).
-    /// A user-pinned window is left untouched.
+    /// A user-pinned window (per-model entry or `context_window`) is used as-is.
     fn refresh_context_window(&mut self) {
+        if let Some(n) = self.cfg.model_context_window() {
+            let _ = self.ui.send(UiEvent::ContextLimit(n));
+            return;
+        }
         if self.cfg.context_window_explicit {
+            // Re-announce it: the previous model may have had its own entry.
+            let _ = self.ui.send(UiEvent::ContextLimit(self.cfg.context_window));
             return;
         }
         let table = crate::config::known_context_window(&self.cfg.model);
@@ -918,9 +924,13 @@ impl Worker {
         }
     }
 
-    /// The context window auto-compaction sizes against: a user-pinned value,
-    /// else what the provider advertised for this model, else the table.
+    /// The context window auto-compaction sizes against: the model's own
+    /// entry, else a user-pinned value, else what the provider advertised for
+    /// this model, else the table.
     fn ctx_limit(&self) -> u32 {
+        if let Some(n) = self.cfg.model_context_window() {
+            return n;
+        }
         if !self.cfg.context_window_explicit {
             if let Ok(d) = self.ctx_detected.lock() {
                 if let Some((model, n)) = d.as_ref() {
