@@ -121,6 +121,8 @@ memory, sessions, skills) into `~/.config/haikucode`.
   or per-provider value. Prices apply on top of the provider's list, so a
   priced model on a custom server gets a cost readout too. Switching models
   re-applies them. (The older `model_context_windows` map is still read.)
+  The `/config` context-window row shows the window in effect and pins it
+  on the current model, never globally.
 - **Queued input** — keep typing while the agent works; Enter queues messages
   that send as turns finish.
 - **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to

@@ -252,6 +252,12 @@ pub struct App {
     /// Session input tokens served from / written to the provider's cache.
     sess_cached: u64,
     sess_written: u64,
+    /// Cost already priced: when the price list changes (a provider or model
+    /// switch), the tokens so far are priced at the old list and banked, so
+    /// the readout doesn't re-price past spend at the new one.
+    banked_cost: f64,
+    /// Token totals at the last bank, so only spend since then is priced live.
+    banked_at: money::Spent,
     balance: Option<money::Balance>,
     /// True once the "balance and prices are in different currencies" notice
     /// has been shown, so the per-turn balance refresh doesn't repeat it.
@@ -454,6 +460,8 @@ impl App {
             sess_completion: 0,
             sess_cached: 0,
             sess_written: 0,
+            banked_cost: 0.0,
+            banked_at: money::Spent::default(),
             balance: None,
             settings: cfg.settings,
             cwd_label: cwd_label(),
@@ -733,6 +741,7 @@ impl App {
             UiEvent::ContextLimit(n) => {
                 self.ctx_limit = n;
             }
+            UiEvent::BalanceCleared => self.balance = None,
             UiEvent::Balance(b) => {
                 // A balance in another currency (DeepSeek bills China-region
                 // accounts in CNY) needs no nudge: the status line tags both
@@ -784,6 +793,7 @@ impl App {
             }
             UiEvent::SessionSwitched { label, replay } => {
                 self.transcript.clear();
+                self.reset_session_counters();
                 self.replay(replay);
                 self.push(Kind::Notice, format!("resumed session {label}"));
                 self.session_label = label;
@@ -1507,7 +1517,7 @@ impl App {
                 self.settings.theme = THEMES[i].to_string();
                 Config::persist_theme(THEMES[i]);
             }
-            9 => self.mode = edit_with(self.settings.effective_context_window().to_string()),
+            9 => self.mode = edit_with(self.ctx_limit.to_string()),
             10 => self.mode = edit_with(setting_max_tool_calls(self.settings.max_tool_calls)),
             // A pick-list, USD first. The currency belongs to the active
             // provider's price list: cycling it relabels the cost, it doesn't
@@ -1550,7 +1560,10 @@ impl App {
                 let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::ApiKey(val)));
             }
             9 => {
-                let v: u32 = val.parse().map(|n: u32| n.max(1)).unwrap_or(self.ctx_limit);
+                let Ok(v) = val.trim().replace(['_', ','], "").parse::<u32>().map(|n| n.max(1)) else {
+                    self.push(Kind::ErrorK, format!("context window must be a number of tokens; kept {}", self.ctx_limit));
+                    return;
+                };
                 self.settings.set_context_window(v);
                 self.ctx_limit = v;
                 let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::ContextWindow(v)));
@@ -2643,6 +2656,7 @@ impl App {
             "new" => {
                 let _ = h.cmd_tx.send(WorkerCmd::New);
                 self.transcript.clear();
+                self.reset_session_counters();
                 self.dirty();
             }
             "config" => {
@@ -2978,16 +2992,45 @@ impl App {
     /// the active server's price is unknown (a custom provider without a
     /// price list) — the cost readout is hidden.
     fn session_cost(&self) -> Option<f64> {
-        if !self.cost_known {
-            return None;
+        let live = self.cost_known.then(|| self.unbanked().cost(self.price_in, self.price_cached_in.unwrap_or(self.price_in * 0.1), self.price_out));
+        match live {
+            Some(c) => Some(self.banked_cost + c),
+            // Priced spend from earlier stays visible on an unpriced server.
+            None => (self.banked_cost > 0.0).then_some(self.banked_cost),
         }
-        let spent = money::Spent {
+    }
+
+    /// Tokens spent since the last bank (see `banked_cost`).
+    fn unbanked(&self) -> money::Spent {
+        money::Spent {
+            prompt: self.sess_prompt.saturating_sub(self.banked_at.prompt),
+            completion: self.sess_completion.saturating_sub(self.banked_at.completion),
+            cached: self.sess_cached.saturating_sub(self.banked_at.cached),
+            written: self.sess_written.saturating_sub(self.banked_at.written),
+        }
+    }
+
+    /// Price the spend so far at the current list before it changes.
+    fn bank_cost(&mut self) {
+        if let Some(c) = self.session_cost() {
+            self.banked_cost = c;
+        }
+        self.banked_at = money::Spent {
             prompt: self.sess_prompt,
             completion: self.sess_completion,
             cached: self.sess_cached,
             written: self.sess_written,
         };
-        Some(spent.cost(self.price_in, self.price_cached_in.unwrap_or(self.price_in * 0.1), self.price_out))
+    }
+
+    /// `/new` and `/resume` start a new session: its counters start at zero.
+    fn reset_session_counters(&mut self) {
+        self.sess_prompt = 0;
+        self.sess_completion = 0;
+        self.sess_cached = 0;
+        self.sess_written = 0;
+        self.banked_cost = 0.0;
+        self.banked_at = money::Spent::default();
     }
 
     /// Change the reasoning setting: live in the worker, persisted, and shown.
@@ -3178,8 +3221,11 @@ impl App {
         let Some((p, b, m)) = self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) else {
             return;
         };
-        // The active provider keeps the model it's on, not the preset's.
-        let m = if p == self.settings.provider && !self.settings.model.is_empty() { self.settings.model.clone() } else { m };
+        // The active provider keeps the address and model it's on (a proxy
+        // URL set in /config, a model picked since), not the preset's.
+        let active = p == self.settings.provider;
+        let m = if active && !self.settings.model.is_empty() { self.settings.model.clone() } else { m };
+        let b = if active && !self.settings.base_url.is_empty() { self.settings.base_url.clone() } else { b };
         self.wizard = Some(ProviderDraft { name: p, base_url: b, model: m, ..Default::default() });
         self.open_auth_picker();
     }
@@ -3668,6 +3714,8 @@ impl App {
 
     /// Make `provider` active with its address and model, and its saved key.
     fn switch_provider(&mut self, provider: String, base_url: String, model: String, h: &Handles) {
+        self.balance = None; // the old account's; the worker fetches the new one
+        self.settings.sync_active_custom(); // remember what the old provider was on
         self.settings.provider = provider.clone();
         self.settings.base_url = base_url.clone();
         self.settings.model = model.clone();
@@ -3682,6 +3730,7 @@ impl App {
     /// user-set one, else the built-in table) or hide the cost (a custom
     /// server with no known price).
     fn sync_prices(&mut self) {
+        self.bank_cost();
         match self.settings.effective_price_list() {
             Some(p) => {
                 self.price_in = p.price_in;
@@ -4120,7 +4169,7 @@ impl App {
             6 => perm_name(self.perm()).to_string(),
             7 => if s.auto_commit { "on".into() } else { "off".into() },
             8 => self.palette.name.to_string(),
-            9 => s.effective_context_window().to_string(),
+            9 => self.ctx_limit.to_string(), // the window in effect (pinned, detected or table)
             10 => setting_max_tool_calls(s.max_tool_calls),
             11 => {
                 // Cycled off USD while the active provider still runs the
@@ -6955,6 +7004,38 @@ mod tests {
     }
 
     #[test]
+    fn switching_providers_drops_the_old_balance_and_the_ctx_row_shows_the_live_window() {
+        let (mut app, h) = scrollable_app();
+        app.handle_event(UiEvent::Balance(crate::money::Balance {
+            amount: "12.30".into(),
+            currency: crate::money::Currency::parse("USD"),
+            converted_from: None,
+        }), &h);
+        assert!(app.balance.is_some());
+        app.switch_provider("mylocal".into(), "http://localhost:11434/v1".into(), "qwen3".into(), &h);
+        assert!(app.balance.is_none(), "DeepSeek's balance isn't the local server's");
+        app.handle_event(UiEvent::Balance(crate::money::Balance {
+            amount: "1".into(), currency: crate::money::Currency::parse("USD"), converted_from: None,
+        }), &h);
+        app.handle_event(UiEvent::BalanceCleared, &h);
+        assert!(app.balance.is_none());
+        // the /config row shows (and edits from) the window in effect
+        app.handle_event(UiEvent::ContextLimit(8192), &h);
+        assert_eq!(app.setting_value(9), "8192");
+    }
+
+    #[test]
+    fn re_running_sign_in_keeps_the_active_presets_proxy_url() {
+        let (mut app, _h) = scrollable_app();
+        app.settings.provider = "openai".into();
+        app.settings.base_url = "https://proxy.example/v1".into();
+        app.settings.model = "gpt-x".into();
+        app.setup_provider("openai");
+        let d = app.wizard.as_ref().expect("the sign-in step");
+        assert_eq!((d.base_url.as_str(), d.model.as_str()), ("https://proxy.example/v1", "gpt-x"));
+    }
+
+    #[test]
     fn the_config_panel_can_switch_the_price_currency() {
         let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
         app.mode = Mode::Idle;
@@ -6978,9 +7059,9 @@ mod tests {
         assert_eq!(app.settings.price_currency, "USD");
     }
 
-    /// The cost counter follows the provider: switching presets re-prices the
-    /// same session tokens, and a custom server without a price list hides
-    /// the cost (status line and /cost alike).
+    /// The cost counter follows the provider for new spend only: tokens spent
+    /// before a switch keep the price they were spent at, and a custom server
+    /// without a price list prices nothing new (status line and /cost alike).
     #[test]
     fn the_cost_counter_follows_the_provider() {
         use ratatui::backend::TestBackend;
@@ -6989,10 +7070,9 @@ mod tests {
         let (mut app, _h, _cmd_rx) = select_app(&["m0"]);
         app.mode = Mode::Idle;
         let (h, _cmd_rx) = test_handles();
-        app.sess_prompt = 100_000;
-        app.sess_completion = 50_000;
         // test_ui_config zeros the prices; take the default provider's list.
         app.sync_prices();
+        app.add_spent(crate::money::Spent { prompt: 100_000, completion: 50_000, ..Default::default() });
         assert!(app.cost_known);
         let deepseek_cost = app.session_cost().unwrap();
         assert!(deepseek_cost > 0.0);
@@ -7004,11 +7084,15 @@ mod tests {
             &h,
         );
         assert!(app.cost_known);
-        let opus_cost = app.session_cost().unwrap();
         assert!(
-            (opus_cost - deepseek_cost).abs() > 1.0,
-            "150k tokens cost very differently on Opus than on DeepSeek Flash ({deepseek_cost} vs {opus_cost})"
+            (app.session_cost().unwrap() - deepseek_cost).abs() < 1e-9,
+            "switching doesn't re-price what was spent on DeepSeek"
         );
+        // The same tokens again, on Opus, cost far more than they did.
+        app.add_spent(crate::money::Spent { prompt: 100_000, completion: 50_000, ..Default::default() });
+        let opus_part = app.session_cost().unwrap() - deepseek_cost;
+        assert!(opus_part > deepseek_cost + 1.0, "{deepseek_cost} then {opus_part}");
+        let before_local = app.session_cost().unwrap();
 
         app.switch_provider(
             "mylocal".into(),
@@ -7017,14 +7101,19 @@ mod tests {
             &h,
         );
         assert!(!app.cost_known, "a custom server has no known price");
-        assert!(app.session_cost().is_none());
+        // What was already spent stays; spend here adds nothing to it.
+        app.add_spent(crate::money::Spent { prompt: 100_000, ..Default::default() });
+        assert!((app.session_cost().unwrap() - before_local).abs() < 1e-9);
+        let lines = app.cost_lines();
+        assert!(lines[0].starts_with("session: 400.0k tokens (300.0k in / 100.0k out)"), "{lines:?}");
 
-        // /cost drops the cost figure but keeps the token counts.
+        // A fresh session (no priced spend yet) on that server hides the cost.
+        app.reset_session_counters();
+        app.add_spent(crate::money::Spent { prompt: 100_000, completion: 50_000, ..Default::default() });
+        assert!(app.session_cost().is_none());
         let lines = app.cost_lines();
         assert!(lines[0].starts_with("session: 150.0k tokens (100.0k in / 50.0k out)"), "{lines:?}");
         assert!(!lines[0].contains('·'), "the cost is hidden:\n{lines:?}");
-
-        // And the status line: tokens stay, the cost segment goes.
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         let screen = draw(&mut app, &mut term);
         assert!(screen.contains("150.0k tok"), "tokens stay on the line:\n{screen}");

@@ -611,7 +611,7 @@ fn start_perm(cfg: &Config, auto: bool) -> u8 {
 /// Run one task to completion without the TUI. Returns false when the run
 /// reported an error (or `--output` couldn't be written), for the exit status.
 fn run_oneshot(
-    cfg: Config,
+    mut cfg: Config,
     messages: Vec<Message>,
     session: Option<std::path::PathBuf>,
     task: String,
@@ -628,6 +628,15 @@ fn run_oneshot(
         .as_ref()
         .map(|p| p.price_currency.clone())
         .unwrap_or_default();
+    // The TUI refines the window from /models while the user types; a
+    // one-shot sends its prompt at once, so look it up first or the first
+    // turn is sized against the table's guess. In memory only: never saved.
+    if cfg.model_context_window().is_none() && !cfg.context_window_explicit {
+        if let Some(n) = api::context_window(&api::agent_http(), &cfg, &cfg.model) {
+            cfg.context_window = n;
+            cfg.context_window_explicit = true;
+        }
+    }
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let h = agent::spawn(cfg, messages, perm, session, ui_tx);
     let (task_text, attached) = ui::expand_attachments(&task);

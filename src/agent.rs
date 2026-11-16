@@ -75,6 +75,9 @@ pub enum UiEvent {
     /// Account balance, with the currency the provider billed it in (see
     /// `money::Balance`), so the status line can't mix units silently.
     Balance(crate::money::Balance),
+    /// The provider changed: drop the old account's balance from the status
+    /// line (the new one may not report one at all).
+    BalanceCleared,
     Notice(String),
     /// Progress chatter about tool work ("running 3 read-only calls in
     /// parallel…"): folded into the brief summary like the tools themselves.
@@ -201,7 +204,13 @@ struct Worker {
     /// Context window the provider's `/models` advertised, tagged with the
     /// model it was fetched for (filled by a background thread). Preferred
     /// over the built-in table when sizing auto-compaction.
+    /// The window `/models` advertised, keyed by provider, base URL and
+    /// model: the same model id behind another server can have another limit.
     ctx_detected: Arc<Mutex<Option<(String, u32)>>>,
+    /// Bumped by every context-window / balance refresh, so a background
+    /// lookup that finishes after a newer switch is dropped, not shown.
+    ctx_gen: Arc<std::sync::atomic::AtomicU64>,
+    balance_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Where each prompt of this run starts, for `/rewind`.
     turns: Vec<TurnMark>,
     /// When the session was last written mid-turn (see run_loop).
@@ -314,6 +323,8 @@ pub fn spawn(
             hooks,
             recent_calls: Vec::new(),
             ctx_detected: Arc::new(Mutex::new(None)),
+            ctx_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            balance_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turns: Vec::new(),
             last_save: std::time::Instant::now(),
             generation: GenerationStats::default(),
@@ -326,6 +337,8 @@ pub fn spawn(
             match cmd {
                 WorkerCmd::Quit => break,
                 WorkerCmd::Reset => {
+                    // A follow-up suggestion for the old conversation mustn't land here.
+                    w.suggest_cancel.store(true, Ordering::Relaxed);
                     let old_len = w.messages.len();
                     w.messages.truncate(w.system_len);
                     w.turns.clear();
@@ -337,6 +350,7 @@ pub fn spawn(
                     let _ = w.ui.send(UiEvent::Context(0));
                 }
                 WorkerCmd::New => {
+                    w.suggest_cancel.store(true, Ordering::Relaxed);
                     // The current session stays saved and resumable; carry on
                     // in a fresh one (its file appears with the first save).
                     if w.session.is_some() {
@@ -515,9 +529,22 @@ pub fn spawn(
                     if matches!(&p, ConfigPatch::AutoCommit(_)) && !w.messages.is_empty() {
                         w.messages[0] = Message::system(system_prompt(w.cfg.auto_commit));
                     }
-                    // The balance is shown in this currency: re-fetch it.
-                    if matches!(&p, ConfigPatch::PriceCurrency(_)) {
+                    // The balance is shown in this currency, and belongs to the
+                    // account the credentials name: re-fetch it.
+                    if matches!(
+                        &p,
+                        ConfigPatch::PriceCurrency(_)
+                            | ConfigPatch::BaseUrl(_)
+                            | ConfigPatch::ApiKey(_)
+                            | ConfigPatch::ProviderKey { .. }
+                            | ConfigPatch::ProviderAuth { .. }
+                            | ConfigPatch::SignOut(_)
+                    ) {
                         w.refresh_balance();
+                    }
+                    // Another server may serve the same model id with another window.
+                    if matches!(&p, ConfigPatch::BaseUrl(_)) {
+                        w.refresh_context_window();
                     }
                     // Provider presets also switch the model; reflect it.
                     if let ConfigPatch::Provider { model, provider, .. } = &p {
@@ -639,11 +666,17 @@ pub fn spawn(
 impl Worker {
     /// Fetch the account balance on a background thread (best-effort).
     fn refresh_balance(&self) {
+        let gen = self.balance_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.ui.send(UiEvent::BalanceCleared);
         let ui = self.ui.clone();
         let cfg = self.cfg.clone();
+        let current = self.balance_gen.clone();
         std::thread::spawn(move || {
             let http = api::agent_http();
             if let Some(b) = api::fetch_balance(&http, &cfg) {
+                if current.load(Ordering::SeqCst) != gen {
+                    return; // a newer provider/key took over meanwhile
+                }
                 // An account billed in another currency (DeepSeek's China
                 // region is CNY) shows in the status line's currency at the
                 // day's rate; unconverted (and tagged) if the rate is missing.
@@ -655,9 +688,16 @@ impl Worker {
                         .and_then(|rate| b.convert(&want, rate))
                         .unwrap_or(b)
                 };
-                let _ = ui.send(UiEvent::Balance(b));
+                if current.load(Ordering::SeqCst) == gen {
+                    let _ = ui.send(UiEvent::Balance(b));
+                }
             }
         });
+    }
+
+    /// What a detected window is keyed by.
+    fn ctx_key(cfg: &Config) -> String {
+        format!("{}\n{}\n{}", cfg.provider, cfg.base_url, cfg.model)
     }
 
     /// Set the context window for the current model. The built-in table is
@@ -665,6 +705,11 @@ impl Worker {
     /// `/models` metadata for providers that advertise one (see `ctx_limit`).
     /// A user-pinned window (per-model entry or `context_window`) is used as-is.
     fn refresh_context_window(&mut self) {
+        // Whatever was detected belonged to the previous provider/model.
+        let gen = self.ctx_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut d) = self.ctx_detected.lock() {
+            *d = None;
+        }
         if let Some(n) = self.cfg.model_context_window() {
             let _ = self.ui.send(UiEvent::ContextLimit(n));
             return;
@@ -680,11 +725,16 @@ impl Worker {
         let ui = self.ui.clone();
         let cfg = self.cfg.clone();
         let detected = self.ctx_detected.clone();
+        let current = self.ctx_gen.clone();
         std::thread::spawn(move || {
             let http = api::agent_http();
             if let Some(n) = api::context_window(&http, &cfg, &cfg.model) {
+                // A switch since this lookup started: its answer is stale.
+                if current.load(Ordering::SeqCst) != gen {
+                    return;
+                }
                 if let Ok(mut d) = detected.lock() {
-                    *d = Some((cfg.model.clone(), n));
+                    *d = Some((Self::ctx_key(&cfg), n));
                 }
                 if n != table {
                     let _ = ui.send(UiEvent::ContextLimit(n));
@@ -801,8 +851,14 @@ impl Worker {
                     None => err(self, format!("session {} is empty or unreadable.", meta.id)),
                     Some(mut msgs) => {
                         repair_orphans(&mut msgs);
+                        self.suggest_cancel.store(true, Ordering::Relaxed);
                         self.messages = msgs;
                         self.system_len = system_prefix_len(&self.messages);
+                        // The saved prompt describes the settings it was saved
+                        // under; speak to the live ones (as the AutoCommit patch does).
+                        if self.system_len > 0 {
+                            self.messages[0] = Message::system(system_prompt(self.cfg.auto_commit));
+                        }
                         self.session = Some(path);
                         // Turn marks index the old conversation.
                         self.turns.clear();
@@ -921,8 +977,8 @@ impl Worker {
         }
         if !self.cfg.context_window_explicit {
             if let Ok(d) = self.ctx_detected.lock() {
-                if let Some((model, n)) = d.as_ref() {
-                    if *model == self.cfg.model {
+                if let Some((key, n)) = d.as_ref() {
+                    if *key == Self::ctx_key(&self.cfg) {
                         return *n;
                     }
                 }
