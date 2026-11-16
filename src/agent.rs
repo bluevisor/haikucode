@@ -418,7 +418,7 @@ pub fn spawn(
                             let _ = w.ui.send(UiEvent::ModelList(ids));
                         }
                         Err(e) => {
-                            let _ = w.ui.send(UiEvent::Error(format!("could not fetch models: {e}")));
+                            let _ = w.ui.send(UiEvent::Error(format!("could not fetch models: {e}\nEnter /model <model-id> to use a model directly, or /provider edit to check the server settings.")));
                         }
                     }
                     let _ = w.ui.send(UiEvent::TurnDone);
