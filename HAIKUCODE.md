@@ -33,8 +33,20 @@ assets/icon.svg       the app icon: a prompt chevron in Haiku's leaf colors and 
                       mark alone in one color, for tinting — Temino's pane banner
                       draws it
 src/
-  main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
-  config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
+  main.rs             CLI args, system prompt, first-run setup, dispatch to one-shot / TUI / subcommands
+  startup.rs          session start/resume/fork, startup context (instruction files, git), banner
+                      status lines, panic hook, run_tui, input history
+  oneshot.rs          one-shot mode (+ --output, --json/--stream-json), piped stdin
+  subcommands.rs      `haikucode sessions` and `haikucode model`
+  config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers): Config and its types
+  config/providers.rs provider presets, sign-in methods, PROVIDERS/PRICES, key env vars, context windows
+  config/paths.rs     config dir (+ picoder adoption), atomic_write, settings layers, session paths
+  config/disk.rs      load (lenient, + env overrides) / save (minimal on-disk JSON), persist helpers
+  config/models.rs    per-model settings and prices, wire protocol, provider choices, context window
+  config/credentials.rs  keys, sign-ins, endpoint: the credential a request carries
+  config/patch.rs     ConfigPatch: one /config change, applied live and mirrored to disk
+  config/setup.rs     interactive first-run setup wizard
+  config/tests_*.rs   config tests: disk round trips (tests_disk), providers/models/prices (tests_models)
   api.rs              OpenAI-compatible streaming SSE, tool schema, multimodal parts, retry, list_models
   tools.rs            tool impls: bash (+ background), read/write/edit/list, grep, glob,
                       web_fetch, web_search, todo, view_image, remember, recall
@@ -207,8 +219,8 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   auto-commit, theme, context window, max tool calls, price currency. Changes
   apply immediately and persist.
 - Costs and balance: the cost counter follows the active provider — switching
-  providers switches the price list (the built-in `PRICES` table in config.rs
-  for the presets, or the user's `prices.<provider>` entry in config.json,
+  providers switches the price list (the built-in `PRICES` table in
+  config/providers.rs for the presets, or the user's `prices.<provider>` entry in config.json,
   which wins and survives a provider round trip). A custom server without a
   price list hides the cost: the status segment drops out, `/cost` drops the
   figure, and the one-shot JSON reports `cost: null`. `src/money.rs` formats
