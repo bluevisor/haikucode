@@ -163,6 +163,20 @@ impl App {
                     self.mode = Mode::Select;
                 }
             }
+            UiEvent::McpList(rows) => {
+                self.picker = Some(Picker {
+                    title: "MCP servers".into(),
+                    items: rows.iter().map(|r| r.line.clone()).collect(),
+                    current: None,
+                    filter: String::new(),
+                    cursor: 0,
+                    scroll: 0,
+                    action: PickAction::McpServer,
+                    hint: None,
+                });
+                self.mcp_rows = rows;
+                self.mode = Mode::Select;
+            }
             UiEvent::Rewound(prompt) => {
                 // Hand the prompt back so it can be edited and re-sent.
                 self.input = prompt;

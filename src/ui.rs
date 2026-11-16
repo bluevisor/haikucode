@@ -155,6 +155,9 @@ pub struct App {
     suggest_idx: usize,
     /// State for Mode::Select (the /model list, etc.).
     picker: Option<Picker>,
+    /// `/mcp`'s servers while its picker is open, then the one picked (whose
+    /// actions the second picker lists).
+    mcp_rows: Vec<crate::mcp::McpRow>,
     mode: Mode,
     /// Buffer + reply channel for an in-flight masked sudo password prompt. Held
     /// in memory only; never pushed to the transcript, history, or session.
@@ -413,6 +416,7 @@ impl App {
             suggestion: None,
             suggest_idx: 0,
             picker: None,
+            mcp_rows: Vec::new(),
             mode: Mode::Idle,
             pw_input: String::new(),
             pw_reply: None,

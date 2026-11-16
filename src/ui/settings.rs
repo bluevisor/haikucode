@@ -198,6 +198,7 @@ impl App {
                 let mut provider_pick = None;
                 let mut auth_pick = None;
                 let mut model_pick = None;
+                let mut mcp_pick = None;
                 // A model that isn't listed: take the typed name as is.
                 if filtered.is_empty() && matches!(picker.action, PickAction::Model) {
                     let typed = picker.filter.trim().to_string();
@@ -222,6 +223,7 @@ impl App {
                                 let _ = h.cmd_tx.send(WorkerCmd::Resume(id.to_string()));
                             }
                         }
+                        PickAction::McpServer | PickAction::McpAction => mcp_pick = Some((picker.action, idx)),
                     }
                 }
                 self.mode = Mode::Idle;
@@ -231,6 +233,11 @@ impl App {
                 }
                 if let Some(idx) = auth_pick {
                     self.auth_picked(idx, h);
+                }
+                match mcp_pick {
+                    Some((PickAction::McpServer, idx)) => self.mcp_server_picked(idx),
+                    Some((_, idx)) => self.mcp_action_picked(idx, h),
+                    None => {}
                 }
                 if let Some(model) = model_pick {
                     let _ = h.cmd_tx.send(WorkerCmd::SetModel(model.clone()));
@@ -252,6 +259,35 @@ impl App {
                 picker.clamp(len.max(1));
             }
             _ => {}
+        }
+    }
+
+    /// `/mcp`, step 2: show the server's details and offer its actions.
+    fn mcp_server_picked(&mut self, idx: usize) {
+        let Some(row) = self.mcp_rows.get(idx).cloned() else { return };
+        for line in &row.details {
+            self.push(Kind::Notice, line.clone());
+        }
+        self.picker = Some(Picker {
+            title: format!("MCP server {}", row.name),
+            items: row.actions.iter().map(|(label, _)| label.clone()).collect(),
+            current: None,
+            filter: String::new(),
+            cursor: 0,
+            scroll: 0,
+            action: PickAction::McpAction,
+            hint: Some(row.line.clone()),
+        });
+        self.mcp_rows = vec![row];
+        self.mode = Mode::Select;
+    }
+
+    /// `/mcp`, step 3: run the chosen action as its `/mcp <sub> <server>`.
+    fn mcp_action_picked(&mut self, idx: usize, h: &Handles) {
+        let rows = std::mem::take(&mut self.mcp_rows);
+        let Some(row) = rows.first() else { return };
+        if let Some((_, sub)) = row.actions.get(idx) {
+            self.run_command(&format!("mcp {sub} {}", row.name), h);
         }
     }
 

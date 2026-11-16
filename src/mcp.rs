@@ -77,6 +77,16 @@ pub struct McpPrompt {
     pub arguments: Vec<(String, bool)>,
 }
 
+/// One server in the `/mcp` picker: its list line, the detail lines shown
+/// when it's picked, and the actions it offers as (label, `/mcp` subcommand).
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpRow {
+    pub name: String,
+    pub line: String,
+    pub details: Vec<String>,
+    pub actions: Vec<(String, String)>,
+}
+
 /// Status of one server, for startup notices and `/mcp`.
 pub struct ServerStatus {
     pub name: String,

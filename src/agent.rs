@@ -50,6 +50,8 @@ pub enum UiEvent {
     McpPromptReady { shown: String, text: String },
     /// `/rewind` choices, newest first: "N. prompt preview".
     TurnList(Vec<String>),
+    /// `/mcp`: the configured servers, for the picker.
+    McpList(Vec<crate::mcp::McpRow>),
     /// After a rewind: the prompt that was undone, to put back in the composer.
     Rewound(String),
     ModelChanged(String),

@@ -108,7 +108,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "reasoning effort: auto, off, low, medium, high, xhigh, max"),
     ("/reset", "clear conversation context"),
     ("/yolo", "toggle YOLO mode: approve everything (also /auto)"),
-    ("/mcp", "MCP servers: state, tools, prompts · /mcp approve|deny|login|logout <server>"),
+    ("/mcp", "MCP servers: pick one to sign in, reconnect, approve…"),
     ("/memory", "show persistent memory"),
     ("/theme", "open the theme picker"),
     ("/statusline", "choose and order the status bar's items"),
@@ -170,6 +170,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/mcp deny ", "<server> refuse a project's MCP server"),
     ("/mcp login ", "<server> sign in to a server that needs OAuth"),
     ("/mcp logout ", "<server> forget a server's login"),
+    ("/mcp reconnect ", "<server> connect to a server again"),
     ("/sessions delete ", "<id|name> delete a saved session"),
     ("/export --all", "include haikucode's system/context messages"),
     ("/export ", "<file> write to this path (default: a file in this directory)"),
@@ -322,6 +323,10 @@ pub enum PickAction {
     Provider,
     /// `/provider`'s sign-in step: an index into `ProviderDraft::choices`.
     Auth,
+    /// `/mcp`: a server (an index into `App::mcp_rows`).
+    McpServer,
+    /// `/mcp`'s second step: an action for the server picked.
+    McpAction,
 }
 
 /// State for `Mode::Select`: a filterable, scrollable list of choices.
