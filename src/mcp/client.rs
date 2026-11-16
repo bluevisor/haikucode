@@ -8,7 +8,7 @@ use super::render::{
 };
 use super::transport::{http_post, Server};
 use super::{
-    transport_of, Fail, McpPrompt, McpTool, ServerStatus, Transport, CALL_TIMEOUT, LIST_RESOURCES,
+    transport_of, Fail, McpPrompt, McpRow, McpTool, ServerStatus, Transport, CALL_TIMEOUT, LIST_RESOURCES,
     MAX_PAGES, PROTOCOL_VERSION, READ_RESOURCE, TOKENS_FILE,
 };
 use crate::config::McpServerConfig;
@@ -553,10 +553,13 @@ impl Mcp {
             .ok_or_else(|| format!("no MCP server named {name:?} (see /mcp)"))
     }
 
-    /// Lines for `/mcp`: per server its state, transport, origin, auth and
-    /// what it offers.
-    pub fn describe(&self) -> Vec<String> {
+    /// The `/mcp` picker: one row per server, with the actions its state allows
+    /// (the likely one first, so Enter twice does the obvious thing). Its
+    /// details are per server its state, transport, origin, auth and what it
+    /// offers.
+    pub fn rows(&self) -> Vec<McpRow> {
         let tokens: BTreeMap<String, Token> = read_store(&self.store.join(TOKENS_FILE));
+        let width = self.slots.iter().map(|s| s.name.chars().count()).max().unwrap_or(0);
         let mut out = Vec::new();
         for (slot, st) in self.slots.iter().zip(&self.status) {
             let tag = match &slot.state {
@@ -576,8 +579,10 @@ impl Mcp {
                 Origin::Project { dir, .. } => format!("{}/.mcp.json", dir.display()),
             };
             let mut auth = String::new();
+            let mut signed_in = false;
             if transport == "http" {
                 let url = expanded(&slot.cfg).map(|c| c.url).unwrap_or_default();
+                signed_in = tokens.contains_key(&url);
                 auth = match tokens.get(&url) {
                     Some(t) if t.expires_at == 0 => " · signed in".into(),
                     Some(t) => {
@@ -588,19 +593,52 @@ impl Mcp {
                     None => " · no auth".into(),
                 };
             }
-            out.push(format!("mcp {} [{tag}] {transport} from {origin}{auth} — {}", slot.name, st.detail));
+            let mut details = vec![format!("mcp {} [{tag}] {transport} from {origin}{auth} — {}", slot.name, st.detail)];
             if slot.state == State::Running {
                 if !slot.tools.is_empty() {
                     let names: Vec<&str> = slot.tools.iter().map(|t| t.full_name.as_str()).collect();
-                    out.push(format!("  tools: {}", names.join(", ")));
+                    details.push(format!("  tools: {}", names.join(", ")));
                 }
                 if !slot.prompts.is_empty() {
                     let names: Vec<String> = slot.prompts.iter().map(|p| format!("/{}", p.command)).collect();
-                    out.push(format!("  prompts: {}", names.join(", ")));
+                    details.push(format!("  prompts: {}", names.join(", ")));
                 }
             }
+            let act = |label: &str, sub: &str| (label.to_string(), sub.to_string());
+            let http = transport == "http";
+            let mut actions = match &slot.state {
+                State::NeedsLogin => vec![act("Sign in", "login")],
+                State::NeedsApproval => vec![act("Approve", "approve"), act("Deny", "deny")],
+                State::Denied => vec![act("Approve", "approve")],
+                State::Failed(_) if http && !signed_in => vec![act("Reconnect", "reconnect"), act("Sign in", "login")],
+                State::Running | State::Failed(_) => vec![act("Reconnect", "reconnect")],
+            };
+            if signed_in {
+                actions.push(act("Sign out", "logout"));
+            }
+            if matches!(slot.origin, Origin::Project { .. }) && slot.state == State::Running {
+                actions.push(act("Deny (stop it)", "deny"));
+            }
+            let summary = if slot.state == State::Running { st.detail.as_str() } else { tag };
+            let line = format!("{:<width$}  {summary} · {transport}{auth}", slot.name);
+            out.push(McpRow { name: slot.name.clone(), line, details, actions });
         }
         out
+    }
+
+    /// `/mcp reconnect <name>`: drop the connection and connect again (after
+    /// fixing its config, or when the server restarted).
+    pub fn reconnect(&mut self, name: &str) -> Result<String, String> {
+        let i = self.slot(name)?;
+        if matches!(self.slots[i].state, State::NeedsApproval | State::Denied) {
+            return Err(format!("{name} isn't approved yet: /mcp approve {name}"));
+        }
+        self.open(i);
+        self.rebuild();
+        match self.slots[i].state {
+            State::Running => Ok(format!("{name} reconnected: {}", self.status[i].detail)),
+            _ => Err(format!("{name}: {}", self.status[i].detail)),
+        }
     }
 
     /// Stop every server (best-effort) on shutdown.
@@ -717,6 +755,11 @@ for line in sys.stdin:
         assert!(added[0].starts_with("mcp late: loaded"), "{added:?}");
         assert!(mcp.slot("late").is_ok(), "/mcp login late now finds it");
         assert!(mcp.sync(vec![("late".into(), cfg, Origin::Global)]).is_empty(), "unchanged entry: no-op");
+        let rows = mcp.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].line.starts_with("late  FAILED · stdio"), "{rows:?}");
+        assert_eq!(rows[0].actions[0].1, "reconnect", "a broken stdio server offers a retry");
+        assert!(mcp.reconnect("late").is_err());
         let removed = mcp.sync(Vec::new());
         assert!(removed[0].contains("removed"), "{removed:?}");
         assert!(mcp.is_empty());

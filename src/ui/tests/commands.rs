@@ -57,6 +57,36 @@ fn rewind_picker_sends_the_chosen_turn_and_refills_the_prompt() {
     assert!(app.picker.is_none() && !matches!(app.mode, Mode::Select));
 }
 
+/// `/mcp` lists the servers; picking one shows its details and offers its
+/// actions, and picking an action runs it as `/mcp <action> <server>`.
+#[test]
+fn mcp_picker_lists_servers_then_runs_the_chosen_action() {
+    let mut app = App::new(test_ui_config(), Vec::new());
+    let (h, cmd_rx) = test_handles();
+    app.run_command("mcp", &h);
+    assert!(matches!(cmd_rx.try_recv(), Ok(WorkerCmd::ListMcp)));
+    assert!(!app.transcript.iter().any(|l| l.text.contains("/mcp options:")), "no options dump");
+    let row = |name: &str, actions: &[(&str, &str)]| crate::mcp::McpRow {
+        name: name.into(),
+        line: format!("{name}  needs sign-in · http"),
+        details: vec![format!("mcp {name} [needs sign-in] http from config.json")],
+        actions: actions.iter().map(|(l, s)| (l.to_string(), s.to_string())).collect(),
+    };
+    app.handle_event(
+        UiEvent::McpList(vec![row("alpha", &[("Reconnect", "reconnect")]), row("iris", &[("Sign in", "login"), ("Sign out", "logout")])]),
+        &h,
+    );
+    assert!(matches!(app.mode, Mode::Select), "McpList opens the picker");
+    app.on_key(key(KeyCode::Down), &h);
+    app.on_key(key(KeyCode::Enter), &h);
+    let p = app.picker.as_ref().expect("the action picker is open");
+    assert_eq!(p.items, vec!["Sign in", "Sign out"]);
+    assert!(app.transcript.iter().any(|l| l.text.contains("mcp iris [needs sign-in]")), "details shown");
+    app.on_key(key(KeyCode::Enter), &h);
+    let sent: Vec<WorkerCmd> = cmd_rx.try_iter().collect();
+    assert!(sent.iter().any(|c| matches!(c, WorkerCmd::Mcp(a) if a == "login iris")), "ran /mcp login iris");
+}
+
 /// `/effort high` goes live in the worker and persists; nonsense is refused.
 #[test]
 fn effort_command_sets_reasoning() {

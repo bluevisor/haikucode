@@ -260,9 +260,7 @@ pub fn spawn(
                             "no MCP servers configured (add \"mcp_servers\" to config.json, or a project .mcp.json).".into(),
                         ));
                     } else {
-                        for line in w.mcp.describe() {
-                            let _ = w.ui.send(UiEvent::Notice(line));
-                        }
+                        let _ = w.ui.send(UiEvent::McpList(w.mcp.rows()));
                     }
                     let _ = w.ui.send(UiEvent::TurnDone);
                 }
@@ -272,14 +270,15 @@ pub fn spawn(
                     let (sub, name) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
                     let ui = w.ui.clone();
                     let result = match (sub, name) {
-                        (_, "") => Err("usage: /mcp [approve|deny|login|logout] <server>".to_string()),
+                        (_, "") => Err("usage: /mcp [approve|deny|login|logout|reconnect] <server>".to_string()),
                         ("approve", n) => w.mcp.decide(n, true),
                         ("deny", n) => w.mcp.decide(n, false),
                         ("login", n) => w.mcp.login(n, &|m| {
                             let _ = ui.send(UiEvent::Notice(m));
                         }),
                         ("logout", n) => w.mcp.logout(n),
-                        (other, _) => Err(format!("unknown /mcp command {other:?}: approve, deny, login or logout")),
+                        ("reconnect", n) => w.mcp.reconnect(n),
+                        (other, _) => Err(format!("unknown /mcp command {other:?}: approve, deny, login, logout or reconnect")),
                     };
                     match result {
                         Ok(m) => {

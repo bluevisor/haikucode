@@ -269,9 +269,6 @@ impl App {
                 self.push(Kind::Notice, format!("permissions: {}", perm_name(self.perm())));
             }
             "mcp" => {
-                if _arg.is_none() {
-                    self.show_options("/mcp");
-                }
                 let _ = h.cmd_tx.send(match _arg {
                     None => WorkerCmd::ListMcp,
                     Some(a) => WorkerCmd::Mcp(a.to_string()),
