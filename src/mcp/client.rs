@@ -63,24 +63,52 @@ impl Mcp {
     /// `/mcp`), never fatal.
     pub fn start(entries: Vec<(String, McpServerConfig, Origin)>, store: PathBuf) -> Mcp {
         let mut mcp = Mcp { slots: Vec::new(), tools: Vec::new(), status: Vec::new(), store };
+        mcp.sync(entries);
+        mcp
+    }
+
+    /// Bring the running set in line with `entries` (the config as it is on
+    /// disk now): start servers that were added, stop ones that were removed,
+    /// restart ones whose entry changed, and leave the rest running untouched.
+    /// Returns one line per change, for the user; empty when nothing changed.
+    pub fn sync(&mut self, entries: Vec<(String, McpServerConfig, Origin)>) -> Vec<String> {
+        let same = |a: &McpServerConfig, b: &McpServerConfig| serde_json::to_value(a).ok() == serde_json::to_value(b).ok();
+        let mut changes = Vec::new();
+        self.slots.retain_mut(|s| {
+            let now = entries.iter().find(|(n, _, _)| *n == s.name);
+            if now.is_some_and(|(_, c, o)| same(c, &s.cfg) && *o == s.origin) {
+                return true;
+            }
+            if let Some(mut server) = s.server.take() {
+                server.close();
+            }
+            if now.is_none() {
+                changes.push(format!("mcp {}: removed from config, stopped", s.name));
+            }
+            false
+        });
         for (name, cfg, origin) in entries {
+            if self.slots.iter().any(|s| s.name == name) {
+                continue;
+            }
             let state = match &origin {
-                Origin::Project { dir, hash } => match approval(&mcp.store, dir, &name, hash) {
+                Origin::Project { dir, hash } => match approval(&self.store, dir, &name, hash) {
                     Some(true) => State::Running,
                     Some(false) => State::Denied,
                     None => State::NeedsApproval,
                 },
                 Origin::Global => State::Running,
             };
-            mcp.slots.push(Slot { name, cfg, origin, state, server: None, tools: Vec::new(), prompts: Vec::new(), resources: false });
-        }
-        for i in 0..mcp.slots.len() {
-            if mcp.slots[i].state == State::Running {
-                mcp.open(i);
+            self.slots.push(Slot { name, cfg, origin, state, server: None, tools: Vec::new(), prompts: Vec::new(), resources: false });
+            let i = self.slots.len() - 1;
+            if self.slots[i].state == State::Running {
+                self.open(i);
             }
+            let s = &self.slots[i];
+            changes.push(format!("mcp {}: loaded from config — {}", s.name, s.status().detail));
         }
-        mcp.rebuild();
-        mcp
+        self.rebuild();
+        changes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -677,6 +705,21 @@ for line in sys.stdin:
         assert!(mcp.tools().is_empty());
         assert_eq!(mcp.status().len(), 1);
         assert!(!mcp.status()[0].ok && !mcp.status()[0].waiting);
+    }
+
+    #[test]
+    fn sync_picks_up_servers_added_and_removed_after_launch() {
+        let mut mcp = Mcp::start(Vec::new(), scratch("sync"));
+        assert!(mcp.is_empty());
+        let cfg = stdio("definitely-not-a-real-binary-xyz", vec![]);
+        let added = mcp.sync(vec![("late".into(), cfg.clone(), Origin::Global)]);
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].starts_with("mcp late: loaded"), "{added:?}");
+        assert!(mcp.slot("late").is_ok(), "/mcp login late now finds it");
+        assert!(mcp.sync(vec![("late".into(), cfg, Origin::Global)]).is_empty(), "unchanged entry: no-op");
+        let removed = mcp.sync(Vec::new());
+        assert!(removed[0].contains("removed"), "{removed:?}");
+        assert!(mcp.is_empty());
     }
 
     #[test]

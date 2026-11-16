@@ -254,6 +254,7 @@ pub fn spawn(
                     let _ = w.ui.send(UiEvent::TurnDone);
                 }
                 WorkerCmd::ListMcp => {
+                    w.reload_mcp();
                     if w.mcp.is_empty() {
                         let _ = w.ui.send(UiEvent::Notice(
                             "no MCP servers configured (add \"mcp_servers\" to config.json, or a project .mcp.json).".into(),
@@ -266,6 +267,7 @@ pub fn spawn(
                     let _ = w.ui.send(UiEvent::TurnDone);
                 }
                 WorkerCmd::Mcp(args) => {
+                    w.reload_mcp();
                     let mut words = args.split_whitespace();
                     let (sub, name) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
                     let ui = w.ui.clone();
@@ -447,4 +449,24 @@ pub fn spawn(
     });
 
     Handles { join, cmd_tx, appr_tx, shared }
+}
+
+impl Worker {
+    /// Re-read the MCP config from disk so `/mcp` sees servers added (or
+    /// removed) since launch — e.g. one the model just wrote into config.json —
+    /// without a restart.
+    fn reload_mcp(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let global = Config::load().mcp_servers;
+        let changes = self.mcp.sync(crate::mcp::entries(&global, &cwd));
+        self.cfg.mcp_servers = global;
+        if changes.is_empty() {
+            return;
+        }
+        for line in changes {
+            let _ = self.ui.send(UiEvent::Notice(line));
+        }
+        self.tools = api::tools_spec_with(self.mcp.tools());
+        let _ = self.ui.send(UiEvent::McpPrompts(self.mcp.prompt_palette()));
+    }
 }
