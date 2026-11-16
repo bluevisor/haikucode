@@ -233,26 +233,30 @@ memory, sessions, skills) into `~/.config/haikucode`.
   auth mode, reasoning effort, default permission mode, auto-commit, theme, context
   window, max tool calls, and price currency, edited in-TUI; changes apply live
   and persist to `config.json`.
-- **Providers** (`/provider`) — a step-by-step picker: choose a provider with
-  the arrow keys (it asks for the API key if none is saved, masked, paste
-  works), then its model from the server's list. "+ Add a custom provider"
-  walks through name, base URL, API key and model for any OpenAI-compatible
-  endpoint (a LiteLLM or other gateway, a local server). Shortcuts:
-  `/provider <name>` switches, `/provider add` opens setup (or use
-  `/provider add <name> <base_url> <model>`),
-  `/provider edit <name>` edits a saved custom server (`/provider edit` edits
-  the active one; Ctrl+E edits the highlighted custom server in the picker).
-  Address and model fields are prefilled and support arrow keys, Home/End,
-  Delete, and paste; Shift+Tab goes back, Esc cancels without saving.
-  Enter keeps a prefilled value or a saved key; a new key replaces the old
-  one, and `-` in the key field removes it. Changing the address requires
-  entering the key again, or Enter to use no saved key. Clear the model with
-  Ctrl+U to browse the server's models instead. Editing an inactive server
-  keeps the current provider unless you choose to browse its models.
-  `/provider remove <name>` forgets one and its key; `/provider list` lists them.
-  Each keeps its own API key (the `/config`
-  key row) and remembers its model; the `/config` provider row cycles through
-  them too. A provider made by the setup wizard's "custom" choice joins the list.
+- **Providers** (`/provider`) — three steps, each with the arrow keys:
+  **1. provider** (each row says how it's set up: `✓ API key`, `✓ ChatGPT
+  sign-in`, or `not set up`), **2. sign in** — every way that provider
+  accepts, with what's saved highlighted so Enter keeps it: an API key
+  (masked, paste works, with where to get one), a **ChatGPT subscription**
+  for `openai` (Plus / Pro / Business; signs in in your browser, Esc cancels,
+  requests then go to ChatGPT's Codex backend), Z.ai's **GLM Coding Plan**
+  for `zai`, or no key for a local server — and **3. model**, from the
+  server's own list (non-chat models filtered out; a name it doesn't list is
+  used as typed). A refused key goes back to step 2 with the reason; a
+  server that can't list models asks for the id. Esc goes back a step.
+  Anthropic and Google are API-key only: Anthropic doesn't allow Claude
+  Pro/Max sign-in in third-party apps, and a Gemini sign-in needs Google's
+  Code Assist API. "+ Add a custom provider" walks through name and base URL
+  first, for any OpenAI-compatible endpoint (a LiteLLM or other gateway, a
+  local server). Shortcuts: `/provider <name>` switches (or sets it up),
+  `/provider add <name> <base_url> <model>`, `/provider remove <name>`
+  forgets one with its key and sign-in, `/provider list`. `/provider edit
+  [name]` (or Ctrl+E on a custom server in the picker) reopens a saved custom
+  server at its address, prefilled; editing one that isn't active saves it
+  without switching to it. Each provider keeps
+  its own key, sign-in method and model; the `/config` sign-in row reruns
+  steps 2–3 for the active one. The first-run setup (`haikucode --config`)
+  asks the same three steps.
 - **Themes** (`/theme`) — `HaikuOS` (the default: Haiku's yellow window tab
   and blue desktop), `Rainbow` (picoder's original Apple-rainbow look),
   `Apple ][` (green phosphor), `MSDOS`, `macOS`, `SUN`, `NeXT`, and `SGI`.
@@ -367,12 +371,12 @@ tool, the thread model, conventions) are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## Configuration
 
-On first run, Haiku Code walks you through provider, model, and API key. State lives
+On first run, Haiku Code walks you through provider, sign-in (API key or subscription), and model. State lives
 in `~/config/settings/haikucode/` on Haiku and `~/.config/haikucode/` on macOS
 and Linux:
 
 ```
-config.json   provider / model / key (0600), max_tool_calls, prices
+config.json   provider / model / keys / sign-ins (0600), max_tool_calls, prices
               (+ optional mcp_servers, permissions, hooks, auto_bump_version)
 commands/     user-wide custom slash commands (*.md)
 skills/       user-wide skills (<name>/SKILL.md)

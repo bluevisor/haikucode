@@ -687,6 +687,16 @@ impl App {
                     .collect();
             }
             UiEvent::McpPromptReady { shown, text } => self.send_prompt_as(shown, text, h),
+            UiEvent::ModelList(ids) if self.wizard.as_ref().is_some_and(|d| d.waiting_models) => {
+                self.last_models = ids.clone();
+                self.wizard_models(ids);
+            }
+            UiEvent::ModelListFailed(e) if self.wizard.as_ref().is_some_and(|d| d.waiting_models) => {
+                self.wizard_models_failed(&e);
+            }
+            UiEvent::ModelListFailed(e) => self.push(Kind::ErrorK, format!("could not fetch models: {e}")),
+            UiEvent::SignedIn { provider, token } => self.on_signed_in(provider, Some(token), String::new(), h),
+            UiEvent::SignInFailed { provider, error } => self.on_signed_in(provider, None, error, h),
             UiEvent::ModelList(ids) => {
                 let current = ids.iter().position(|m| *m == self.model_info);
                 self.picker = Some(Picker {
@@ -697,6 +707,7 @@ impl App {
                     cursor: current.unwrap_or(0),
                     scroll: 0,
                     action: PickAction::Model,
+                    hint: None,
                 });
                 if let Some(p) = self.picker.as_mut() {
                     let len = p.items.len();
@@ -721,9 +732,6 @@ impl App {
             UiEvent::ContextLimit(n) => {
                 self.ctx_limit = n;
             }
-            UiEvent::AuthMode(m) => {
-                self.settings.auth_mode = m;
-            }
             UiEvent::Balance(b) => {
                 // A balance in another currency (DeepSeek bills China-region
                 // accounts in CNY) needs no nudge: the status line tags both
@@ -744,6 +752,7 @@ impl App {
                         cursor: 0,
                         scroll: 0,
                         action: PickAction::Rewind,
+                        hint: None,
                     });
                     self.mode = Mode::Select;
                 }
@@ -767,6 +776,7 @@ impl App {
                         cursor: 0,
                         scroll: 0,
                         action: PickAction::Resume,
+                        hint: None,
                     });
                     self.mode = Mode::Select;
                 }
@@ -1259,12 +1269,13 @@ impl App {
         match self.mode {
             Mode::Password { .. } => self.cancel_password(),
             Mode::Question { .. } => self.cancel_question(),
-            Mode::ProviderInput { .. } => self.cancel_wizard(),
+            Mode::ProviderInput { step } => self.wizard_back(step, h),
+            Mode::Select => self.select_escape(h),
             Mode::Approval(_) => {
                 let _ = h.appr_tx.send(ApprovalResponse::No);
                 self.interrupt(h);
             }
-            Mode::Settings { .. } | Mode::Select | Mode::ThemeSelect { .. } => {
+            Mode::Settings { .. } | Mode::ThemeSelect { .. } => {
                 self.clear_busy();
                 self.picker = None;
             }
@@ -1466,10 +1477,10 @@ impl App {
             2 => self.mode = edit_with(self.settings.model.clone()),
             3 => self.mode = edit_with(String::new()),
             4 => {
-                // Toggle credential source: API key <-> subscription (OAuth).
-                let next = if self.settings.auth_mode == "sub" { "api" } else { "sub" };
-                self.settings.auth_mode = next.to_string();
-                let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::AuthMode(next.to_string())));
+                // Sign-in has steps (a key, a browser login, then the
+                // model): run the /provider wizard's for this provider.
+                let p = self.settings.provider.clone();
+                self.setup_provider(&p);
             }
             5 => {
                 let levels = crate::config::REASONING_LEVELS;
@@ -1575,20 +1586,25 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Idle;
-                self.picker = None;
-            }
+            KeyCode::Esc => self.select_escape(h),
             KeyCode::Enter => {
                 let filtered = picker.filtered();
                 let mut provider_pick = None;
+                let mut auth_pick = None;
+                let mut model_pick = None;
+                // A model that isn't listed: take the typed name as is.
+                if filtered.is_empty() && matches!(picker.action, PickAction::Model) {
+                    let typed = picker.filter.trim().to_string();
+                    if !typed.is_empty() {
+                        model_pick = Some(typed);
+                    }
+                }
                 if let Some(&idx) = filtered.get(picker.cursor) {
                     let item = picker.items[idx].clone();
                     match picker.action {
                         PickAction::Provider => provider_pick = Some(item),
-                        PickAction::Model => {
-                            let _ = h.cmd_tx.send(WorkerCmd::SetModel(item));
-                        }
+                        PickAction::Auth => auth_pick = Some(idx),
+                        PickAction::Model => model_pick = Some(item),
                         PickAction::Rewind => {
                             let n = item.split_once('.').and_then(|(n, _)| n.parse::<usize>().ok());
                             if let Some(n) = n.filter(|&n| n > 0) {
@@ -1607,6 +1623,16 @@ impl App {
                 if let Some(item) = provider_pick {
                     self.provider_picked(&item, h);
                 }
+                if let Some(idx) = auth_pick {
+                    self.auth_picked(idx, h);
+                }
+                if let Some(model) = model_pick {
+                    let _ = h.cmd_tx.send(WorkerCmd::SetModel(model.clone()));
+                    if let Some(mut d) = self.wizard.take().filter(|d| d.waiting_models) {
+                        d.model = model;
+                        self.wizard_done(d, h);
+                    }
+                }
             }
             KeyCode::Backspace => {
                 picker.filter.pop();
@@ -1620,6 +1646,28 @@ impl App {
                 picker.clamp(len.max(1));
             }
             _ => {}
+        }
+    }
+
+    /// Esc in a picker: close it, or in the provider wizard go back a step
+    /// (the model step ends the setup on the model already in use).
+    fn select_escape(&mut self, h: &Handles) {
+        let action = self.picker.as_ref().map(|p| p.action);
+        self.picker = None;
+        self.clear_busy();
+        let Some(mut d) = self.wizard.take() else { return };
+        d.error = None;
+        match action {
+            Some(PickAction::Model) if d.waiting_models => self.wizard_done(d, h),
+            Some(PickAction::Auth) if d.adding => {
+                self.wizard = Some(d);
+                self.ask(ProviderStep::BaseUrl);
+            }
+            Some(PickAction::Auth) => self.open_provider_picker(),
+            _ => {
+                self.wizard = Some(d);
+                self.cancel_wizard();
+            }
         }
     }
 
@@ -2990,7 +3038,12 @@ impl App {
         let hooks = crate::hooks::Hooks::load();
         let mut lines = vec![
             format!("Haiku Code {}", env!("CARGO_PKG_VERSION")),
-            format!("model:       {} ({} · {})", self.model_info, self.settings.provider, self.settings.auth_mode),
+            format!(
+                "model:       {} ({} · {})",
+                self.model_info,
+                self.settings.provider,
+                crate::config::method_short(&self.settings.provider, self.settings.auth())
+            ),
             format!("cwd:         {cwd}"),
             format!("git:         {git}"),
             format!("permissions: {} · {} allow / {} deny rule(s)", perm_name(self.perm()), policy.allow.len(), policy.deny.len()),
@@ -3050,32 +3103,56 @@ impl App {
     const ADD_PROVIDER: &'static str = "+ Add a custom provider (any OpenAI-compatible URL)";
     const WIZARD_CONTROLS: &'static str = "Enter next/save · Shift+Tab back · Esc cancel · Ctrl+U clear";
 
-    /// `/provider` with no argument: an arrow-key list of every provider,
-    /// then "+ Add" at the bottom.
+    /// How `name` is set up, in a few words: "✓ API key", "✓ ChatGPT
+    /// sign-in", or "not set up".
+    fn provider_status(&self, name: &str) -> String {
+        let s = &self.settings;
+        let tick = if self.ascii { "*" } else { "✓" };
+        if s.has_credentials_for(name) {
+            format!("{tick} {}", crate::config::method_short(name, s.auth_for(name)))
+        } else {
+            "not set up".into()
+        }
+    }
+
+    /// The wizard's place in its steps: "step 2 of 3" (a preset: provider,
+    /// sign-in, model) or "step 3 of 4" (a new one: name, URL, sign-in, model).
+    fn wizard_step(d: &ProviderDraft, step: usize) -> String {
+        if d.adding {
+            format!("step {step} of 4")
+        } else {
+            format!("step {} of 3", step.saturating_sub(1).max(1))
+        }
+    }
+
+    /// `/provider` with no argument: an arrow-key list of every provider
+    /// with how it's set up, then "+ Add" at the bottom.
     fn open_provider_picker(&mut self) {
         let choices = self.settings.provider_choices();
         let width = choices.iter().map(|(n, _, _)| n.chars().count()).max().unwrap_or(8);
+        let statuses: Vec<String> = choices.iter().map(|(n, _, _)| self.provider_status(n)).collect();
+        let swidth = statuses.iter().map(|s| s.chars().count()).max().unwrap_or(10);
         let mut items: Vec<String> = choices
             .iter()
-            .map(|(name, base, model)| {
+            .zip(&statuses)
+            .map(|((name, base, model), status)| {
                 let custom = if crate::config::is_builtin_provider(name) { "" } else { " (custom)" };
-                let key = if self.settings.has_key_for(name) { "" }
-                    else if crate::config::is_builtin_provider(name) { " · no key yet" }
-                    else { " · no saved key" };
+                let host = base.split('/').nth(2).unwrap_or(base);
                 let model = if model.is_empty() { "no model yet" } else { model.as_str() };
-                format!("{name:<width$}  {base} · {model}{custom}{key}")
+                format!("{name:<width$}  {status:<swidth$}  {host} · {model}{custom}")
             })
             .collect();
         items.push(Self::ADD_PROVIDER.to_string());
         let current = choices.iter().position(|(n, _, _)| *n == self.settings.provider);
         let mut picker = Picker {
-            title: "Pick a provider · Ctrl+E edits a custom server".into(),
+            title: "Choose a provider · Ctrl+E edits a custom server".into(),
             items,
             current,
             filter: String::new(),
             cursor: current.unwrap_or(0),
             scroll: 0,
             action: PickAction::Provider,
+            hint: Some("step 1 of 3 · then choose how to sign in (API key or subscription) and the model".into()),
         };
         let len = picker.items.len();
         picker.clamp(len);
@@ -3083,40 +3160,177 @@ impl App {
         self.mode = Mode::Select;
     }
 
-    /// The provider picker's choice: start adding one, ask for a missing
-    /// key, or switch and go on to pick a model.
-    fn provider_picked(&mut self, item: &str, h: &Handles) {
+    /// The provider picker's choice: start adding one, or go on to how to
+    /// sign in to it.
+    fn provider_picked(&mut self, item: &str, _h: &Handles) {
         if item == Self::ADD_PROVIDER {
             self.wizard = Some(ProviderDraft { adding: true, ..Default::default() });
             self.ask(ProviderStep::Name);
             return;
         }
         let name = item.split_whitespace().next().unwrap_or_default();
+        self.setup_provider(name);
+    }
+
+    /// Start the wizard at the sign-in step for a known provider.
+    fn setup_provider(&mut self, name: &str) {
         let Some((p, b, m)) = self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) else {
             return;
         };
-        if self.settings.has_key_for(&p) || !crate::config::is_builtin_provider(&p) {
-            self.switch_provider(p, b, m, h);
-            self.pick_model(h);
-        } else {
-            self.wizard = Some(ProviderDraft { name: p, base_url: b, model: m, ..Default::default() });
-            self.ask(ProviderStep::ApiKey);
-        }
+        // The active provider keeps the model it's on, not the preset's.
+        let m = if p == self.settings.provider && !self.settings.model.is_empty() { self.settings.model.clone() } else { m };
+        self.wizard = Some(ProviderDraft { name: p, base_url: b, model: m, ..Default::default() });
+        self.open_auth_picker();
     }
 
-    /// Open the model list for the active provider (as `/model` does).
-    fn pick_model(&mut self, h: &Handles) {
-        let _ = h.cmd_tx.send(WorkerCmd::ListModels);
+    /// The sign-in step: every way this provider accepts, with what's saved
+    /// for each, the current one highlighted.
+    fn open_auth_picker(&mut self) {
+        use crate::config::{auth_methods, coding_plan_label, key_tail, key_url, no_sub_reason, AuthMethod};
+        use types::AuthChoice;
+        let Some(mut d) = self.wizard.take() else { return };
+        d.signing_in = false;
+        d.waiting_models = false;
+        let s = &self.settings;
+        let name = d.name.clone();
+        let saved_key = s.api_keys.get(&name).filter(|k| !k.is_empty()).map(|k| format!("…{}", key_tail(k)));
+        let env_key = (saved_key.is_none() && s.has_key_for(&name)).then(|| "from the environment".to_string());
+        // A saved custom server whose address was just changed: its key
+        // belongs to the old host, so don't offer to send it to the new one.
+        let moved = s.custom_provider(&name).is_some_and(|c| c.base_url != d.base_url);
+        let key_note = if moved { None } else { saved_key.or(env_key) };
+        if moved && s.has_key_for(&name) && d.error.is_none() {
+            d.error = Some("the address changed, so the saved key isn't reused: enter it again, or pick No key".into());
+        }
+        let sub = crate::auth::sub_label(&name);
+        let mut rows: Vec<(AuthChoice, String)> = Vec::new();
+        for m in auth_methods(&name) {
+            match m {
+                AuthMethod::Api => {
+                    let get = key_url(&name, false).map(|u| format!(" (get one at {u})")).unwrap_or_default();
+                    match &key_note {
+                        Some(k) => {
+                            rows.push((AuthChoice::Keep(m), format!("API key — use the saved key {k}")));
+                            rows.push((AuthChoice::EnterKey(m), "API key — enter a different key".into()));
+                        }
+                        None => rows.push((AuthChoice::EnterKey(m), format!("API key — paste a key{get}"))),
+                    }
+                }
+                AuthMethod::Sub if s.signed_in(&name) => {
+                    rows.push((AuthChoice::Keep(m), format!("{sub} subscription — signed in")));
+                    rows.push((AuthChoice::SignIn, format!("{sub} subscription — sign in again (another account)")));
+                    rows.push((AuthChoice::SignOut, format!("Sign out of {sub}")));
+                }
+                AuthMethod::Sub => {
+                    let plans = if name == "openai" { " (Plus / Pro / Business)" } else { "" };
+                    rows.push((AuthChoice::SignIn, format!("{sub} subscription{plans} — sign in in your browser")));
+                }
+                AuthMethod::Plan => {
+                    let plan = coding_plan_label(&name);
+                    match &key_note {
+                        Some(k) => {
+                            rows.push((AuthChoice::Keep(m), format!("{plan} — use the saved key {k} on the plan's endpoint")));
+                            rows.push((AuthChoice::EnterKey(m), format!("{plan} — enter the plan's key")));
+                        }
+                        None => rows.push((AuthChoice::EnterKey(m), format!("{plan} — paste the plan's key"))),
+                    }
+                }
+                AuthMethod::None => rows.push((AuthChoice::NoKey, "No key — a local or open server".into())),
+            }
+        }
+        // Highlight what's in use now (or, set up for the first time, the
+        // default first row).
+        let now = s.auth_for(&name);
+        let in_use = s.has_credentials_for(&name).then(|| {
+            rows.iter().position(|(c, _)| match c {
+                AuthChoice::Keep(m) => *m == now,
+                AuthChoice::NoKey => now == AuthMethod::None,
+                _ => false,
+            })
+        });
+        // A custom server with nothing saved is most often a keyless local
+        // one: highlight No key so Enter doesn't demand a key it doesn't need.
+        let current = in_use.flatten().or_else(|| {
+            (!crate::config::is_builtin_provider(&name) && (moved || !s.has_key_for(&name)))
+                .then(|| rows.iter().position(|(c, _)| matches!(c, AuthChoice::NoKey)))
+                .flatten()
+        });
+        let step = Self::wizard_step(&d, 3);
+        let ways = if crate::auth::sub_supported(&name) { "API key or subscription".to_string() } else { "API key".into() };
+        let hint = match no_sub_reason(&name) {
+            Some(why) => format!("{step} · {why}"),
+            None => format!("{step} · {ways} · Esc goes back"),
+        };
+        d.choices = rows.iter().map(|(c, _)| *c).collect();
+        let mut picker = Picker {
+            title: format!("{name} · How do you sign in?"),
+            items: rows.into_iter().map(|(_, l)| l).collect(),
+            current,
+            filter: String::new(),
+            cursor: current.unwrap_or(0),
+            scroll: 0,
+            action: PickAction::Auth,
+            hint: Some(hint),
+        };
+        let len = picker.items.len();
+        picker.clamp(len);
+        self.wizard = Some(d);
+        self.picker = Some(picker);
         self.mode = Mode::Select;
     }
 
+    /// Act on a sign-in row: keep what's saved, ask for a key, open the
+    /// browser, or sign out.
+    fn auth_picked(&mut self, idx: usize, h: &Handles) {
+        use crate::config::AuthMethod;
+        use types::AuthChoice;
+        let Some(mut d) = self.wizard.take() else { return };
+        d.error = None;
+        let Some(choice) = d.choices.get(idx).copied() else { return };
+        match choice {
+            AuthChoice::Keep(m) => {
+                d.method = m;
+                self.commit_provider(d, h);
+            }
+            AuthChoice::EnterKey(m) => {
+                d.method = m;
+                self.wizard = Some(d);
+                self.ask(ProviderStep::ApiKey);
+            }
+            AuthChoice::NoKey => {
+                d.method = AuthMethod::None;
+                d.api_key.clear();
+                // Don't keep a secret for a server that no longer uses it.
+                d.clear_key = self.settings.api_keys.get(&d.name).is_some_and(|k| !k.is_empty());
+                self.commit_provider(d, h);
+            }
+            AuthChoice::SignIn => {
+                d.method = AuthMethod::Sub;
+                d.signing_in = true;
+                let _ = h.cmd_tx.send(WorkerCmd::Login(d.name.clone()));
+                self.wizard = Some(d);
+                self.set_busy();
+                self.current_activity = Some("waiting for the browser sign-in… (Esc cancels)".into());
+            }
+            AuthChoice::SignOut => {
+                let label = crate::auth::sub_label(&d.name);
+                self.patch(ConfigPatch::SignOut(d.name.clone()), h);
+                self.push(Kind::Notice, format!("signed out of {label} for {}", d.name));
+                self.wizard = Some(d);
+                self.open_auth_picker();
+            }
+        }
+    }
+
+    /// Open a typed step (prefilled where there's something to keep).
     fn ask(&mut self, step: ProviderStep) {
         self.wiz_input = self.wizard.as_ref().map(|d| match step {
             ProviderStep::Name => d.name.clone(),
             ProviderStep::BaseUrl => d.base_url.clone(),
-            // Never prefill a saved secret, even in a masked field.
-            ProviderStep::ApiKey => if d.clear_key { "-".into() } else { d.api_key.clone() },
-            ProviderStep::Model => d.model.clone(),
+            // Never prefill a key, even in a masked field.
+            ProviderStep::ApiKey => String::new(),
+            // Empty: Enter keeps the draft's model, typing replaces it.
+            ProviderStep::Model => String::new(),
         }).unwrap_or_default();
         self.wiz_cursor = self.wiz_input.chars().count();
         self.mode = Mode::ProviderInput { step };
@@ -3135,30 +3349,6 @@ impl App {
         self.ask(ProviderStep::BaseUrl);
     }
 
-    fn wizard_back(&mut self, step: ProviderStep) {
-        let Some(d) = self.wizard.as_mut() else { return };
-        if !d.adding { return; }
-        let previous = match step {
-            ProviderStep::Name => return,
-            ProviderStep::BaseUrl if d.editing => return,
-            ProviderStep::BaseUrl => ProviderStep::Name,
-            ProviderStep::ApiKey => ProviderStep::BaseUrl,
-            ProviderStep::Model => ProviderStep::ApiKey,
-        };
-        // Keep unfinished text so going forward restores it, including new keys.
-        match step {
-            ProviderStep::Name => d.name = self.wiz_input.clone(),
-            ProviderStep::BaseUrl => d.base_url = self.wiz_input.clone(),
-            ProviderStep::ApiKey => {
-                d.clear_key = self.wiz_input.trim() == "-";
-                d.api_key = if d.clear_key { String::new() } else { self.wiz_input.trim().into() };
-            }
-            ProviderStep::Model => d.model = self.wiz_input.clone(),
-        }
-        d.error = None;
-        self.ask(previous);
-    }
-
     fn cancel_wizard(&mut self) {
         self.wizard = None;
         self.wiz_input.clear();
@@ -3167,51 +3357,79 @@ impl App {
         self.push(Kind::Notice, String::from("provider setup cancelled"));
     }
 
-    /// The prompt and hint for a wizard step: (title, hint).
-    fn wizard_prompt(&self, step: ProviderStep) -> (String, String) {
-        let d = self.wizard.clone().unwrap_or_default();
-        let (n, total) = match step {
-            ProviderStep::Name => (1, 4),
-            ProviderStep::BaseUrl => (2, 4),
-            ProviderStep::ApiKey => (3, 4),
-            ProviderStep::Model => (4, 4),
+    /// Esc in a typed step: back one step (a new provider's name step, or
+    /// the end of a setup, cancels).
+    fn wizard_back(&mut self, step: ProviderStep, h: &Handles) {
+        let Some(mut d) = self.wizard.take() else {
+            self.mode = Mode::Idle;
+            return;
         };
-        let lead = if d.editing {
-            format!("Edit {} · step {} of 3 · ", d.name, n - 1)
-        } else if d.adding { format!("Add provider · step {n} of {total} · ") } else { format!("{} · ", d.name) };
+        d.error = None;
+        self.wiz_input.clear();
+        match step {
+            ProviderStep::Name => {
+                self.wizard = Some(d);
+                self.cancel_wizard();
+            }
+            // Editing a saved server has no name step to go back to.
+            ProviderStep::BaseUrl if d.editing => {
+                self.wizard = Some(d);
+                self.cancel_wizard();
+            }
+            ProviderStep::BaseUrl => {
+                self.wizard = Some(d);
+                self.ask(ProviderStep::Name);
+            }
+            ProviderStep::ApiKey => {
+                self.wizard = Some(d);
+                self.open_auth_picker();
+            }
+            // Already switched: keep the model it has.
+            ProviderStep::Model => self.wizard_done(d, h),
+        }
+    }
+
+    /// The prompt and hint for a typed wizard step: (title, hint).
+    fn wizard_prompt(&self, step: ProviderStep) -> (String, String) {
+        use crate::config::{coding_plan_label, key_url, AuthMethod};
+        let d = self.wizard.clone().unwrap_or_default();
+        let who = if d.name.is_empty() { "New provider".to_string() } else { d.name.clone() };
         match step {
             ProviderStep::Name => (
-                format!("{lead}Name"),
-                "a short name, e.g. litellm or local (letters, digits, - _ .)".into(),
+                "New provider · Name".into(),
+                format!(
+                    "{} · a short name, e.g. litellm or ollama (letters, digits, - _ .) · Esc cancels",
+                    Self::wizard_step(&d, 1)
+                ),
             ),
             ProviderStep::BaseUrl => (
-                format!("{lead}Base URL"),
-                "API base URL, e.g. http://localhost:1234/v1 · not /chat/completions".into(),
+                format!("{}{who} · Base URL", if d.editing { "Edit " } else { "" }),
+                format!(
+                    "{} · the OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 (not …/chat/completions) · Esc goes back",
+                    Self::wizard_step(&d, 2)
+                ),
             ),
-            ProviderStep::ApiKey => (
-                format!("{lead}API key"),
-                if self.settings.custom_provider(&d.name).is_some_and(|c| c.base_url != d.base_url) {
-                    "address changed · paste a key, or Enter to use no saved key".into()
-                } else if self.settings.has_key_for(&d.name) {
-                    "hidden · Enter keeps key · paste replaces · '-' clears saved key".into()
-                } else if d.adding {
-                    "optional · hidden; paste works · Enter skips for a local server".into()
-                } else {
-                    format!("{} has no key saved · hidden as you type; paste works", d.name)
-                },
-            ),
-            ProviderStep::Model => (
-                format!("{lead}Model"),
-                "model ID · Enter keeps it · clear with Ctrl+U to browse server models".into(),
-            ),
+            ProviderStep::ApiKey => {
+                let plan = d.method == AuthMethod::Plan;
+                let what = if plan { format!("{} key", coding_plan_label(&d.name)) } else { "API key".into() };
+                let get = key_url(&d.name, plan).map(|u| format!(" · get one at {u}")).unwrap_or_default();
+                (
+                    format!("{who} · {what}"),
+                    format!("{}{get} · hidden as you type; paste works · Esc goes back", Self::wizard_step(&d, 3)),
+                )
+            }
+            ProviderStep::Model => {
+                let keep = if d.model.is_empty() { String::new() } else { format!(" · Enter keeps {}", d.model) };
+                (format!("{who} · Model"), format!("{} · type the model id{keep}", Self::wizard_step(&d, 4)))
+            }
         }
     }
 
     fn on_key_provider_input(&mut self, step: ProviderStep, key: KeyEvent, h: &Handles) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.cancel_wizard(),
-            KeyCode::BackTab => self.wizard_back(step),
+            KeyCode::Esc => self.wizard_back(step, h),
+            KeyCode::BackTab => self.wizard_back(step, h),
             KeyCode::Enter => {
                 let val = self.wiz_input.trim().to_string();
                 self.wizard_answer(step, val, h);
@@ -3250,7 +3468,12 @@ impl App {
             return;
         };
         d.error = None;
-        let next = match step {
+        let retry = |app: &mut Self, mut d: ProviderDraft, e: String| {
+            d.error = Some(e);
+            app.wizard = Some(d);
+            app.mode = Mode::ProviderInput { step }; // keeps what was typed, to fix it
+        };
+        match step {
             ProviderStep::Name => match valid_custom_name(&val) {
                 Ok(()) => {
                     let changed = d.name != val;
@@ -3261,66 +3484,57 @@ impl App {
                         d.model = c.model.clone();
                         d.editing = true;
                     }
-                    Some(ProviderStep::BaseUrl)
+                    self.wizard = Some(d);
+                    self.ask(ProviderStep::BaseUrl);
                 }
-                Err(e) => {
-                    d.error = Some(e);
-                    Some(ProviderStep::Name)
-                }
+                Err(e) => retry(self, d, e),
             },
             ProviderStep::BaseUrl => {
                 let val = if val.is_empty() { d.base_url.clone() } else { val };
                 match crate::config::normalize_provider_url(&val) {
                     Ok(url) => {
                         d.base_url = url;
-                        Some(ProviderStep::ApiKey)
+                        self.wizard = Some(d);
+                        self.open_auth_picker();
                     }
-                    Err(e) => {
-                        d.error = Some(e);
-                        Some(ProviderStep::BaseUrl)
-                    }
+                    Err(e) => retry(self, d, e),
                 }
             }
             ProviderStep::ApiKey => {
-                d.clear_key = val == "-" || (val.is_empty()
-                    && self.settings.custom_provider(&d.name).is_some_and(|c| c.base_url != d.base_url));
-                d.api_key = if d.clear_key { String::new() } else { val };
-                if d.adding {
-                    Some(ProviderStep::Model)
+                // A pasted "Bearer sk-…" or "KEY=sk-…" line still works.
+                let key = val.trim_start_matches("Bearer ").rsplit('=').next().unwrap_or("").trim().to_string();
+                if key.is_empty() {
+                    retry(self, d, "paste the key (Esc goes back to pick another way)".into());
+                } else if key == "-" {
+                    retry(self, d, "to use no key, press Esc and pick No key".into());
+                } else if key.chars().any(char::is_whitespace) {
+                    retry(self, d, "that has spaces in it: paste just the key".into());
                 } else {
-                    None
+                    d.api_key = key;
+                    self.wiz_input.clear();
+                    self.commit_provider(d, h);
                 }
             }
             ProviderStep::Model => {
-                if !val.is_empty() {
-                    d.model = val;
-                } else {
-                    d.model.clear();
+                let model = if val.is_empty() { d.model.clone() } else { val };
+                if model.is_empty() {
+                    retry(self, d, "type a model id".into());
+                    return;
                 }
-                None
-            }
-        };
-        match next {
-            Some(step) => {
-                // The same step again keeps what was typed, to fix it.
-                let retry = d.error.is_some();
-                self.wizard = Some(d);
-                if retry {
-                    self.mode = Mode::ProviderInput { step };
-                } else {
-                    self.ask(step);
-                }
-            }
-            None => {
                 self.wiz_input.clear();
-                self.finish_wizard(d, h);
+                if model != self.settings.model {
+                    let _ = h.cmd_tx.send(WorkerCmd::SetModel(model.clone()));
+                }
+                d.model = model;
+                self.wizard_done(d, h);
             }
         }
     }
 
-    /// Save what the wizard collected, switch to it, and pick a model when
-    /// none was typed.
-    fn finish_wizard(&mut self, d: ProviderDraft, h: &Handles) {
+    /// Save what the wizard collected (a new provider, a key, the sign-in
+    /// method), switch to it, and go on to choose the model from the
+    /// server's list.
+    fn commit_provider(&mut self, d: ProviderDraft, h: &Handles) {
         use crate::config::CustomProvider;
         if d.adding {
             let updated = self.settings.custom_provider(&d.name).is_some();
@@ -3339,20 +3553,116 @@ impl App {
         }
         if !d.api_key.is_empty() || d.clear_key {
             self.patch(ConfigPatch::ProviderKey { provider: d.name.clone(), key: d.api_key.clone() }, h);
-            self.push(Kind::Notice, format!("API key {} for {}", if d.clear_key { "cleared" } else { "saved" }, d.name));
+            self.push(Kind::Notice, format!("key {} for {}", if d.clear_key { "removed" } else { "saved" }, d.name));
         }
+        // The method belongs to the provider: set it before switching, so
+        // the switch already speaks the right way.
+        self.patch(ConfigPatch::ProviderAuth { provider: d.name.clone(), mode: d.method.id().into() }, h);
+        // Editing a server that isn't the active one saves it without
+        // switching away from what's in use.
         if d.editing && self.settings.provider != d.name && !d.model.is_empty() {
+            self.wizard = None;
+            self.wiz_input.clear();
             self.mode = Mode::Idle;
             self.push(Kind::Notice, format!("saved · /provider {} switches to this server", d.name));
             return;
         }
         self.switch_provider(d.name.clone(), d.base_url.clone(), d.model.clone(), h);
-        if d.model.is_empty() || !d.adding {
-            // Pick (or confirm) the model from what the server offers.
-            self.pick_model(h);
+        let mut d = d;
+        d.api_key.clear();
+        d.waiting_models = true;
+        self.push(Kind::Notice, format!("loading {}'s models…", d.name));
+        self.wizard = Some(d);
+        self.pick_model(h);
+    }
+
+    /// The model list arrived for the wizard: the last step.
+    fn wizard_models(&mut self, ids: Vec<String>) {
+        let d = self.wizard.clone().unwrap_or_default();
+        let default = crate::config::PROVIDERS.iter().find(|(n, _, _)| *n == d.name).map(|(_, _, m)| *m);
+        let current = ids
+            .iter()
+            .position(|m| *m == self.settings.model)
+            .or_else(|| default.and_then(|dm| ids.iter().position(|m| m == dm)));
+        let mut picker = Picker {
+            title: format!("{} · Choose a model", d.name),
+            items: ids,
+            current,
+            filter: String::new(),
+            cursor: current.unwrap_or(0),
+            scroll: 0,
+            action: PickAction::Model,
+            hint: Some(format!(
+                "{} · type to filter; a name that isn't listed is used as typed · Esc keeps {}",
+                Self::wizard_step(&d, 4),
+                if self.settings.model.is_empty() { "none" } else { self.settings.model.as_str() }
+            )),
+        };
+        let len = picker.items.len();
+        picker.clamp(len);
+        self.picker = Some(picker);
+        self.mode = Mode::Select;
+    }
+
+    /// The model list didn't come: a refused credential goes back to the
+    /// sign-in step, anything else asks for the model id by hand.
+    fn wizard_models_failed(&mut self, err: &str) {
+        let Some(mut d) = self.wizard.take() else { return };
+        let short = crate::api::truncate(err.lines().next().unwrap_or(err), 160);
+        if err.contains("HTTP 401") || err.contains("HTTP 403") {
+            let what = if d.method == crate::config::AuthMethod::Sub { "sign-in" } else { "key" };
+            d.error = Some(format!("{} refused the {what} ({short}): pick or enter another", d.name));
+            self.wizard = Some(d);
+            self.open_auth_picker();
+            self.push(Kind::ErrorK, format!("{}: the {what} was refused", self.settings.provider));
         } else {
-            self.mode = Mode::Idle;
+            d.error = Some(format!("couldn't load the model list ({short}): type the model id"));
+            d.model = self.settings.model.clone();
+            self.wizard = Some(d);
+            self.ask(ProviderStep::Model);
         }
+    }
+
+    /// The wizard's end: say what's now in use.
+    fn wizard_done(&mut self, d: ProviderDraft, _h: &Handles) {
+        self.wizard = None;
+        self.wiz_input.clear();
+        self.mode = Mode::Idle;
+        let s = &self.settings;
+        let model = if d.model.is_empty() { s.model.clone() } else { d.model.clone() };
+        let tick = if self.ascii { "*" } else { "✓" };
+        self.push(
+            Kind::Notice,
+            format!("{tick} {} · {} · {model}", s.provider, crate::config::method_short(&s.provider, s.auth())),
+        );
+    }
+
+    /// A browser sign-in finished (or didn't).
+    fn on_signed_in(&mut self, provider: String, token: Option<crate::config::OAuthToken>, error: String, h: &Handles) {
+        let waiting = self.wizard.as_ref().is_some_and(|d| d.signing_in && d.name == provider);
+        if let Some(token) = token {
+            self.settings.apply_patch(&ConfigPatch::SignedIn { provider: provider.clone(), token });
+            self.push(Kind::Notice, format!("signed in with {}", crate::auth::sub_label(&provider)));
+            if let Some(mut d) = self.wizard.take().filter(|_| waiting) {
+                d.signing_in = false;
+                self.clear_busy();
+                self.commit_provider(d, h);
+            }
+        } else if waiting {
+            if let Some(d) = self.wizard.as_mut() {
+                d.error = Some(format!("sign-in didn't finish: {error}"));
+            }
+            self.clear_busy();
+            self.open_auth_picker();
+        } else {
+            self.push(Kind::ErrorK, format!("sign-in failed: {error}"));
+        }
+    }
+
+    /// Open the model list for the active provider (as `/model` does).
+    fn pick_model(&mut self, h: &Handles) {
+        let _ = h.cmd_tx.send(WorkerCmd::ListModels);
+        self.mode = Mode::Select;
     }
 
     /// Make `provider` active with its address and model, and its saved key.
@@ -3362,6 +3672,7 @@ impl App {
         self.settings.model = model.clone();
         self.model_info = model.clone();
         self.settings.resolve_key();
+        self.settings.sync_auth_mode();
         self.sync_prices(); // the cost counter follows the provider
         let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::Provider { provider, base_url, model }));
     }
@@ -3407,14 +3718,10 @@ impl App {
                 for (name, base, model) in self.settings.provider_choices() {
                     let active = if name == self.settings.provider { "●" } else { " " };
                     let kind = if is_builtin_provider(&name) { "" } else { " (custom)" };
-                    let key = if self.settings.api_keys.get(&name).is_some_and(|k| !k.is_empty()) {
-                        ""
-                    } else {
-                        " · no key saved"
-                    };
-                    self.push(Kind::Notice, format!("  {active} {name}{kind}  {base} · {model}{key}"));
+                    let status = self.provider_status(&name);
+                    self.push(Kind::Notice, format!("  {active} {name}{kind}  {status}  {base} · {model}"));
                 }
-                self.push(Kind::Notice, String::from("  /provider <name> switches"));
+                self.push(Kind::Notice, String::from("  /provider <name> switches (or sets it up) · /provider opens the picker"));
                 self.show_options("/provider");
             }
             ["add", name, base, model] => {
@@ -3465,7 +3772,9 @@ impl App {
                 self.push(Kind::Notice, format!("removed provider {name} and its saved key"));
             }
             [name] => match self.settings.provider_choices().into_iter().find(|(n, _, _)| n == name) {
-                Some((p, b, m)) => self.switch_provider(p, b, m, h),
+                Some((p, b, m)) if self.settings.has_credentials_for(&p) => self.switch_provider(p, b, m, h),
+                // Not set up yet: walk through signing in and the model.
+                Some((p, _, _)) => self.setup_provider(&p),
                 None => {
                     self.push(Kind::ErrorK, format!("unknown provider '{name}' (/provider lists them)"));
                 }
@@ -3759,6 +4068,17 @@ impl App {
         }
     }
 
+    /// The line under a picker's title: the wizard's last error (red), else
+    /// the picker's own hint.
+    fn picker_hint(&self, picker: &Picker) -> Option<Line<'static>> {
+        let error = self.wizard.as_ref().and_then(|d| d.error.clone()).filter(|_| matches!(picker.action, PickAction::Auth));
+        match (error, &picker.hint) {
+            (Some(e), _) => Some(Line::from(Span::styled(e, Style::default().fg(Color::Red)))),
+            (None, Some(h)) => Some(Line::from(Span::styled(h.clone(), Style::default().fg(self.dim_text())))),
+            (None, None) => None,
+        }
+    }
+
     /// Display value for one `/config` row.
     fn setting_value(&self, row: usize) -> String {
         let s = &self.settings;
@@ -3787,11 +4107,12 @@ impl App {
                 }
             }
             4 => {
-                if s.auth_mode == "sub" {
-                    let signed = if s.oauth.contains_key(&s.provider) { "" } else { " — not signed in, run /login" };
-                    format!("subscription{signed}")
+                let how = crate::config::method_short(&s.provider, s.auth());
+                let more = if crate::config::auth_methods(&s.provider).len() > 1 { " (Enter to change)" } else { "" };
+                if s.has_credentials() {
+                    format!("{how}{more}")
                 } else {
-                    "api key".into()
+                    format!("{how} — not set up (Enter to set up)")
                 }
             }
             5 => s.reasoning.clone(),
@@ -3867,7 +4188,8 @@ impl App {
             Mode::Settings { .. } => SETTING_ROWS.len() as u16 + 1,
             Mode::Select => {
                 let n = self.picker.as_ref().map(|p| p.filtered().len()).unwrap_or(0);
-                n.clamp(1, PICKER_VISIBLE) as u16 + 1
+                let hint = self.picker.as_ref().and_then(|p| self.picker_hint(p)).is_some() as u16;
+                n.clamp(1, PICKER_VISIBLE) as u16 + 1 + hint
             }
             Mode::Password { .. } => 2,
             Mode::ProviderInput { step } => {
@@ -4204,6 +4526,9 @@ impl App {
                         ));
                     }
                     lines.push(Line::from(header));
+                    if let Some(row) = self.picker_hint(picker) {
+                        lines.push(row);
+                    }
                     let filtered = picker.filtered();
                     if filtered.is_empty() {
                         lines.push(Line::from(Span::styled(
@@ -5059,6 +5384,7 @@ mod tests {
         // the next one wraps to the first preset.
         app.activate_setting(0, 1, &h);
         assert_eq!(app.settings.provider, crate::config::PROVIDERS[0].0);
+        app.settings.api_keys.insert("box".into(), "k".into()); // set up, so /provider box just switches
         run(&mut app, "/provider box");
         assert_eq!((app.settings.provider.as_str(), app.settings.model.as_str()), ("box", "some-model"));
         let _ = patches(&rx);
@@ -5080,6 +5406,30 @@ mod tests {
         assert!(app.transcript.iter().any(|l| l.kind == crate::ui::types::Kind::ErrorK && l.text.contains("unknown provider")));
     }
 
+    /// Press Enter on the picker row containing `needle`.
+    fn pick_row(app: &mut App, h: &Handles, needle: &str) {
+        let p = app.picker.as_mut().expect("a picker is open");
+        p.cursor = p.items.iter().position(|i| i.contains(needle)).unwrap_or_else(|| panic!("no row {needle:?} in {:?}", p.items));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), h);
+    }
+
+    /// What the worker was sent, in a few words each.
+    fn sent_kinds(rx: &std::sync::mpsc::Receiver<WorkerCmd>) -> Vec<String> {
+        rx.try_iter()
+            .map(|c| match c {
+                WorkerCmd::Patch(ConfigPatch::AddProvider(c)) => format!("add {} {} [{}]", c.name, c.base_url, c.model),
+                WorkerCmd::Patch(ConfigPatch::Provider { provider, .. }) => format!("switch {provider}"),
+                WorkerCmd::Patch(ConfigPatch::ProviderKey { provider, key }) => format!("key {provider} {key}"),
+                WorkerCmd::Patch(ConfigPatch::ProviderAuth { provider, mode }) => format!("auth {provider} {mode}"),
+                WorkerCmd::Patch(ConfigPatch::SignOut(p)) => format!("signout {p}"),
+                WorkerCmd::Login(p) => format!("login {p}"),
+                WorkerCmd::SetModel(m) => format!("model {m}"),
+                WorkerCmd::ListModels => "models".into(),
+                _ => "other".into(),
+            })
+            .collect()
+    }
+
     #[test]
     fn editing_a_server_prefills_values_and_keeps_the_key_and_active_provider() {
         let mut app = App::new(test_ui_config(), Vec::new());
@@ -5092,16 +5442,16 @@ mod tests {
         app.provider_command(Some("edit local"), &h);
         assert_eq!(app.wiz_input, "http://localhost:1234/v1");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        assert!(app.wiz_input.is_empty(), "a saved key is never prefilled");
-        assert!(app.wizard_prompt(ProviderStep::ApiKey).1.contains("Enter keeps key"));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        assert_eq!(app.wiz_input, "saved-model");
+        // Same address: the saved key is offered (by its tail, never in full) and highlighted.
+        let p = app.picker.as_ref().expect("the sign-in step");
+        assert!(p.items[p.cursor].contains("use the saved key"), "{:?}", p.items);
+        assert!(!p.items.iter().any(|i| i.contains("saved-secret")));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
         assert_eq!(app.settings.api_keys["local"], "saved-secret");
+        // An inactive server is saved without switching to it.
         assert_eq!(app.settings.provider, active);
-        let sent: Vec<_> = rx.try_iter().collect();
-        assert_eq!(sent.len(), 1);
-        assert!(matches!(&sent[0], WorkerCmd::Patch(ConfigPatch::AddProvider(c)) if c.model == "saved-model"));
+        assert!(app.wizard.is_none());
+        assert_eq!(sent_kinds(&rx), ["add local http://localhost:1234/v1 [saved-model]", "auth local api"]);
     }
 
     #[test]
@@ -5113,25 +5463,28 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
         app.on_paste("http://localhost:1234/v1".into());
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        pick_row(&mut app, &h, "API key — paste");
         app.on_paste("unsaved-secret".into());
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &h);
-        assert_eq!(app.wiz_input, "http://localhost:1234/v1");
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        assert_eq!(app.wiz_input, "unsaved-secret");
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
         let screen = draw(&mut app, &mut term);
-        assert!(!screen.contains("unsaved-secret"));
-        assert!(screen.contains("Shift+Tab back"));
+        assert!(!screen.contains("unsaved-secret"), "the key is masked");
+        // Shift+Tab goes back a step like Esc: to the sign-in step, then the address.
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &h);
+        assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, crate::ui::types::PickAction::Auth)));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
-        assert!(rx.try_iter().next().is_none());
+        for _ in 0..4 {
+            if app.wizard.is_none() { break; }
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
+        }
         assert!(app.wizard.is_none());
         assert!(app.wiz_input.is_empty());
+        assert!(rx.try_iter().next().is_none(), "nothing saved");
         assert!(app.settings.custom_provider("local").is_none());
     }
 
     #[test]
     fn editing_server_addresses_never_reuses_a_saved_key_by_default() {
-        for (input_key, expected) in [("", ""), ("-", ""), ("replacement", "replacement")] {
+        for (row, typed, expected) in [("No key", "", ""), ("API key — paste", "replacement", "replacement")] {
             let mut app = App::new(test_ui_config(), Vec::new());
             let (h, rx) = test_handles();
             let cp = crate::config::CustomProvider {
@@ -5141,10 +5494,16 @@ mod tests {
             app.settings.api_keys.insert("local".into(), "old-secret".into());
             app.provider_command(Some("edit local"), &h);
             app.wizard_answer(ProviderStep::BaseUrl, "https://new.example/v1".into(), &h);
-            assert!(app.wizard_prompt(ProviderStep::ApiKey).1.contains("address changed"));
-            app.wizard_answer(ProviderStep::ApiKey, input_key.into(), &h);
-            app.wizard_answer(ProviderStep::Model, "m".into(), &h);
-            assert_eq!(app.settings.api_keys["local"], expected);
+            let p = app.picker.as_ref().expect("the sign-in step");
+            assert!(!p.items.iter().any(|i| i.contains("saved key")), "{:?}", p.items);
+            assert!(p.items[p.cursor].contains("No key"));
+            assert!(app.wizard.as_ref().and_then(|d| d.error.as_deref()).is_some_and(|e| e.contains("address changed")));
+            pick_row(&mut app, &h, row);
+            if !typed.is_empty() {
+                app.on_paste(typed.into());
+                app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+            }
+            assert_eq!(app.settings.api_keys.get("local").map(String::as_str).unwrap_or(""), expected);
             assert!(rx.try_iter().any(|cmd| matches!(cmd,
                 WorkerCmd::Patch(ConfigPatch::ProviderKey { key, .. }) if key == expected)));
         }
@@ -5154,8 +5513,8 @@ mod tests {
     fn wizard_supports_in_place_unicode_edits_and_paste() {
         let mut app = App::new(test_ui_config(), Vec::new());
         let (h, _rx) = test_handles();
-        app.wizard = Some(ProviderDraft { adding: true, model: "ab語cd".into(), ..Default::default() });
-        app.ask(ProviderStep::Model);
+        app.wizard = Some(ProviderDraft { adding: true, base_url: "ab語cd".into(), ..Default::default() });
+        app.ask(ProviderStep::BaseUrl);
         app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &h);
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &h);
         app.on_paste("X".into());
@@ -5182,9 +5541,13 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), &h);
         assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::BaseUrl }));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
+        assert!(app.wizard.is_none(), "Esc on an edit's first step cancels");
         app.provider_picked("local", &h);
+        // No key saved: No key is highlighted, so one Enter switches.
+        let p = app.picker.as_ref().expect("the sign-in step");
+        assert!(p.items[p.cursor].contains("No key"), "{:?}", p.items);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
         assert_eq!(app.settings.provider, "local");
-        assert!(app.wizard.is_none());
         assert!(rx.try_iter().any(|cmd| matches!(cmd, WorkerCmd::ListModels)));
     }
 
@@ -5195,9 +5558,8 @@ mod tests {
         app.ask(ProviderStep::BaseUrl);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(46, 20)).unwrap();
         let screen = draw(&mut app, &mut term);
-        assert!(screen.contains("localhost:1234/v1"), "{screen}");
-        assert!(screen.contains("Shift+Tab back"), "{screen}");
-        assert!(screen.contains("Ctrl+U clear"), "{screen}");
+        assert!(screen.contains("Base URL"), "{screen}");
+        assert!(screen.contains("Esc goes back"), "{screen}");
         let buf = term.backend().buffer();
         assert!(buf.content().iter().any(|c| c.modifier.contains(ratatui::style::Modifier::REVERSED)), "cursor must remain visible: {screen}");
     }
@@ -5212,18 +5574,22 @@ mod tests {
         app.settings.base_url = cp.base_url;
         app.settings.model = cp.model;
         app.settings.api_keys.insert("local".into(), "old-secret".into());
+        app.settings.resolve_key();
         app.provider_command(Some("edit"), &h);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        app.on_paste("-".into());
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &h);
-        app.on_paste("new-model".into());
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        // No key drops the saved one; the active server switches live.
+        pick_row(&mut app, &h, "No key");
         assert_eq!(app.settings.provider, "local");
         assert_eq!(app.settings.api_key, "");
+        assert!(app.settings.api_keys.get("local").is_none_or(|k| k.is_empty()));
+        app.handle_event(UiEvent::ModelList(vec!["old-model".into(), "new-model".into()]), &h);
+        pick_row(&mut app, &h, "new-model");
+        app.handle_event(UiEvent::ModelChanged("new-model".into()), &h); // the worker's ack
         assert_eq!(app.settings.model, "new-model");
         assert_eq!(app.model_info, "new-model");
-        assert!(rx.try_iter().any(|c| matches!(c, WorkerCmd::Patch(ConfigPatch::Provider { provider, model, .. }) if provider == "local" && model == "new-model")));
+        let sent = sent_kinds(&rx);
+        assert!(sent.contains(&"key local ".to_string()), "{sent:?}");
+        assert!(sent.contains(&"model new-model".to_string()), "{sent:?}");
     }
 
     #[test]
@@ -5245,6 +5611,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Select));
         let p = app.picker.as_mut().expect("provider picker");
         assert!(matches!(p.action, PickAction::Provider));
+        assert!(p.hint.as_deref().is_some_and(|t| t.contains("step 1 of 3")));
         assert_eq!(p.items.last().map(String::as_str), Some(App::ADD_PROVIDER));
         p.cursor = p.items.len() - 1;
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
@@ -5259,53 +5626,156 @@ mod tests {
         typed(&mut app, "ftp://x");
         assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::BaseUrl }));
         typed(&mut app, "https://llm.example/v1/");
-        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
-        typed(&mut app, "secret");
-        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::Model }));
-        typed(&mut app, ""); // pick from the server's list
 
-        let sent: Vec<WorkerCmd> = rx.try_iter().collect();
-        let kinds: Vec<String> = sent
-            .iter()
-            .map(|c| match c {
-                WorkerCmd::Patch(ConfigPatch::AddProvider(c)) => format!("add {} {} [{}]", c.name, c.base_url, c.model),
-                WorkerCmd::Patch(ConfigPatch::Provider { provider, .. }) => format!("switch {provider}"),
-                WorkerCmd::Patch(ConfigPatch::ProviderKey { provider, key }) => format!("key {provider} {key}"),
-                WorkerCmd::ListModels => "models".into(),
-                _ => "other".into(),
-            })
-            .collect();
-        assert_eq!(kinds, ["add box https://llm.example/v1 []", "key box secret", "switch box", "models"]);
-        assert!(matches!(app.mode, Mode::Select), "the model list opens next");
+        // Sign-in: a custom server takes a key or none.
+        let p = app.picker.as_ref().expect("sign-in picker");
+        assert!(matches!(p.action, PickAction::Auth));
+        assert!(p.items.iter().any(|i| i.starts_with("No key")));
+        pick_row(&mut app, &h, "API key — paste");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
+        typed(&mut app, "two words");
+        assert!(app.wizard.as_ref().unwrap().error.is_some(), "a key with spaces is refused");
+        typed(&mut app, "Bearer secret");
+
+        assert_eq!(
+            sent_kinds(&rx),
+            ["add box https://llm.example/v1 []", "key box secret", "auth box api", "switch box", "models"]
+        );
+        assert!(app.wizard.as_ref().is_some_and(|d| d.waiting_models));
+
+        // The model step: the server's list, and a name it doesn't list
+        // is taken as typed.
+        app.handle_event(UiEvent::ModelList(vec!["alpha".into(), "beta".into()]), &h);
+        let p = app.picker.as_ref().expect("model picker");
+        assert!(p.title.contains("Choose a model") && p.hint.as_deref().is_some_and(|t| t.contains("step 4 of 4")));
+        for c in "gamma-7b".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &h);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(sent_kinds(&rx), ["model gamma-7b"]);
+        assert!(app.wizard.is_none());
+        assert!(matches!(app.mode, Mode::Idle));
+        assert!(app.transcript.iter().any(|l| l.text.contains("box · API key · gamma-7b")));
+    }
+
+    #[test]
+    fn a_saved_key_is_kept_with_enter_and_esc_goes_back_a_step() {
+        use crate::ui::types::{PickAction, ProviderStep};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.settings.api_keys.insert("deepseek".into(), "sk-abcd1234".into());
+        app.open_provider_picker();
+        let p = app.picker.as_ref().unwrap();
+        assert!(p.items.iter().any(|i| i.starts_with("deepseek") && i.contains("API key")), "set up shows as ready");
+        assert!(p.items.iter().any(|i| i.starts_with("groq") && i.contains("not set up")));
+        pick_row(&mut app, &h, "deepseek");
+
+        // The saved key is the highlighted row: Enter keeps it.
+        let p = app.picker.as_ref().unwrap();
+        assert!(matches!(p.action, PickAction::Auth));
+        assert!(p.items[p.cursor].contains("saved key …1234"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(sent_kinds(&rx), ["auth deepseek api", "switch deepseek", "models"]);
+
+        // Esc on the model list keeps the model in use and ends the setup.
+        app.handle_event(UiEvent::ModelList(vec!["deepseek-flash".into()]), &h);
+        app.do_esc(&h);
+        assert!(app.wizard.is_none() && matches!(app.mode, Mode::Idle));
+
+        // Esc walks back: key entry → sign-in → provider list.
+        app.open_provider_picker();
+        pick_row(&mut app, &h, "groq");
+        pick_row(&mut app, &h, "API key — paste");
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
+        app.do_esc(&h);
+        assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth)));
+        app.do_esc(&h);
+        assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Provider)));
+        app.do_esc(&h);
+        assert!(matches!(app.mode, Mode::Idle));
+        assert!(rx.try_iter().next().is_none(), "backing out sends nothing");
+    }
+
+    #[test]
+    fn chatgpt_sign_in_then_model_and_a_refused_key_goes_back() {
+        use crate::ui::types::{PickAction, ProviderStep};
+        let mut app = App::new(test_ui_config(), Vec::new());
+        let (h, rx) = test_handles();
+        app.open_provider_picker();
+        pick_row(&mut app, &h, "openai");
+        let p = app.picker.as_ref().unwrap();
+        assert!(p.items.iter().any(|i| i.contains("API key")));
+        pick_row(&mut app, &h, "ChatGPT subscription");
+        assert_eq!(sent_kinds(&rx), ["login openai"]);
+        assert!(matches!(app.mode, Mode::Busy), "waits for the browser");
+
+        // Esc / a failed sign-in comes back to the sign-in step with why.
+        app.handle_event(UiEvent::SignInFailed { provider: "openai".into(), error: "sign-in cancelled".into() }, &h);
+        assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth)));
+        assert!(app.wizard.as_ref().and_then(|d| d.error.as_deref()).is_some_and(|e| e.contains("cancelled")));
+        pick_row(&mut app, &h, "ChatGPT subscription");
+        let _ = sent_kinds(&rx);
+        let token = crate::config::OAuthToken { access_token: "tok".into(), ..Default::default() };
+        app.handle_event(UiEvent::SignedIn { provider: "openai".into(), token }, &h);
+        assert_eq!(sent_kinds(&rx), ["auth openai sub", "switch openai", "models"]);
+        assert!(app.settings.uses_sub() && app.settings.chatgpt_sub());
+        app.handle_event(UiEvent::ModelList(vec!["gpt-a".into(), "gpt-b".into()]), &h);
+        pick_row(&mut app, &h, "gpt-b");
+        assert_eq!(sent_kinds(&rx), ["model gpt-b"]);
+        assert!(app.transcript.iter().any(|l| l.text.contains("openai · ChatGPT sign-in · gpt-b")));
+
+        // Signed in, the sign-in step offers to keep it, re-sign or sign out.
+        app.open_provider_picker();
+        pick_row(&mut app, &h, "openai");
+        let p = app.picker.as_ref().unwrap();
+        assert!(p.items[p.cursor].contains("signed in"), "the sign-in in use is highlighted");
+        pick_row(&mut app, &h, "Sign out");
+        assert_eq!(sent_kinds(&rx), ["signout openai"]);
+        assert!(!app.settings.signed_in("openai") && !app.settings.uses_sub());
+
+        // A key the server refuses goes back to the sign-in step.
+        pick_row(&mut app, &h, "API key — paste");
+        for c in "sk-bad".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &h);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        let _ = sent_kinds(&rx);
+        app.handle_event(UiEvent::ModelListFailed("HTTP 401: invalid api key".into()), &h);
+        assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth)));
+        assert!(app.wizard.as_ref().and_then(|d| d.error.as_deref()).is_some_and(|e| e.contains("refused the key")));
+
+        // Any other failure asks for the model id by hand.
+        pick_row(&mut app, &h, "use the saved key");
+        let _ = sent_kinds(&rx);
+        app.handle_event(UiEvent::ModelListFailed("network error: timed out".into()), &h);
+        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::Model }));
+        for c in "gpt-c".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &h);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+        assert_eq!(sent_kinds(&rx), ["model gpt-c"]);
         assert!(app.wizard.is_none());
     }
 
     #[test]
-    fn provider_wizard_asks_only_for_a_missing_key_then_the_model() {
-        use crate::ui::types::ProviderStep;
-        let mut app = App::new(test_ui_config(), Vec::new());
-        let (h, rx) = test_handles();
-        app.settings.api_keys.insert("deepseek".into(), "k".into());
-        app.open_provider_picker();
-        // A preset with a key switches at once and lists models.
-        let p = app.picker.as_mut().unwrap();
-        p.cursor = p.items.iter().position(|i| i.starts_with("deepseek")).unwrap();
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        let sent: Vec<WorkerCmd> = rx.try_iter().collect();
-        assert!(matches!(&sent[0], WorkerCmd::Patch(ConfigPatch::Provider { provider, .. }) if provider == "deepseek"));
-        assert!(matches!(sent[1], WorkerCmd::ListModels));
-
-        // One without a key asks for it first (masked), and Esc cancels.
-        app.mode = Mode::Idle;
-        app.open_provider_picker();
-        let p = app.picker.as_mut().unwrap();
-        let no_key = p.items.iter().position(|i| i.contains("no key yet")).unwrap();
-        p.cursor = no_key;
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
-        assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &h);
-        assert!(matches!(app.mode, Mode::Idle));
-        assert!(rx.try_iter().next().is_none(), "cancel sends nothing");
+    fn sign_in_is_per_provider_and_offered_only_where_possible() {
+        use crate::config::{auth_methods, AuthMethod};
+        assert_eq!(auth_methods("openai"), [AuthMethod::Api, AuthMethod::Sub]);
+        assert_eq!(auth_methods("anthropic"), [AuthMethod::Api]);
+        assert_eq!(auth_methods("zai"), [AuthMethod::Api, AuthMethod::Plan]);
+        assert_eq!(auth_methods("my-box"), [AuthMethod::Api, AuthMethod::None]);
+        let mut c = crate::config::Config::default();
+        c.oauth.insert("openai".into(), crate::config::OAuthToken { access_token: "t".into(), ..Default::default() });
+        c.apply_patch(&ConfigPatch::ProviderAuth { provider: "openai".into(), mode: "sub".into() });
+        c.apply_patch(&ConfigPatch::ProviderAuth { provider: "anthropic".into(), mode: "sub".into() });
+        assert_eq!(c.auth_for("anthropic"), AuthMethod::Api, "a method the provider lacks is ignored");
+        c.apply_patch(&ConfigPatch::Provider { provider: "openai".into(), base_url: "https://api.openai.com/v1".into(), model: "m".into() });
+        assert!(c.chatgpt_sub() && c.endpoint_base() == crate::config::CHATGPT_CODEX_URL && c.bearer() == "t");
+        c.apply_patch(&ConfigPatch::Provider { provider: "deepseek".into(), base_url: "https://api.deepseek.com".into(), model: "m".into() });
+        assert!(!c.uses_sub(), "the subscription doesn't follow you to another provider");
+        c.apply_patch(&ConfigPatch::ProviderAuth { provider: "zai".into(), mode: "plan".into() });
+        c.apply_patch(&ConfigPatch::Provider { provider: "zai".into(), base_url: "https://api.z.ai/api/paas/v4".into(), model: "m".into() });
+        assert_eq!(c.endpoint_base(), "https://api.z.ai/api/coding/paas/v4");
     }
 
     #[test]

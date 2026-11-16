@@ -2,6 +2,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::Color;
+use crate::config::AuthMethod;
 use std::time::Duration;
 
 pub const SPIN_U: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -102,7 +103,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "pick a model from the provider's list"),
     ("/new", "start a new session (the current one stays saved)"),
     ("/config", "settings: provider, model, key, reasoning, …"),
-    ("/provider", "pick a provider, or add your own OpenAI-compatible one, step by step"),
+    ("/provider", "set up a provider: pick it, sign in (API key or subscription), choose the model"),
     ("/compact", "summarize older turns to free context"),
     ("/effort", "reasoning effort: auto, off, low, medium, high, xhigh, max"),
     ("/reset", "clear conversation context"),
@@ -143,10 +144,10 @@ pub const DOUBLE_PRESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// run bare); an entry ending in a space still needs an argument, so picking
 /// it fills the line instead of running it.
 pub const SLASH_OPTIONS: &[(&str, &str)] = &[
-    ("/provider list", "list every provider and whether it has a key"),
-    ("/provider add ", "add a server: /provider add (wizard) or /provider add <name> <base_url> <model>"),
+    ("/provider list", "list every provider and how it signs in"),
+    ("/provider add ", "add one: /provider add <name> <base_url> <model>"),
+    ("/provider remove ", "forget a custom provider, its key and sign-in: /provider remove <name>"),
     ("/provider edit ", "edit a custom server: /provider edit <name> (active server if omitted)"),
-    ("/provider remove ", "forget a custom provider and its saved key: /provider remove <name>"),
     ("/effort auto", "send nothing: the model's own default"),
     ("/effort off", "no reasoning (or the provider's lowest)"),
     ("/effort low", "quick, light reasoning"),
@@ -194,7 +195,7 @@ pub const SETTING_LABELS: &[&str] = &[
     "base url",
     "model",
     "api key",
-    "auth mode",
+    "sign in",
     "reasoning",
     "permissions",
     "auto-commit",
@@ -205,10 +206,9 @@ pub const SETTING_LABELS: &[&str] = &[
 ];
 
 /// The `/config` rows shown, as indexes into `SETTING_LABELS` (the panel's
-/// cursor is a position in this list). Row 4, auth mode, is hidden along with
-/// `/login`: subscription tokens only work through the vendors' own apps, and
-/// haikucode has no native adapter for them.
-pub const SETTING_ROWS: &[usize] = &[0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11];
+/// cursor is a position in this list). Sign-in sits right under the provider
+/// it belongs to.
+pub const SETTING_ROWS: &[usize] = &[0, 4, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11];
 
 #[derive(Clone, Copy)]
 pub enum BannerColor {
@@ -269,10 +269,25 @@ pub enum ProviderStep {
     Model,
 }
 
+/// One row of the `/provider` wizard's sign-in step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthChoice {
+    /// Keep what's saved for this method (a key, a sign-in).
+    Keep(AuthMethod),
+    /// Type a new key for an API-key or coding-plan method.
+    EnterKey(AuthMethod),
+    /// Sign in with the subscription in the browser.
+    SignIn,
+    /// Forget the subscription sign-in.
+    SignOut,
+    /// A keyless server.
+    NoKey,
+}
+
 /// What the `/provider` wizard has collected so far.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderDraft {
-    /// True for full add/edit setup; false when only a key is missing.
+    /// True while adding or editing a custom provider; false when setting up a known one.
     pub adding: bool,
     /// Editing a saved provider keeps its name and starts at its address.
     pub editing: bool,
@@ -282,6 +297,14 @@ pub struct ProviderDraft {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// The sign-in method chosen.
+    pub method: AuthMethod,
+    /// The sign-in step's rows, parallel to its picker's items.
+    pub choices: Vec<AuthChoice>,
+    /// A browser sign-in is in flight.
+    pub signing_in: bool,
+    /// Set up and switched; waiting on the server's model list.
+    pub waiting_models: bool,
     /// Why the last answer was refused, shown under the prompt.
     pub error: Option<String>,
 }
@@ -297,6 +320,8 @@ pub enum PickAction {
     Resume,
     /// `/provider`: switch to the chosen provider, or start adding one.
     Provider,
+    /// `/provider`'s sign-in step: an index into `ProviderDraft::choices`.
+    Auth,
 }
 
 /// State for `Mode::Select`: a filterable, scrollable list of choices.
@@ -310,6 +335,8 @@ pub struct Picker {
     pub cursor: usize,
     pub scroll: usize,
     pub action: PickAction,
+    /// A line under the title (what this step is for), if any.
+    pub hint: Option<String>,
 }
 
 /// Visible rows of a Select picker before it scrolls.
@@ -441,6 +468,7 @@ mod picker_tests {
             cursor: 0,
             scroll: 0,
             action: PickAction::Model,
+            hint: None,
         }
     }
 

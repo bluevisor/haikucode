@@ -104,10 +104,15 @@ pub struct Config {
     /// Per-provider subscription-login tokens (OAuth). Keyed by provider name.
     #[serde(default)]
     pub oauth: BTreeMap<String, OAuthToken>,
-    /// Credential source for the active provider: "api" (API key) or "sub"
-    /// (subscription / OAuth login). Defaults to API key.
+    /// Credential source for the active provider (mirrors its `auth_modes`
+    /// entry; see `AuthMethod`). Not persisted itself.
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
+    /// How each provider signs in, by name: "api" (API key, the default),
+    /// "sub" (subscription login), "plan" (a coding-plan key on the plan's
+    /// own endpoint) or "none" (a keyless custom server).
+    #[serde(default)]
+    pub auth_modes: BTreeMap<String, String>,
     #[serde(default = "default_theme")]
     pub theme: String,
     /// Model context window, for the ctx usage bar.
@@ -248,6 +253,100 @@ impl PriceList {
     }
 }
 
+/// ChatGPT sign-ins talk to the Codex backend, not api.openai.com.
+pub const CHATGPT_CODEX_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+/// One way to authenticate with a provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// A pay-as-you-go API key.
+    #[default]
+    Api,
+    /// A subscription login in the browser (OAuth).
+    Sub,
+    /// A coding-plan key, sent to the plan's own endpoint.
+    Plan,
+    /// No credentials (a local or open server).
+    None,
+}
+
+impl AuthMethod {
+    pub fn id(self) -> &'static str {
+        match self {
+            AuthMethod::Api => "api",
+            AuthMethod::Sub => "sub",
+            AuthMethod::Plan => "plan",
+            AuthMethod::None => "none",
+        }
+    }
+
+    pub fn parse(s: &str) -> AuthMethod {
+        match s.trim() {
+            "sub" | "subscription" | "oauth" => AuthMethod::Sub,
+            "plan" | "coding_plan" => AuthMethod::Plan,
+            "none" => AuthMethod::None,
+            _ => AuthMethod::Api,
+        }
+    }
+}
+
+/// The sign-in methods `provider` offers, the default (API key) first.
+pub fn auth_methods(provider: &str) -> Vec<AuthMethod> {
+    if !is_builtin_provider(provider) {
+        return vec![AuthMethod::Api, AuthMethod::None];
+    }
+    let mut v = vec![AuthMethod::Api];
+    if crate::auth::sub_supported(provider) {
+        v.push(AuthMethod::Sub);
+    }
+    if coding_plan_url(provider).is_some() {
+        v.push(AuthMethod::Plan);
+    }
+    v
+}
+
+/// A provider's subscription coding plan that is used with a key of its own
+/// on a separate endpoint (Z.ai's GLM Coding Plan).
+pub fn coding_plan_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        "zai" => Some("https://api.z.ai/api/coding/paas/v4"),
+        _ => None,
+    }
+}
+
+/// What the coding plan is called, for the UI.
+pub fn coding_plan_label(provider: &str) -> &'static str {
+    match provider {
+        "zai" => "GLM Coding Plan",
+        _ => "coding plan",
+    }
+}
+
+/// Where to get an API key for a preset, for the key prompt.
+pub fn key_url(provider: &str, plan: bool) -> Option<&'static str> {
+    Some(match (provider, plan) {
+        ("zai", true) => "z.ai/subscribe (then z.ai/manage-apikey/apikey-list)",
+        ("deepseek", _) => "platform.deepseek.com/api_keys",
+        ("openai", _) => "platform.openai.com/api-keys",
+        ("anthropic", _) => "console.anthropic.com/settings/keys",
+        ("groq", _) => "console.groq.com/keys",
+        ("openrouter", _) => "openrouter.ai/settings/keys",
+        ("google", _) => "aistudio.google.com/apikey",
+        ("zai", _) => "z.ai/manage-apikey/apikey-list",
+        ("vercel", _) => "vercel.com → AI Gateway → API Keys",
+        _ => return None,
+    })
+}
+
+/// Why a preset has no subscription sign-in, when people often look for one.
+pub fn no_sub_reason(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("Claude Pro/Max sign-in isn't available: Anthropic only allows it in its own apps"),
+        "google" => Some("Gemini sign-in isn't available yet: it needs Google's Code Assist API"),
+        _ => None,
+    }
+}
+
 /// Is `name` one of the built-in presets in `PROVIDERS`?
 pub fn is_builtin_provider(name: &str) -> bool {
     PROVIDERS.iter().any(|(n, _, _)| *n == name)
@@ -384,7 +483,13 @@ pub enum ConfigPatch {
     AutoCommit(bool),
     ContextWindow(u32),
     MaxToolCalls(u32),
-    AuthMode(String),
+    /// One provider's sign-in method, active or not (the `/provider` wizard
+    /// sets it before switching).
+    ProviderAuth { provider: String, mode: String },
+    /// A subscription login finished: keep its token.
+    SignedIn { provider: String, token: OAuthToken },
+    /// Forget a provider's subscription login (back to its API key).
+    SignOut(String),
     /// ISO code the price list is quoted in (see `Config::price_currency`).
     PriceCurrency(String),
 }
@@ -488,6 +593,7 @@ impl Default for Config {
             api_keys: BTreeMap::new(),
             oauth: BTreeMap::new(),
             auth_mode: default_auth_mode(),
+            auth_modes: BTreeMap::new(),
             theme: default_theme(),
             context_window: default_ctx(),
             context_window_explicit: false,
@@ -790,9 +896,15 @@ impl Config {
         if let Some(s) = v.get("permission").and_then(|x| x.as_str()) {
             cfg.permission = s.to_string();
         }
-        // `auth_mode` is deliberately not read while `/login` is hidden:
-        // with no UI to switch back, a stale "sub" would strand the
-        // config on a token the provider's API doesn't accept.
+        // The old global `auth_mode` is deliberately not read: it predates
+        // per-provider sign-in, and a stale "sub" would follow every provider.
+        if let Some(map) = v.get("auth_modes").and_then(|x| x.as_object()) {
+            for (k, val) in map {
+                if let Some(s) = val.as_str() {
+                    cfg.auth_modes.insert(k.clone(), s.to_string());
+                }
+            }
+        }
         if let Some(n) = v.get("max_tool_calls").and_then(|x| x.as_u64()) {
             cfg.max_tool_calls = n as u32;
         }
@@ -890,6 +1002,7 @@ impl Config {
         }
         // Resolve the effective key from the per-provider map.
         cfg.resolve_key();
+        cfg.sync_auth_mode();
         // The top-level price fields mirror the active provider's list.
         cfg.sync_prices();
         cfg
@@ -1010,8 +1123,8 @@ impl Config {
         if on_disk.permission != default_permission() {
             json["permission"] = serde_json::json!(on_disk.permission);
         }
-        if on_disk.auth_mode != default_auth_mode() {
-            json["auth_mode"] = serde_json::json!(on_disk.auth_mode);
+        if !on_disk.auth_modes.is_empty() {
+            json["auth_modes"] = serde_json::to_value(&on_disk.auth_modes).unwrap_or_default();
         }
         if on_disk.max_tool_calls != default_max_tool_calls() {
             json["max_tool_calls"] = serde_json::json!(on_disk.max_tool_calls);
@@ -1050,6 +1163,9 @@ impl Config {
     /// Messages API for the anthropic preset, OpenAI's Responses API for the
     /// openai preset, and chat/completions for everyone else.
     pub fn api_kind(&self) -> ApiKind {
+        if self.chatgpt_sub() {
+            return ApiKind::Responses; // the Codex backend speaks only Responses
+        }
         match self.api.as_deref().map(str::trim) {
             Some("messages" | "anthropic") => ApiKind::Messages,
             Some("responses") => ApiKind::Responses,
@@ -1203,11 +1319,9 @@ impl Config {
     /// The Bearer credential to send for the active provider: the subscription
     /// access token in "sub" mode (when present), otherwise the API key.
     pub fn bearer(&self) -> &str {
-        if self.auth_mode == "sub" {
+        if self.uses_sub() {
             if let Some(t) = self.oauth.get(&self.provider) {
-                if !t.access_token.is_empty() {
-                    return &t.access_token;
-                }
+                return &t.access_token;
             }
         }
         &self.api_key
@@ -1246,11 +1360,94 @@ impl Config {
         let _ = disk.save();
     }
 
-    /// Resolve the effective API key for the current provider from the per-provider
-    /// map. Does NOT check env vars.
+    /// Resolve the effective API key for the current provider: its saved key,
+    /// else its environment variable (so a provider whose key lives only in
+    /// the environment works after a switch, as the picker promises).
     pub fn resolve_key(&mut self) {
         self.api_key = self.api_keys.get(&self.provider).cloned().unwrap_or_default();
         self.key_from_env = false;
+        if self.api_key.is_empty() {
+            if let Some(k) = key_env_vars(&self.provider)
+                .iter()
+                .filter_map(|v| std::env::var(v).ok())
+                .find(|k| !k.is_empty())
+            {
+                self.api_key = k;
+                self.key_from_env = true;
+            }
+        }
+    }
+
+    /// How `provider` signs in: its saved choice when the provider offers
+    /// it, else an API key.
+    pub fn auth_for(&self, provider: &str) -> AuthMethod {
+        self.auth_modes
+            .get(provider)
+            .map(|m| AuthMethod::parse(m))
+            .filter(|m| auth_methods(provider).contains(m))
+            .unwrap_or(AuthMethod::Api)
+    }
+
+    /// The active provider's sign-in method.
+    pub fn auth(&self) -> AuthMethod {
+        self.auth_for(&self.provider)
+    }
+
+    /// Mirror the active provider's sign-in method into `auth_mode`.
+    pub fn sync_auth_mode(&mut self) {
+        self.auth_mode = self.auth().id().to_string();
+    }
+
+    /// Is `provider` signed in with a subscription token?
+    pub fn signed_in(&self, provider: &str) -> bool {
+        self.oauth.get(provider).is_some_and(|t| !t.access_token.is_empty())
+    }
+
+    /// Does the active provider send a subscription token (not an API key)?
+    pub fn uses_sub(&self) -> bool {
+        self.auth() == AuthMethod::Sub && self.signed_in(&self.provider)
+    }
+
+    /// Signed in to OpenAI with ChatGPT: requests go to the Codex backend.
+    pub fn chatgpt_sub(&self) -> bool {
+        self.provider == "openai" && self.uses_sub()
+    }
+
+    /// The base URL requests go to: the configured one, except where the
+    /// sign-in method has its own endpoint (ChatGPT's Codex backend, a
+    /// coding plan's URL).
+    pub fn endpoint_base(&self) -> String {
+        if self.chatgpt_sub() {
+            return std::env::var("HAIKUCODE_CHATGPT_BASE_URL")
+                .ok()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| CHATGPT_CODEX_URL.to_string());
+        }
+        if self.auth() == AuthMethod::Plan {
+            if let Some(u) = coding_plan_url(&self.provider) {
+                return u.to_string();
+            }
+        }
+        self.base_url.clone()
+    }
+
+    /// Can `provider` make requests as set up: a key for "api" / "plan", a
+    /// token for "sub", nothing for a keyless server?
+    pub fn has_credentials_for(&self, provider: &str) -> bool {
+        match self.auth_for(provider) {
+            AuthMethod::Api | AuthMethod::Plan => self.has_key_for(provider),
+            AuthMethod::Sub => self.signed_in(provider),
+            AuthMethod::None => true,
+        }
+    }
+
+    /// `has_credentials_for` the active provider (its resolved key counts).
+    pub fn has_credentials(&self) -> bool {
+        match self.auth() {
+            AuthMethod::Api | AuthMethod::Plan => !self.api_key.is_empty(),
+            AuthMethod::Sub => self.signed_in(&self.provider),
+            AuthMethod::None => true,
+        }
     }
 
     pub fn apply_patch(&mut self, p: &ConfigPatch) {
@@ -1259,8 +1456,10 @@ impl Config {
                 self.provider = provider.clone();
                 self.base_url = base_url.clone();
                 self.model = model.clone();
-                // Swap to the new provider's saved key (or empty).
+                // Swap to the new provider's saved key (or empty) and its
+                // sign-in method.
                 self.resolve_key();
+                self.sync_auth_mode();
                 // The cost counter follows the provider: its price list (the
                 // user-set one, else the built-in table, else hidden).
                 self.sync_prices();
@@ -1280,6 +1479,26 @@ impl Config {
                 self.custom_providers.retain(|c| &c.name != name);
                 self.api_keys.remove(name);
                 self.oauth.remove(name);
+                self.auth_modes.remove(name);
+            }
+            ConfigPatch::ProviderAuth { provider, mode } => {
+                let m = AuthMethod::parse(mode);
+                if m == AuthMethod::Api {
+                    self.auth_modes.remove(provider);
+                } else if auth_methods(provider).contains(&m) {
+                    self.auth_modes.insert(provider.clone(), m.id().to_string());
+                }
+                self.sync_auth_mode();
+            }
+            ConfigPatch::SignedIn { provider, token } => {
+                self.oauth.insert(provider.clone(), token.clone());
+            }
+            ConfigPatch::SignOut(provider) => {
+                self.oauth.remove(provider);
+                if self.auth_for(provider) == AuthMethod::Sub {
+                    self.auth_modes.remove(provider);
+                }
+                self.sync_auth_mode();
             }
             ConfigPatch::BaseUrl(u) => {
                 self.base_url = u.clone();
@@ -1295,9 +1514,6 @@ impl Config {
             ConfigPatch::AutoCommit(b) => self.auto_commit = *b,
             ConfigPatch::ContextWindow(n) => self.set_context_window(*n),
             ConfigPatch::MaxToolCalls(n) => self.max_tool_calls = *n,
-            ConfigPatch::AuthMode(m) => {
-                self.auth_mode = if m == "sub" { "sub".into() } else { "api".into() };
-            }
             ConfigPatch::PriceCurrency(c) => {
                 let c = c.trim().to_ascii_uppercase();
                 let c = if c.is_empty() {
@@ -1818,58 +2034,179 @@ fn set_private(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn set_private(_path: &std::path::Path) {}
 
-/// Interactive first-run setup, executed before the TUI starts (cooked stdin).
+/// Interactive first-run setup, executed before the TUI starts (cooked stdin):
+/// the same three steps as `/provider` — provider, sign-in, model.
 pub fn run_setup() -> Result<Config> {
     let mut cfg = Config::load();
-    println!("\x1b[1mhaikucode setup\x1b[0m");
-    println!("Provider:");
-    for (i, (name, _, _)) in PROVIDERS.iter().enumerate() {
-        let default = if i == 0 { " (default)" } else { "" };
-        println!("  {}) {name}{default}", i + 1);
+    let bold = |t: &str| println!("\n\x1b[1m{t}\x1b[0m");
+    let dim = |t: &str| println!("\x1b[2m  {t}\x1b[0m");
+    let err = |t: &str| println!("\x1b[31m  {t}\x1b[0m");
+    println!("\x1b[1mhaikucode setup\x1b[0m  \x1b[2m(Enter takes the [default]; Ctrl+C quits)\x1b[0m");
+
+    // Step 1: provider.
+    bold("Step 1 of 3 · Provider");
+    let width = PROVIDERS.iter().map(|(n, _, _)| n.len()).max().unwrap_or(8);
+    let current = PROVIDERS.iter().position(|(n, _, _)| *n == cfg.provider).unwrap_or(0);
+    for (i, (name, base, _)) in PROVIDERS.iter().enumerate() {
+        let ways = auth_methods(name)
+            .iter()
+            .map(|m| method_short(name, *m))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let host = base.split('/').nth(2).unwrap_or(base);
+        println!("  {:>2}) {name:<width$}  \x1b[2m{host} · {ways}\x1b[0m", i + 1);
     }
     let custom_n = PROVIDERS.len() + 1;
-    println!("  {custom_n}) custom");
-    let choice = prompt("> [1] ")?;
-    let n = choice.trim().parse::<usize>().unwrap_or(1);
+    println!("  {custom_n:>2}) {:<width$}  \x1b[2many OpenAI-compatible URL (LiteLLM, Ollama, LM Studio, …)\x1b[0m", "custom");
+    let n = loop {
+        let choice = prompt(&format!("> [{}] ", current + 1))?;
+        if choice.is_empty() {
+            break current + 1;
+        }
+        match choice.parse::<usize>() {
+            Ok(n) if (1..=custom_n).contains(&n) => break n,
+            _ => match PROVIDERS.iter().position(|(p, _, _)| *p == choice) {
+                Some(i) => break i + 1,
+                None => err(&format!("pick 1 to {custom_n}, or type a provider's name")),
+            },
+        }
+    };
     let custom = n == custom_n;
-    let (prov, base, model): (String, String, String) = if custom {
+    let (prov, base, default_model): (String, String, String) = if custom {
         let p = loop {
-            let p = prompt("provider name [custom]: ")?;
-            let p = if p.trim().is_empty() { "custom".to_string() } else { p.trim().to_string() };
+            let p = prompt("  name [custom]: ")?;
+            let p = nonempty(p, "custom");
             match valid_custom_name(&p) {
                 Ok(()) => break p,
-                Err(e) => println!("\x1b[31m  {e}\x1b[0m"),
+                Err(e) => err(&e),
             }
         };
+        let saved = cfg.custom_provider(&p).cloned();
         let b = loop {
-            let b = prompt("base_url (OpenAI-compatible): ")?;
+            let hint = saved.as_ref().map(|c| format!(" [{}]", c.base_url)).unwrap_or_default();
+            dim("the OpenAI-compatible endpoint, e.g. http://localhost:11434/v1");
+            let b = prompt(&format!("  base URL{hint}: "))?;
+            let b = nonempty(b, saved.as_ref().map(|c| c.base_url.as_str()).unwrap_or(""));
             match normalize_provider_url(&b) {
                 Ok(b) => break b,
-                Err(e) => println!("\x1b[31m  {e}\x1b[0m"),
+                Err(e) => err(&e),
             }
         };
-        let m = loop {
-            let m = prompt("model: ")?;
-            let m = m.trim().to_string();
-            if !m.is_empty() {
-                break m;
-            }
-            println!("\x1b[31m  model is required\x1b[0m");
-        };
-        (p, b, m)
+        (p, b, saved.map(|c| c.model).unwrap_or_default())
     } else {
-        let (p, b, m) = PROVIDERS[n.saturating_sub(1).min(PROVIDERS.len() - 1)];
+        let (p, b, m) = PROVIDERS[n - 1];
         (p.into(), b.into(), m.into())
     };
-    let model = if custom {
-        model
+    cfg.provider = prov.clone();
+    cfg.base_url = base.clone();
+    cfg.resolve_key();
+
+    // Step 2: sign in.
+    bold(&format!("Step 2 of 3 · Sign in to {prov}"));
+    let methods = auth_methods(&prov);
+    if let Some(why) = no_sub_reason(&prov) {
+        dim(why);
+    }
+    let method = if methods.len() == 1 {
+        methods[0]
     } else {
-        let m = prompt(&format!("model [{model}]: "))?;
-        nonempty(m, &model)
+        let cur = methods.iter().position(|m| *m == cfg.auth_for(&prov)).unwrap_or(0);
+        for (i, m) in methods.iter().enumerate() {
+            println!("  {}) {}", i + 1, method_long(&prov, *m, &cfg));
+        }
+        loop {
+            let c = prompt(&format!("> [{}] ", cur + 1))?;
+            if c.is_empty() {
+                break methods[cur];
+            }
+            match c.parse::<usize>() {
+                Ok(i) if (1..=methods.len()).contains(&i) => break methods[i - 1],
+                _ => err(&format!("pick 1 to {}", methods.len())),
+            }
+        }
     };
-    let key = prompt("API key: ")?;
-    cfg.provider = prov;
-    cfg.base_url = base;
+    if method == AuthMethod::Api {
+        cfg.auth_modes.remove(&prov);
+    } else {
+        cfg.auth_modes.insert(prov.clone(), method.id().to_string());
+    }
+    cfg.sync_auth_mode();
+    match method {
+        AuthMethod::Api | AuthMethod::Plan => {
+            if let Some(url) = key_url(&prov, method == AuthMethod::Plan) {
+                dim(&format!("get one at {url}"));
+            }
+            let saved = cfg.api_keys.get(&prov).filter(|k| !k.is_empty()).map(|k| key_tail(k));
+            let label = if method == AuthMethod::Plan { coding_plan_label(&prov) } else { "API" };
+            let key = loop {
+                let hint = match &saved {
+                    Some(t) => format!(" [saved …{t}, Enter keeps it]"),
+                    None if custom => " [none]".into(),
+                    None => String::new(),
+                };
+                let k = prompt_secret(&format!("  {label} key{hint} (hidden): "))?;
+                if !k.is_empty() || saved.is_some() || custom {
+                    break k;
+                }
+                err("paste a key (or Ctrl+C and pick another provider)");
+            };
+            if !key.is_empty() {
+                cfg.api_keys.insert(prov.clone(), key.clone());
+                cfg.api_key = key;
+                cfg.key_from_env = false;
+            }
+        }
+        AuthMethod::Sub => {
+            let p = crate::auth::provider(&prov).ok_or_else(|| anyhow::anyhow!("{prov} has no subscription sign-in"))?;
+            let login = crate::auth::start(p)?;
+            println!("  Opening your browser to sign in with {}.", crate::auth::sub_label(&prov));
+            dim(&format!("if it didn't open, visit: {}", login.url));
+            let token = login.finish()?;
+            cfg.oauth.insert(prov.clone(), token);
+            println!("\x1b[32m  signed in\x1b[0m");
+        }
+        AuthMethod::None => dim("no key: requests go out without an Authorization header"),
+    }
+
+    // Step 3: model, from the server's list when it answers.
+    bold("Step 3 of 3 · Model");
+    let default_model = if cfg.chatgpt_sub() { String::new() } else { default_model };
+    let ids = match crate::api::list_models(&crate::api::agent_http(), &cfg) {
+        Ok(ids) => crate::api::chat_models(ids),
+        Err(e) => {
+            err(&format!("couldn't load the model list: {}", crate::api::truncate(&e.to_string(), 200)));
+            if matches!(method, AuthMethod::Api | AuthMethod::Plan) && e.to_string().contains("HTTP 401") {
+                dim("the key was refused: run `haikucode --config` again to re-enter it");
+            }
+            Vec::new()
+        }
+    };
+    let default_model = if default_model.is_empty() || (!ids.is_empty() && !ids.contains(&default_model)) {
+        ids.first().cloned().unwrap_or(default_model)
+    } else {
+        default_model
+    };
+    const SHOWN: usize = 30;
+    for (i, id) in ids.iter().take(SHOWN).enumerate() {
+        let mark = if *id == default_model { "  (default)" } else { "" };
+        println!("  {:>2}) {id}{mark}", i + 1);
+    }
+    if ids.len() > SHOWN {
+        dim(&format!("…and {} more: type any model id", ids.len() - SHOWN));
+    }
+    let model = loop {
+        let hint = if default_model.is_empty() { String::new() } else { format!(" [{default_model}]") };
+        let ask = if ids.is_empty() { "  model id" } else { "  number or model id" };
+        let m = prompt(&format!("{ask}{hint}: "))?;
+        let m = match m.parse::<usize>() {
+            Ok(i) if (1..=ids.len().min(SHOWN)).contains(&i) => ids[i - 1].clone(),
+            _ => nonempty(m, &default_model),
+        };
+        if !m.is_empty() {
+            break m;
+        }
+        err("a model id is required");
+    };
     cfg.model = model;
     if custom {
         cfg.custom_providers.retain(|c| c.name != cfg.provider);
@@ -1879,14 +2216,81 @@ pub fn run_setup() -> Result<Config> {
             model: cfg.model.clone(),
         });
     }
-    if !key.is_empty() {
-        cfg.api_key = key.clone();
-        cfg.api_keys.insert(cfg.provider.clone(), key);
-        cfg.key_from_env = false;
+    if !cfg.context_window_explicit {
+        cfg.context_window = known_context_window(&cfg.model);
     }
+    cfg.sync_prices();
     cfg.save()?;
-    println!("\x1b[32msaved {}\x1b[0m", config_path().display());
+    println!(
+        "\n\x1b[32m✓ {} · {} · {}\x1b[0m  \x1b[2msaved {}\x1b[0m",
+        cfg.provider,
+        method_short(&cfg.provider, method),
+        cfg.model,
+        config_path().display()
+    );
     Ok(cfg)
+}
+
+/// A sign-in method in a few words, e.g. "API key" or "ChatGPT sign-in".
+pub fn method_short(provider: &str, m: AuthMethod) -> String {
+    match m {
+        AuthMethod::Api => "API key".into(),
+        AuthMethod::Sub => format!("{} sign-in", crate::auth::sub_label(provider)),
+        AuthMethod::Plan => coding_plan_label(provider).into(),
+        AuthMethod::None => "no key".into(),
+    }
+}
+
+/// A sign-in method as a menu line, with what's already saved for it.
+pub fn method_long(provider: &str, m: AuthMethod, cfg: &Config) -> String {
+    let saved_key = cfg.api_keys.get(provider).filter(|k| !k.is_empty()).map(|k| key_tail(k));
+    match m {
+        AuthMethod::Api => match saved_key {
+            Some(t) if cfg.auth_for(provider) == AuthMethod::Api => format!("API key — saved …{t}"),
+            _ => "API key — pay as you go".into(),
+        },
+        AuthMethod::Sub if cfg.signed_in(provider) => {
+            format!("{} subscription — signed in", crate::auth::sub_label(provider))
+        }
+        AuthMethod::Sub => match provider {
+            "openai" => "ChatGPT subscription (Plus / Pro / Business) — sign in in your browser".into(),
+            _ => "subscription — sign in in your browser".into(),
+        },
+        AuthMethod::Plan => match saved_key {
+            Some(t) if cfg.auth_for(provider) == AuthMethod::Plan => {
+                format!("{} — saved key …{t}", coding_plan_label(provider))
+            }
+            _ => format!("{} — a subscription key, on the plan's own endpoint", coding_plan_label(provider)),
+        },
+        AuthMethod::None => "no key — a local or open server".into(),
+    }
+}
+
+/// The last four characters of a key, for "saved …abcd".
+pub fn key_tail(k: &str) -> String {
+    let n = k.chars().count();
+    k.chars().skip(n.saturating_sub(4)).collect()
+}
+
+/// `prompt` without echoing what's typed (`stty -echo`), for keys.
+fn prompt_secret(msg: &str) -> Result<String> {
+    use std::process::{Command, Stdio};
+    let stty = |arg: &str| {
+        Command::new("stty")
+            .arg(arg)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let hidden = stty("-echo");
+    let line = prompt(msg);
+    if hidden {
+        stty("echo");
+        println!();
+    }
+    line
 }
 
 fn prompt(msg: &str) -> Result<String> {

@@ -1,7 +1,13 @@
-//! OAuth 2.0 (PKCE) "subscription login" for providers that authenticate with
-//! an account rather than a pay-as-you-go API key: Anthropic (Claude Pro/Max),
-//! OpenAI (ChatGPT) and Google (Gemini). The browser is opened to the
-//! provider's consent page and the redirect is caught on a localhost listener.
+//! OAuth 2.0 (PKCE) "subscription login" for providers that let a coding tool
+//! authenticate with an account rather than a pay-as-you-go API key: today
+//! OpenAI (ChatGPT Plus/Pro/Business, via the Codex backend). The browser is
+//! opened to the provider's consent page and the redirect is caught on a
+//! localhost listener. The same PKCE machinery serves MCP server logins.
+//!
+//! Not offered: Anthropic (its terms don't allow Claude Pro/Max sign-in in
+//! third-party apps; use an API key) and Google (a Gemini sign-in only works
+//! against the Code Assist API, a different protocol from the OpenAI-compatible
+//! endpoint used here).
 //!
 //! Zero external crates — SHA-256, base64url, a CSPRNG (`/dev/urandom`) and
 //! percent-encoding are implemented here so the Pi-Zero build stays tiny, the
@@ -41,23 +47,9 @@ pub struct OAuthProvider {
 
 /// Built-in defaults, overridable via `HAIKUCODE_OAUTH_<PROVIDER>_<FIELD>` env vars
 /// (e.g. `HAIKUCODE_OAUTH_ANTHROPIC_CLIENT_ID`). Returns None for providers that
-/// don't support subscription login (e.g. deepseek — API key only).
+/// don't support subscription login (every provider but openai: API key only).
 pub fn provider(name: &str) -> Option<OAuthProvider> {
     let mut p = match name {
-        "anthropic" => OAuthProvider {
-            key: "anthropic".into(),
-            label: "Claude Pro/Max".into(),
-            auth_url: "https://claude.ai/oauth/authorize".into(),
-            token_url: "https://console.anthropic.com/v1/oauth/token".into(),
-            // Claude Code's public client id.
-            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".into(),
-            client_secret: String::new(),
-            scope: "org:create_api_key user:profile user:inference".into(),
-            redirect_port: 54545,
-            redirect_path: "/callback".into(),
-            extra: vec![],
-            token_extra: vec![],
-        },
         "openai" => OAuthProvider {
             key: "openai".into(),
             label: "ChatGPT".into(),
@@ -72,28 +64,6 @@ pub fn provider(name: &str) -> Option<OAuthProvider> {
             extra: vec![
                 ("prompt".into(), "login".into()),
                 ("id_token_add_organizations".into(), "true".into()),
-            ],
-            token_extra: vec![],
-        },
-        "google" => OAuthProvider {
-            key: "google".into(),
-            label: "Gemini".into(),
-            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
-            token_url: "https://oauth2.googleapis.com/token".into(),
-            // Google requires a registered client id + secret; supply your own
-            // (or Gemini CLI's public desktop pair) via
-            // HAIKUCODE_OAUTH_GOOGLE_CLIENT_ID / HAIKUCODE_OAUTH_GOOGLE_CLIENT_SECRET.
-            client_id: String::new(),
-            client_secret: String::new(),
-            scope: "https://www.googleapis.com/auth/cloud-platform \
-                    https://www.googleapis.com/auth/userinfo.email \
-                    https://www.googleapis.com/auth/userinfo.profile"
-                .into(),
-            redirect_port: 8085,
-            redirect_path: "/oauth2callback".into(),
-            extra: vec![
-                ("access_type".into(), "offline".into()),
-                ("prompt".into(), "consent".into()),
             ],
             token_extra: vec![],
         },
@@ -118,7 +88,20 @@ pub fn provider(name: &str) -> Option<OAuthProvider> {
 
 /// Provider keys that support subscription login, for help text / completion.
 pub fn supported() -> &'static [&'static str] {
-    &["anthropic", "openai", "google"]
+    &["openai"]
+}
+
+/// Can `name` sign in with a subscription instead of an API key?
+pub fn sub_supported(name: &str) -> bool {
+    supported().contains(&name)
+}
+
+/// What the subscription sign-in is called for `name`, for the UI.
+pub fn sub_label(name: &str) -> &'static str {
+    match name {
+        "openai" => "ChatGPT",
+        _ => "subscription",
+    }
 }
 
 /// A login in progress: the authorize URL to show the user and the bound
@@ -191,8 +174,13 @@ impl Login {
     /// Open the browser, wait (up to 5 min) for the redirect, then exchange the
     /// authorization code for tokens.
     pub fn finish(self) -> Result<OAuthToken> {
+        self.finish_or_cancel(&std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// `finish`, giving up as soon as `cancel` is set (Esc in the TUI).
+    pub fn finish_or_cancel(self, cancel: &std::sync::atomic::AtomicBool) -> Result<OAuthToken> {
         open_browser(&self.url);
-        let code = wait_for_code(&self.listener, &self.state)?;
+        let code = wait_for_code(&self.listener, &self.state, cancel)?;
         exchange_code(&self.provider, &code, &self.verifier, &self.redirect_uri)
     }
 }
@@ -305,7 +293,7 @@ fn jwt_account_id(jwt: &str) -> Option<String> {
 
 /// Block on the listener until the OAuth redirect arrives (5-minute deadline),
 /// validate `state`, reply with a friendly page, and return the code.
-fn wait_for_code(listener: &TcpListener, expect_state: &str) -> Result<String> {
+fn wait_for_code(listener: &TcpListener, expect_state: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| anyhow!("listener setup failed: {e}"))?;
@@ -313,6 +301,9 @@ fn wait_for_code(listener: &TcpListener, expect_state: &str) -> Result<String> {
     loop {
         if Instant::now() >= deadline {
             bail!("login timed out after 5 minutes with no browser redirect");
+        }
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("sign-in cancelled");
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -654,17 +645,21 @@ mod tests {
 
     #[test]
     fn authorize_url_has_pkce_and_redirect() {
-        let p = provider("anthropic").unwrap();
+        let p = provider("openai").unwrap();
         let lg = start(p).unwrap();
         assert!(lg.url.contains("code_challenge_method=S256"));
         assert!(lg.url.contains("code_challenge="));
-        assert!(lg.url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback"));
-        assert!(lg.url.starts_with("https://claude.ai/oauth/authorize?"));
+        assert!(lg.url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+        assert!(lg.url.starts_with("https://auth.openai.com/oauth/authorize?"));
     }
 
     #[test]
-    fn unknown_provider_has_no_oauth() {
+    fn only_providers_that_allow_it_offer_a_subscription() {
         assert!(provider("deepseek").is_none());
+        assert!(sub_supported("openai"));
+        // Anthropic doesn't allow Pro/Max sign-in in third-party apps.
+        assert!(!sub_supported("anthropic") && provider("anthropic").is_none());
+        assert!(!sub_supported("google"));
     }
 
     fn hex(b: &[u8]) -> String {

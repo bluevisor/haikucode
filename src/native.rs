@@ -335,7 +335,7 @@ pub(crate) fn anthropic_stream(
     mut on_content: impl FnMut(&str),
     mut on_reasoning: impl FnMut(&str),
 ) -> Result<Streamed> {
-    let url = format!("{}/messages", cfg.base_url.trim_end_matches('/'));
+    let url = format!("{}/messages", cfg.endpoint_base().trim_end_matches('/'));
     let resp = post_json(http, cfg, &url, &anthropic_body(cfg, messages, tools))?;
     let mut acc = AnthropicAcc::default();
     let mut done = false;
@@ -474,7 +474,22 @@ pub(crate) fn responses_body(cfg: &Config, messages: &[Message], tools: Option<&
             body["tool_choice"] = json!("auto");
         }
     }
-    if let Some(t) = cfg.temperature() {
+    if cfg.chatgpt_sub() {
+        // The Codex backend takes the system prompt as `instructions` (it
+        // refuses system turns in `input`) and sets its own sampling.
+        let mut instructions = Vec::new();
+        if let Some(items) = body["input"].as_array_mut() {
+            items.retain(|it| {
+                if it.get("role").and_then(|r| r.as_str()) == Some("system") {
+                    instructions.push(it["content"].as_str().unwrap_or_default().to_string());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        body["instructions"] = json!(instructions.join("\n\n"));
+    } else if let Some(t) = cfg.temperature() {
         body["temperature"] = json!(t);
     }
     let reasoner = openai_reasoning_model(&cfg.model);
@@ -598,7 +613,7 @@ pub(crate) fn responses_stream(
     mut on_content: impl FnMut(&str),
     mut on_reasoning: impl FnMut(&str),
 ) -> Result<Streamed> {
-    let url = format!("{}/responses", cfg.base_url.trim_end_matches('/'));
+    let url = format!("{}/responses", cfg.endpoint_base().trim_end_matches('/'));
     let resp = post_json(http, cfg, &url, &responses_body(cfg, messages, tools))?;
     let mut acc = ResponsesAcc::default();
     let mut done = false;
