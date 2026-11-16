@@ -241,6 +241,8 @@ fn render_for_summary(messages: &[Message]) -> String {
     api::truncate(&out, 300_000)
 }
 
+/// Crude size estimate (~4 chars/token, ~1000 tokens per image) for the
+/// post-compaction context bar.
 pub(super) fn estimate_tokens(messages: &[Message]) -> u32 {
     let chars: usize = messages
         .iter()

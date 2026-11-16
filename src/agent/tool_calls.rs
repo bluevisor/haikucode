@@ -504,8 +504,6 @@ impl Worker {
     }
 }
 
-/// Crude size estimate (~4 chars/token, ~1000 tokens per image) for the
-/// post-compaction context bar.
 /// One tool call from the model, parsed once.
 struct Call {
     id: String,
