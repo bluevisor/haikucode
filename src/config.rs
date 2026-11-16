@@ -201,6 +201,13 @@ pub struct Config {
     /// like the presets. Their keys live in `api_keys` under their name.
     #[serde(default)]
     pub custom_providers: Vec<CustomProvider>,
+    /// What each built-in provider was last used with (`presets` in
+    /// config.json): its model, and its base URL when that isn't the
+    /// preset's (a proxy). Custom providers keep theirs in
+    /// `custom_providers`; this gives the presets the same memory, so
+    /// switching away and back doesn't reset them.
+    #[serde(default)]
+    pub presets: BTreeMap<String, PresetState>,
     /// User-set price lists, per provider (the cost counter follows the active
     /// provider). Built-ins fall back to `PRICES`; a custom provider without
     /// one has no known cost and its readout is hidden.
@@ -218,6 +225,15 @@ pub struct Config {
 pub struct CustomProvider {
     pub name: String,
     pub base_url: String,
+    pub model: String,
+}
+
+/// A built-in provider's remembered state (see `Config::presets`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PresetState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default)]
     pub model: String,
 }
 
@@ -646,6 +662,7 @@ impl Default for Config {
             price_cached_in: None,
             key_from_env: false,
             custom_providers: Vec::new(),
+            presets: BTreeMap::new(),
             prices: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
@@ -995,6 +1012,16 @@ impl Config {
                 cfg.extra.insert("prices".into(), m.clone());
             }
         }
+        if let Some(obj) = v.get("presets").and_then(|x| x.as_object()) {
+            for (k, val) in obj {
+                if !is_builtin_provider(k) {
+                    continue;
+                }
+                if let Ok(p) = serde_json::from_value::<PresetState>(val.clone()) {
+                    cfg.presets.insert(k.clone(), p);
+                }
+            }
+        }
         if let Some(list) = v.get("custom_providers").and_then(|x| x.as_array()) {
             for item in list {
                 match serde_json::from_value::<CustomProvider>(item.clone()) {
@@ -1201,6 +1228,9 @@ impl Config {
         if !on_disk.custom_providers.is_empty() {
             json["custom_providers"] = serde_json::to_value(&on_disk.custom_providers).unwrap_or_default();
         }
+        if !on_disk.presets.is_empty() {
+            json["presets"] = serde_json::to_value(&on_disk.presets).unwrap_or_default();
+        }
         for (k, v) in &on_disk.extra {
             json[k.as_str()] = v.clone();
         }
@@ -1302,7 +1332,13 @@ impl Config {
     pub fn provider_choices(&self) -> Vec<(String, String, String)> {
         PROVIDERS
             .iter()
-            .map(|(n, b, m)| (n.to_string(), b.to_string(), m.to_string()))
+            .map(|(n, b, m)| {
+                // The preset, as last used: its remembered model and proxy URL.
+                let p = self.presets.get(*n);
+                let base = p.and_then(|p| p.base_url.clone()).unwrap_or_else(|| b.to_string());
+                let model = p.map(|p| p.model.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| m.to_string());
+                (n.to_string(), base, model)
+            })
             .chain(self.custom_providers.iter().map(|c| (c.name.clone(), c.base_url.clone(), c.model.clone())))
             .collect()
     }
@@ -1366,13 +1402,15 @@ impl Config {
     /// when it has one (that is the value in effect), else the global one.
     pub fn set_context_window(&mut self, n: u32) {
         let n = n.max(1);
-        let key = self.model_settings_key().filter(|k| self.models[*k].context_window.is_some()).cloned();
-        if let Some(k) = key {
-            self.models.entry(k).or_default().context_window = Some(n);
-        } else {
+        // A window is a property of the model: pinning it globally would
+        // carry a 128k window over to an 8k model on the next /model.
+        if self.model.is_empty() {
             self.context_window = n;
             self.context_window_explicit = true;
+            return;
         }
+        let k = self.model_settings_key().cloned().unwrap_or_else(|| self.model.clone());
+        self.models.entry(k).or_default().context_window = Some(n);
     }
 
     pub fn sync_active_custom(&mut self) {
@@ -1380,6 +1418,10 @@ impl Config {
         if let Some(c) = self.custom_providers.iter_mut().find(|c| c.name == self.provider) {
             c.base_url = base_url;
             c.model = model;
+        } else if let Some((_, preset_url, _)) = PROVIDERS.iter().find(|(n, _, _)| *n == self.provider) {
+            let url = (base_url.trim_end_matches('/') != preset_url.trim_end_matches('/') && !base_url.is_empty())
+                .then_some(base_url);
+            self.presets.insert(self.provider.clone(), PresetState { base_url: url, model });
         }
     }
 
@@ -1447,17 +1489,19 @@ impl Config {
     /// else its environment variable (so a provider whose key lives only in
     /// the environment works after a switch, as the picker promises).
     pub fn resolve_key(&mut self) {
-        self.api_key = self.api_keys.get(&self.provider).cloned().unwrap_or_default();
-        self.key_from_env = false;
-        if self.api_key.is_empty() {
-            if let Some(k) = key_env_vars(&self.provider)
-                .iter()
-                .filter_map(|v| std::env::var(v).ok())
-                .find(|k| !k.is_empty())
-            {
-                self.api_key = k;
-                self.key_from_env = true;
-            }
+        // Same precedence as `load`: an exported key (HAIKUCODE_API_KEY, then
+        // the provider's own var) overrides the saved one, so a rotated key in
+        // the environment still wins after switching away and back.
+        if let Some(k) = key_env_vars(&self.provider)
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .find(|k| !k.is_empty())
+        {
+            self.api_key = k;
+            self.key_from_env = true;
+        } else {
+            self.api_key = self.api_keys.get(&self.provider).cloned().unwrap_or_default();
+            self.key_from_env = false;
         }
     }
 
@@ -1536,6 +1580,9 @@ impl Config {
     pub fn apply_patch(&mut self, p: &ConfigPatch) {
         match p {
             ConfigPatch::Provider { provider, base_url, model } => {
+                // Remember what the provider being left was on (its model,
+                // a preset's proxy URL), so switching back restores it.
+                self.sync_active_custom();
                 self.provider = provider.clone();
                 self.base_url = base_url.clone();
                 self.model = model.clone();
@@ -1763,7 +1810,8 @@ mod tests {
         assert_eq!(c.reasoning, "high");
         assert_eq!(c.permission, "plan");
         assert!(!c.auto_commit);
-        assert_eq!(c.context_window, 64000);
+        // A window set from the panel belongs to the model it's set on.
+        assert_eq!(c.model_context_window(), Some(64000));
         assert_eq!(c.max_tool_calls, 42);
         // A key set through the panel always counts as a disk key.
         c.key_from_env = true;
@@ -1771,9 +1819,9 @@ mod tests {
         assert!(!c.key_from_env);
         // Zero context window is clamped, not propagated.
         c.apply_patch(&ConfigPatch::ContextWindow(0));
-        assert_eq!(c.context_window, 1);
-        // Pinning the window through the panel marks it explicit so it sticks.
-        assert!(c.context_window_explicit);
+        assert_eq!(c.model_context_window(), Some(1));
+        // The pin is the model's, so it survives a reload (written under `models`).
+        assert_eq!(c.to_disk_json()["models"][&c.model]["context_window"], 1);
     }
 
     #[test]
@@ -2021,14 +2069,16 @@ mod tests {
         c.model = "deepseek-flash".into();
         assert_eq!(c.model_context_window(), None);
         assert_eq!(c.effective_context_window(), 64000);
-        // /config edits the global window for a model without an entry...
+        // /config pins the window on the active model, never globally, so
+        // the next /model doesn't inherit it...
         c.apply_patch(&ConfigPatch::ContextWindow(100_000));
-        assert_eq!((c.context_window, c.effective_context_window()), (100_000, 100_000));
-        // ...and the entry (under its stored spelling) for one with an entry
+        assert_eq!((c.context_window, c.effective_context_window()), (64000, 100_000));
+        assert_eq!(c.models["deepseek-flash"].context_window, Some(100_000));
+        // ...updating an existing entry under its stored spelling
         c.model = "gemma4-26b-a4b-qat".into();
         c.apply_patch(&ConfigPatch::ContextWindow(65536));
         assert_eq!(c.models["Gemma4-26B-A4B-QAT"].context_window, Some(65536));
-        assert_eq!(c.context_window, 100_000);
+        assert_eq!(c.context_window, 64000);
         // round-trips through the file as `models`; the legacy key isn't rewritten
         let json = c.to_disk_json();
         assert_eq!(json["models"]["Gemma4-26B-A4B-QAT"]["context_window"], 65536);
@@ -2037,6 +2087,24 @@ mod tests {
         back.absorb_disk(&json);
         assert_eq!(back.models, c.models);
         assert!(Config::default().to_disk_json().get("models").is_none());
+    }
+
+    #[test]
+    fn presets_remember_their_model_and_proxy_url() {
+        let mut c = Config::default();
+        let (openai_url, openai_model) = PROVIDERS.iter().find(|(n, ..)| *n == "openai").map(|(_, b, m)| (*b, *m)).unwrap();
+        c.apply_patch(&ConfigPatch::Provider { provider: "openai".into(), base_url: openai_url.into(), model: openai_model.into() });
+        c.apply_patch(&ConfigPatch::BaseUrl("https://proxy.example/v1".into()));
+        c.model = "gpt-x".into();
+        c.apply_patch(&ConfigPatch::Provider { provider: "deepseek".into(), base_url: "https://api.deepseek.com".into(), model: "deepseek-flash".into() });
+        let back = c.provider_choices().into_iter().find(|(n, ..)| n == "openai").unwrap();
+        assert_eq!((back.1.as_str(), back.2.as_str()), ("https://proxy.example/v1", "gpt-x"));
+        // the preset's own URL isn't stored, so a later preset change applies
+        assert_eq!(c.presets["deepseek"].base_url, None);
+        // and it survives a reload
+        let mut r = Config::default();
+        r.absorb_disk(&c.to_disk_json());
+        assert_eq!(r.presets, c.presets);
     }
 
     #[test]
