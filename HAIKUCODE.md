@@ -33,20 +33,65 @@ assets/icon.svg       the app icon: a prompt chevron in Haiku's leaf colors and 
                       mark alone in one color, for tinting — Temino's pane banner
                       draws it
 src/
-  main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
-  config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
+  main.rs             CLI args, system prompt, first-run setup, dispatch to one-shot / TUI / subcommands
+  startup.rs          session start/resume/fork, startup context (instruction files, git), banner
+                      status lines, panic hook, run_tui, input history
+  oneshot.rs          one-shot mode (+ --output, --json/--stream-json), piped stdin
+  subcommands.rs      `haikucode sessions` and `haikucode model`
+  config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers): Config and its types
+  config/providers.rs provider presets, sign-in methods, PROVIDERS/PRICES, key env vars, context windows
+  config/paths.rs     config dir (+ picoder adoption), atomic_write, settings layers, session paths
+  config/disk.rs      load (lenient, + env overrides) / save (minimal on-disk JSON), persist helpers
+  config/models.rs    per-model settings and prices, wire protocol, provider choices, context window
+  config/credentials.rs  keys, sign-ins, endpoint: the credential a request carries
+  config/patch.rs     ConfigPatch: one /config change, applied live and mirrored to disk
+  config/setup.rs     interactive first-run setup wizard
+  config/tests_*.rs   config tests: disk round trips (tests_disk), providers/models/prices (tests_models)
   api.rs              OpenAI-compatible streaming SSE, tool schema, multimodal parts, retry, list_models
-  tools.rs            tool impls: bash (+ background), read/write/edit/list, grep, glob,
-                      web_fetch, web_search, todo, view_image, remember, recall
+  api/http.rs         HTTP agent, auth headers, typed error status, retry/backoff, text-only fallback
+  api/stream.rs       chat/completions SSE streaming and delta parsing, usage, sampling-loop guard
+  api/payload.rs      request bodies: messages on the wire, replayed reasoning, reasoning fields
+  api/tools_spec.rs   the tool schema advertised to the model (+ MCP tools, sub-agent subset)
+  api/models.rs       /models listing and context window, account balance, exchange rates
+  tools.rs            tool impls: path expansion + symlink guard; re-exports the submodules
+  tools/shell.rs      bash (sandboxed sh -c) and background jobs: bash_output, bash_kill
+  tools/files.rs      read_file, list_files, write_file, edit/multi_edit + their previews
+  tools/git.rs        auto-checkpoint commits, Cargo version bump, git context/status, rewind
+  tools/search.rs     grep and glob, honoring .gitignore inside a repo
+  tools/images.rs     view_image / @image: path detection, base64 data URIs
+  tools/web.rs        web_fetch (HTML → text) and web_search (DuckDuckGo/SearXNG/Brave/Tavily/DeepSeek)
+  tools/memory.rs     todo checklist, remember/recall memory notes
   agent.rs            worker thread: owns the conversation, runs the model/tool loop, sub-agents,
                       hooks + permission-rule enforcement, thrashing guard, `!cmd` shell runs
+  agent/worker.rs     `spawn`: worker startup and the `WorkerCmd` dispatch loop, follow-up suggestions
+  agent/turn.rs       one turn: the model/tool loop, Stop hooks, `!cmd` runs, /rewind
+  agent/tool_calls.rs tool dispatch, parallel read-only batches, hooks, permission rules, approvals
+  agent/compact.rs    context-window sizing, compaction, token estimation
+  agent/session.rs    session save/label, /resume /rename /fork /export /sessions, orphan repair
+  agent/subagent.rs   sub-agents for the `task` tool
+  agent/provider.rs   account balance refresh, subscription sign-in and token refresh
   policy.rs           permission rules: allow/deny patterns, bash segment splitting, rule persistence
   hooks.rs            lifecycle hooks (PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart)
   commands.rs         custom slash commands from .haikucode/commands/*.md and skills/*/SKILL.md
-  mcp.rs              stdio MCP client: spawn servers, JSON-RPC handshake, tools/list + tools/call
+  mcp.rs              MCP client: shared types (McpTool, ServerStatus, Fail), transport choice
+  mcp/transport.rs    stdio + Streamable HTTP transports (JSON-RPC, SSE), one server's handshake
+  mcp/config.rs       global + project .mcp.json servers, ${VAR} expansion, approvals store
+  mcp/oauth.rs        MCP authorization: metadata discovery, auth plan, client registration
+  mcp/client.rs       Mcp: every configured server, tools/resources/prompts calls, login
+  mcp/render.rs       tool/prompt list parsing, name sanitizing, prompt args, result text
   money.rs            Currency/Balance: keeps the cost and balance readouts in the
                       right units (DeepSeek bills CNY accounts in CNY, prices are USD)
-  ui.rs               ratatui full-screen TUI: transcript, composer, status bar
+  ui.rs               ratatui full-screen TUI: App state, transcript pushes, event loop, terminal setup
+  ui/events.rs        handle_event: applies the worker's UiEvents to the App
+  ui/keys.rs          key dispatch per mode: idle, busy, approval, password, question
+  ui/composer.rs      composer editing: paste, wrap layout, readline motions, history, completion
+  ui/mouse.rs         mouse: wheel scroll, drag selection, copy, flash notes, transcript scrolling
+  ui/commands.rs      submit/dispatch and the built-in slash commands, /diff, /undo, cost, /help
+  ui/provider.rs      /provider wizard, sign-in picker, provider switching
+  ui/settings.rs      /config panel, generic select picker, theme and status-line pickers
+  ui/render.rs        frame layout, transcript/output rendering, display cache, banner
+  ui/draw.rs          composer box, input line and the two status rows
+  ui/tests/           UI unit tests: shared helpers in mod.rs, themed files beside it
   ui/markdown.rs      renders the model's Markdown: lists, quotes, code, tables, inline styles
   ui/activity.rs      the composer prompt's marker, following what the agent is doing
   diff.rs             unified diff for edit/write previews
@@ -207,8 +252,8 @@ tool events, diffs, and approval requests. This keeps the UI responsive and lets
   auto-commit, theme, context window, max tool calls, price currency. Changes
   apply immediately and persist.
 - Costs and balance: the cost counter follows the active provider — switching
-  providers switches the price list (the built-in `PRICES` table in config.rs
-  for the presets, or the user's `prices.<provider>` entry in config.json,
+  providers switches the price list (the built-in `PRICES` table in
+  config/providers.rs for the presets, or the user's `prices.<provider>` entry in config.json,
   which wins and survives a provider round trip). A custom server without a
   price list hides the cost: the status segment drops out, `/cost` drops the
   figure, and the one-shot JSON reports `cost: null`. `src/money.rs` formats

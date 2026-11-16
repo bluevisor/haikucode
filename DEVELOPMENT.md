@@ -45,12 +45,13 @@ Two threads, joined by channels:
 
 The UI talks to the worker with `WorkerCmd` (a prompt, a config change, a
 compaction) and answers approvals on a separate `ApprovalResponse` channel.
-`main.rs` wires the two up for the TUI (`run_tui`) and for one-shot mode
-(`run_oneshot`), which reuses the same worker with a plain stdout printer.
+`main.rs` wires the two up for the TUI (`run_tui`, in `startup.rs`) and for
+one-shot mode (`run_oneshot`, in `oneshot.rs`), which reuses the same worker
+with a plain stdout printer.
 
 Most UI behavior can be tested without a terminal: build an `App`, feed it
 keys or `UiEvent`s, and assert on what it sends the worker
-(`test_handles()` in the `ui.rs` tests gives you the channel ends).
+(`test_handles()` in `src/ui/tests/mod.rs` gives you the channel ends).
 
 ## Adding a built-in tool
 
@@ -58,13 +59,14 @@ A tool touches four places. Grep for an existing tool with the same shape
 (`grep` for a read-only one, `write_file` for one that changes things) and
 follow it.
 
-1. **Schema** — `api.rs`, `tools_spec()`: name, description, JSON parameters.
+1. **Schema** — `api/tools_spec.rs`, `tools_spec()`: name, description, JSON parameters.
    The description is the model's only documentation; say what comes back and
    what not to do.
-2. **Implementation** — `tools.rs`: a plain function that takes typed
-   arguments and returns the result text. Keep it free of worker state so it
-   can be unit-tested directly.
-3. **Dispatch** — `agent.rs`:
+2. **Implementation** — `src/tools/` (the submodule for its kind, re-exported
+   from `tools.rs`): a plain function that takes typed arguments and returns
+   the result text. Keep it free of worker state so it can be unit-tested
+   directly.
+3. **Dispatch** — `agent/tool_calls.rs`:
    - Read-only, no prompt, no worker state: add it to `parallel_safe()` and
      `run_readonly()`. Several such calls from one response then run side by
      side. Update `only_read_only_tools_run_in_parallel` too.
