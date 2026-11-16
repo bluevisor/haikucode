@@ -36,10 +36,22 @@ src/
   main.rs             CLI args, first-run setup, one-shot mode (+ --output), session/context wiring
   config.rs           ~/config/settings/haikucode/config.json (incl. mcp_servers), setup wizard, session paths
   api.rs              OpenAI-compatible streaming SSE, tool schema, multimodal parts, retry, list_models
+  api/http.rs         HTTP agent, auth headers, typed error status, retry/backoff, text-only fallback
+  api/stream.rs       chat/completions SSE streaming and delta parsing, usage, sampling-loop guard
+  api/payload.rs      request bodies: messages on the wire, replayed reasoning, reasoning fields
+  api/tools_spec.rs   the tool schema advertised to the model (+ MCP tools, sub-agent subset)
+  api/models.rs       /models listing and context window, account balance, exchange rates
   tools.rs            tool impls: bash (+ background), read/write/edit/list, grep, glob,
                       web_fetch, web_search, todo, view_image, remember, recall
   agent.rs            worker thread: owns the conversation, runs the model/tool loop, sub-agents,
                       hooks + permission-rule enforcement, thrashing guard, `!cmd` shell runs
+  agent/worker.rs     `spawn`: worker startup and the `WorkerCmd` dispatch loop, follow-up suggestions
+  agent/turn.rs       one turn: the model/tool loop, Stop hooks, `!cmd` runs, /rewind
+  agent/tool_calls.rs tool dispatch, parallel read-only batches, hooks, permission rules, approvals
+  agent/compact.rs    context-window sizing, compaction, token estimation
+  agent/session.rs    session save/label, /resume /rename /fork /export /sessions, orphan repair
+  agent/subagent.rs   sub-agents for the `task` tool
+  agent/provider.rs   account balance refresh, subscription sign-in and token refresh
   policy.rs           permission rules: allow/deny patterns, bash segment splitting, rule persistence
   hooks.rs            lifecycle hooks (PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart)
   commands.rs         custom slash commands from .haikucode/commands/*.md and skills/*/SKILL.md
