@@ -596,6 +596,18 @@ impl LoopGuard {
 /// `req` with the provider's credentials: Anthropic takes `x-api-key` plus a
 /// version header, everyone else a Bearer token.
 pub(crate) fn authed(req: ureq::Request, cfg: &Config) -> ureq::Request {
+    if cfg.chatgpt_sub() {
+        // A ChatGPT sign-in: the Codex backend wants the account it bills.
+        let account = cfg.oauth_token().map(|t| t.account_id.as_str()).unwrap_or("");
+        let req = req
+            .set("Authorization", &format!("Bearer {}", cfg.bearer()))
+            .set("OpenAI-Beta", "responses=experimental")
+            .set("originator", "codex_cli_rs");
+        return if account.is_empty() { req } else { req.set("chatgpt-account-id", account) };
+    }
+    if cfg.auth() == crate::config::AuthMethod::None && cfg.api_key.is_empty() {
+        return req; // a keyless server: no empty "Bearer " header
+    }
     match cfg.api_kind() {
         ApiKind::Messages => req.set("x-api-key", cfg.bearer()).set("anthropic-version", "2023-06-01"),
         _ => req.set("Authorization", &format!("Bearer {}", cfg.bearer())),
@@ -723,7 +735,7 @@ fn chat_completions(
     mut on_content: impl FnMut(&str),
     mut on_reasoning: impl FnMut(&str),
 ) -> Result<Streamed> {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", cfg.endpoint_base().trim_end_matches('/'));
     let mut body = serde_json::json!({
         "model": cfg.model,
         "messages": messages_payload(messages, cfg.supports_images(), &cfg.model),
@@ -965,7 +977,12 @@ fn pick_balance(v: &serde_json::Value, prefer: &Currency) -> Option<Balance> {
 
 /// The provider's model list URL. Anthropic pages it (20 by default).
 fn models_url(cfg: &Config) -> String {
-    let base = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+    let base = format!("{}/models", cfg.endpoint_base().trim_end_matches('/'));
+    if cfg.chatgpt_sub() {
+        // The Codex backend lists the models a client of this version may use.
+        let v = std::env::var("HAIKUCODE_CODEX_CLIENT_VERSION").unwrap_or_else(|_| "1.0.0".into());
+        return format!("{base}?client_version={v}");
+    }
     if cfg.api_kind() == ApiKind::Messages {
         base + "?limit=1000"
     } else {
@@ -1010,18 +1027,49 @@ pub fn list_models(http: &ureq::Agent, cfg: &Config) -> Result<Vec<String>> {
         Err(e) => return Err(anyhow!("network error: {e}")),
     };
     let v: serde_json::Value = serde_json::from_str(&text)?;
-    let items = v.get("data").cloned().unwrap_or(v);
+    Ok(model_ids(&v))
+}
+
+/// The model ids in a `/models` payload: OpenAI's `{"data":[{"id"}]}`, a bare
+/// array, or the Codex backend's `{"models":[{"slug"}]}` (hidden ones left out).
+fn model_ids(v: &serde_json::Value) -> Vec<String> {
+    let items = v.get("data").or_else(|| v.get("models")).unwrap_or(v);
     let mut ids: Vec<String> = items
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(String::from))
+                .filter(|m| m.get("visibility").and_then(|x| x.as_str()).is_none_or(|vis| vis != "hide"))
+                .filter_map(|m| m.get("id").or_else(|| m.get("slug")).and_then(|x| x.as_str()).map(String::from))
                 .collect()
         })
         .unwrap_or_default();
     ids.sort();
     ids.dedup();
-    Ok(ids)
+    ids
+}
+
+/// Drop models that can't hold a chat (embeddings, speech, images,
+/// moderation, legacy completions) from a provider's list, so the model
+/// picker shows only what a coding agent can use. Keeps the list as is when
+/// the filter would empty it.
+pub fn chat_models(ids: Vec<String>) -> Vec<String> {
+    const NOT_CHAT: &[&str] = &[
+        "embed", "whisper", "tts", "dall-e", "moderation", "davinci", "babbage", "transcribe", "realtime",
+        "audio", "image", "sora", "rerank", "guard", "-search-",
+    ];
+    let keep: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            let l = id.to_ascii_lowercase();
+            !NOT_CHAT.iter().any(|n| l.contains(n))
+        })
+        .cloned()
+        .collect();
+    if keep.is_empty() {
+        ids
+    } else {
+        keep
+    }
 }
 
 pub fn truncate(s: &str, limit: usize) -> String {

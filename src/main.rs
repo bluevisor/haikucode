@@ -271,8 +271,8 @@ fn main() {
     }
     let resumed = start.and_then(|(meta, path)| sessions::load(&path).map(|msgs| (meta, path, msgs)));
 
-    if cfg.api_key.is_empty() {
-        eprintln!("\x1b[33mNo API key configured.\x1b[0m");
+    if !cfg.has_credentials() {
+        eprintln!("\x1b[33m{} isn't set up yet (no API key or sign-in).\x1b[0m", cfg.provider);
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             match config::run_setup() {
                 Ok(c) => cfg = c,
@@ -282,7 +282,7 @@ fn main() {
                 }
             }
         }
-        if cfg.api_key.is_empty() {
+        if !cfg.has_credentials() {
             eprintln!("Run: haikucode --config");
             std::process::exit(1);
         }
@@ -940,8 +940,8 @@ fn model_subcommand(cfg: &Config, arg: Option<String>) {
         println!("model set to {id}");
         return;
     }
-    if cfg.api_key.is_empty() {
-        eprintln!("No API key. Run: haikucode --config");
+    if !cfg.has_credentials() {
+        eprintln!("{} isn't set up (no API key or sign-in). Run: haikucode --config", cfg.provider);
         return;
     }
     match api::list_models(&http, cfg) {

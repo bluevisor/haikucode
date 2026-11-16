@@ -66,9 +66,12 @@ pub enum UiEvent {
     /// Auto-detected model context window (tokens): updates the ctx bar and the
     /// `/config` panel's displayed value live, without the user pinning it.
     ContextLimit(u32),
-    /// Auth mode changed by the worker (e.g. after a successful /login), so the
-    /// `/config` panel reflects "api" vs "sub" without a round-trip.
-    AuthMode(String),
+    /// A subscription sign-in finished: the provider and its token.
+    SignedIn { provider: String, token: crate::config::OAuthToken },
+    /// A subscription sign-in failed or was cancelled.
+    SignInFailed { provider: String, error: String },
+    /// `ListModels` failed (the UI decides: an error line, or a setup step).
+    ModelListFailed(String),
     /// Account balance, with the currency the provider billed it in (see
     /// `money::Balance`), so the status line can't mix units silently.
     Balance(crate::money::Balance),
@@ -408,17 +411,19 @@ pub fn spawn(
                     let _ = w.ui.send(UiEvent::Notice(format!("model set to {m}")));
                 }
                 WorkerCmd::Login(name) => {
+                    w.cancel.store(false, Ordering::Relaxed);
                     w.login(&name);
                     let _ = w.ui.send(UiEvent::TurnDone);
                 }
 
                 WorkerCmd::ListModels => {
+                    w.ensure_oauth_fresh();
                     match api::list_models(&w.http, &w.cfg) {
                         Ok(ids) => {
-                            let _ = w.ui.send(UiEvent::ModelList(ids));
+                            let _ = w.ui.send(UiEvent::ModelList(api::chat_models(ids)));
                         }
                         Err(e) => {
-                            let _ = w.ui.send(UiEvent::Error(format!("could not fetch models: {e}")));
+                            let _ = w.ui.send(UiEvent::ModelListFailed(e.to_string()));
                         }
                     }
                     let _ = w.ui.send(UiEvent::TurnDone);
@@ -518,8 +523,8 @@ pub fn spawn(
                         let _ = w.ui.send(UiEvent::ModelChanged(model.clone()));
                         // Cycling the provider row lands on providers with no
                         // key; say so now, not as a setup wizard next launch.
-                        let note = if w.cfg.api_key.is_empty() {
-                            format!("provider set to {provider} (no API key saved for it: set one in the api key row)")
+                        let note = if !w.cfg.has_credentials() {
+                            format!("provider set to {provider} (not set up yet: /provider {provider} to sign in)")
                         } else {
                             format!("provider set to {provider}")
                         };
@@ -530,6 +535,7 @@ pub fn spawn(
                 }
                 WorkerCmd::User { text, images, typed } => {
                     w.cancel.store(false, Ordering::Relaxed);
+                    w.ensure_oauth_fresh(); // a long session outlives the access token
                     // Supersede the previous turn's follow-up suggestion: stop its
                     // call early and mark it stale so a late result is dropped.
                     w.suggest_cancel.store(true, Ordering::Relaxed);
@@ -681,51 +687,32 @@ impl Worker {
     }
 
     /// Run the OAuth subscription flow for `name` and store the token. Blocks
-    /// the worker (a deliberate modal action) while the browser round-trips.
+    /// the worker (a deliberate modal action) while the browser round-trips;
+    /// Esc (the turn's cancel flag) gives up. The UI hears `SignedIn` or
+    /// `SignInFailed` and carries on with the setup.
     fn login(&mut self, name: &str) {
-        let Some(p) = crate::auth::provider(name) else {
-            let _ = self.ui.send(UiEvent::Error(format!(
-                "unknown subscription provider '{name}'. Try one of: {}",
-                crate::auth::supported().join(", ")
-            )));
-            return;
+        let fail = |w: &Self, error: String| {
+            let _ = w.ui.send(UiEvent::SignInFailed { provider: name.to_string(), error });
         };
-        let label = p.label.clone();
+        let Some(p) = crate::auth::provider(name) else {
+            return fail(self, format!("{name} has no subscription sign-in; use an API key"));
+        };
         let login = match crate::auth::start(p) {
             Ok(l) => l,
-            Err(e) => {
-                let _ = self.ui.send(UiEvent::Error(format!("login: {e}")));
-                return;
-            }
+            Err(e) => return fail(self, e.to_string()),
         };
         let _ = self.ui.send(UiEvent::Notice(format!(
-            "Opening your browser to sign in to {label}.\nIf it didn't open, visit:\n{}",
+            "Opening your browser to sign in with {}. Waiting for it (Esc cancels).\nIf it didn't open, visit:\n{}",
+            crate::auth::sub_label(name),
             login.url
         )));
-        match login.finish() {
+        match login.finish_or_cancel(&self.cancel) {
             Ok(token) => {
                 self.cfg.oauth.insert(name.to_string(), token.clone());
                 Config::persist_oauth(name, &token);
-                // Logging in is an explicit opt-in to subscription auth.
-                self.cfg.auth_mode = "sub".into();
-                Config::persist_patch(&ConfigPatch::AuthMode("sub".into()));
-                let _ = self.ui.send(UiEvent::AuthMode("sub".into()));
-                let exp = if token.expires_at > 0 {
-                    format!(
-                        " (access token valid ~{}m)",
-                        token.expires_at.saturating_sub(crate::config::now_unix()) / 60
-                    )
-                } else {
-                    String::new()
-                };
-                let _ = self.ui.send(UiEvent::Notice(format!(
-                    "Signed in to {label}{exp}. Auth mode set to subscription. \
-                     Select the {name} provider in /config to use it."
-                )));
+                let _ = self.ui.send(UiEvent::SignedIn { provider: name.to_string(), token });
             }
-            Err(e) => {
-                let _ = self.ui.send(UiEvent::Error(format!("login failed: {e}")));
-            }
+            Err(e) => fail(self, e.to_string()),
         }
     }
 
