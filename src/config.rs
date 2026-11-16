@@ -124,12 +124,12 @@ pub struct Config {
     /// never overwritten or rewritten to disk by auto-detection.
     #[serde(skip)]
     pub context_window_explicit: bool,
-    /// Per-model context windows (`model_context_windows` in config.json),
-    /// keyed by model id. An entry for the active model wins over
-    /// `context_window` and over auto-detection, so one config can mix a
-    /// 128k local server with an 8k one and a 1M hosted model.
+    /// Per-model overrides (`models` in config.json), keyed by model id:
+    /// context window, temperature and prices. The active model's entry wins
+    /// over the global and per-provider values, so one config can mix a 128k
+    /// local server, an 8k one and a 1M hosted model, each priced right.
     #[serde(default)]
-    pub model_context_windows: BTreeMap<String, u32>,
+    pub models: BTreeMap<String, ModelSettings>,
     /// USD per 1M tokens, for the session cost readout. Mirrors the active
     /// provider's price list (re-derived on load and every provider switch);
     /// the per-provider store is `prices`, with `PRICES` as the built-in
@@ -181,11 +181,14 @@ pub struct Config {
     /// DeepSeek-only `thinking` bool, which still loads (true → "medium").
     #[serde(default = "default_reasoning")]
     pub reasoning: String,
-    /// Wire protocol: "chat" (OpenAI chat/completions), "messages" (Anthropic)
-    /// or "responses" (OpenAI Responses). Unset, the provider decides (see
-    /// `api_kind`).
+    /// Wire protocol per provider (`apis` in config.json): "chat" (OpenAI
+    /// chat/completions), "messages" (Anthropic) or "responses" (OpenAI
+    /// Responses). Unset, the provider decides (see `api_kind`). Per provider
+    /// so a protocol set for one gateway doesn't follow a switch to a local
+    /// server; a legacy top-level `api` belongs to the provider active when
+    /// it was written.
     #[serde(default)]
-    pub api: Option<String>,
+    pub apis: BTreeMap<String, String>,
     /// Price per 1M cached (cache-hit) input tokens. Unset: a tenth of
     /// `price_in`, the usual cache-read discount (see `PriceList::price_cached`).
     #[serde(default)]
@@ -221,6 +224,36 @@ pub struct CustomProvider {
 /// One provider's price list, per 1M tokens. Stored per provider (the
 /// `prices` map in config.json) so the cost counter follows the active
 /// provider; the built-in `PRICES` table covers the presets.
+
+/// One model's overrides in `models` (config.json). Every field is optional;
+/// unset ones fall through to the global / per-provider value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Prices per 1M tokens; set on top of the provider's list, so a model
+    /// can override just its input/output price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_in: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_out: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cached_in: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_currency: Option<String>,
+}
+
+impl ModelSettings {
+    fn is_empty(&self) -> bool {
+        *self == ModelSettings::default()
+    }
+    fn has_price(&self) -> bool {
+        self.price_in.is_some() || self.price_out.is_some()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PriceList {
     pub price_in: f64,
@@ -597,7 +630,7 @@ impl Default for Config {
             theme: default_theme(),
             context_window: default_ctx(),
             context_window_explicit: false,
-            model_context_windows: BTreeMap::new(),
+            models: BTreeMap::new(),
             price_in: default_price_in(),
             price_out: default_price_out(),
             price_currency: default_price_currency(),
@@ -610,7 +643,7 @@ impl Default for Config {
             max_tool_calls: default_max_tool_calls(),
             temperature: None,
             reasoning: default_reasoning(),
-            api: None,
+            apis: BTreeMap::new(),
             price_cached_in: None,
             key_from_env: false,
             custom_providers: Vec::new(),
@@ -818,20 +851,32 @@ impl Config {
             cfg.context_window = n as u32;
             cfg.context_window_explicit = true;
         }
-        // Per-model windows; a non-numeric or zero entry is skipped on its own.
-        if let Some(m) = v.get("model_context_windows") {
+        // Per-model overrides; one malformed entry is skipped on its own.
+        if let Some(m) = v.get("models") {
             match m.as_object() {
                 Some(obj) => {
                     for (k, val) in obj {
-                        match val.as_u64() {
-                            Some(n) if n > 0 => {
-                                cfg.model_context_windows.insert(k.clone(), n.min(u32::MAX as u64) as u32);
+                        match serde_json::from_value::<ModelSettings>(val.clone()) {
+                            Ok(mut ms) => {
+                                ms.context_window = ms.context_window.filter(|n| *n > 0);
+                                if !ms.is_empty() {
+                                    cfg.models.insert(k.clone(), ms);
+                                }
                             }
-                            _ => eprintln!("config: model_context_windows[{k:?}] is not a positive integer and was skipped"),
+                            Err(e) => eprintln!("config: models[{k:?}] is malformed ({e}) and was skipped"),
                         }
                     }
                 }
-                None => eprintln!("config: model_context_windows is not an object and was ignored"),
+                None => eprintln!("config: models is not an object and was ignored"),
+            }
+        }
+        // Legacy (pre-`models`): a bare per-model context-window map.
+        if let Some(obj) = v.get("model_context_windows").and_then(|m| m.as_object()) {
+            for (k, val) in obj {
+                if let Some(n) = val.as_u64().filter(|n| *n > 0) {
+                    let e = cfg.models.entry(k.clone()).or_default();
+                    e.context_window.get_or_insert(n.min(u32::MAX as u64) as u32);
+                }
             }
         }
         if let Some(n) = v.get("price_in").and_then(|x| x.as_f64()) {
@@ -914,8 +959,18 @@ impl Config {
         if let Some(r) = v.get("reasoning").and_then(|x| x.as_str()) {
             cfg.reasoning = normalize_reasoning(r);
         }
-        if let Some(a) = v.get("api").and_then(|x| x.as_str()) {
-            cfg.api = Some(a.to_string());
+        if let Some(obj) = v.get("apis").and_then(|x| x.as_object()) {
+            for (k, a) in obj {
+                if let Some(a) = a.as_str().map(str::trim).filter(|a| !a.is_empty()) {
+                    cfg.apis.insert(k.clone(), a.to_string());
+                }
+            }
+        }
+        // Legacy: one top-level `api`, which belonged to the provider active
+        // when it was written.
+        if let Some(a) = v.get("api").and_then(|x| x.as_str()).map(str::trim).filter(|a| !a.is_empty()) {
+            let provider = cfg.provider.clone();
+            cfg.apis.entry(provider).or_insert_with(|| a.to_string());
         }
         if let Some(p) = v.get("price_cached_in").and_then(|x| x.as_f64()) {
             cfg.price_cached_in = Some(p);
@@ -1100,21 +1155,27 @@ impl Config {
         if on_disk.context_window_explicit {
             json["context_window"] = serde_json::json!(on_disk.context_window);
         }
-        if !on_disk.model_context_windows.is_empty() {
-            json["model_context_windows"] = serde_json::to_value(&on_disk.model_context_windows).unwrap_or_default();
+        let models: BTreeMap<&String, &ModelSettings> = on_disk.models.iter().filter(|(_, m)| !m.is_empty()).collect();
+        if !models.is_empty() {
+            json["models"] = serde_json::to_value(&models).unwrap_or_default();
         }
-        // The top-level price fields mirror the active provider's list. Skip
-        // them when the provider has no list (a custom server with a hidden
-        // cost) so a reload doesn't mistake the zeros for a user price list.
-        if on_disk.price_list().is_some() {
-            if on_disk.price_in != default_price_in() {
-                json["price_in"] = serde_json::json!(on_disk.price_in);
+        // The top-level price fields mirror the active provider's list (not a
+        // model override, which lives in `models` and would otherwise be
+        // folded into the provider's list on the next load). Skip them when
+        // the provider has no list (a custom server with a hidden cost) so a
+        // reload doesn't mistake the zeros for a user price list.
+        if let Some(p) = on_disk.price_list() {
+            if p.price_in != default_price_in() {
+                json["price_in"] = serde_json::json!(p.price_in);
             }
-            if on_disk.price_out != default_price_out() {
-                json["price_out"] = serde_json::json!(on_disk.price_out);
+            if p.price_out != default_price_out() {
+                json["price_out"] = serde_json::json!(p.price_out);
             }
-            if on_disk.price_currency.to_ascii_uppercase() != default_price_currency() {
-                json["price_currency"] = serde_json::json!(on_disk.price_currency);
+            if p.price_currency.to_ascii_uppercase() != default_price_currency() {
+                json["price_currency"] = serde_json::json!(p.price_currency);
+            }
+            if let Some(c) = p.price_cached_in {
+                json["price_cached_in"] = serde_json::json!(c);
             }
         }
         if !on_disk.prices.is_empty() {
@@ -1135,11 +1196,8 @@ impl Config {
         if on_disk.reasoning != default_reasoning() {
             json["reasoning"] = serde_json::json!(on_disk.reasoning);
         }
-        if let Some(a) = &on_disk.api {
-            json["api"] = serde_json::json!(a);
-        }
-        if let Some(p) = on_disk.price_cached_in {
-            json["price_cached_in"] = serde_json::json!(p);
+        if !on_disk.apis.is_empty() {
+            json["apis"] = serde_json::to_value(&on_disk.apis).unwrap_or_default();
         }
         if !on_disk.custom_providers.is_empty() {
             json["custom_providers"] = serde_json::to_value(&on_disk.custom_providers).unwrap_or_default();
@@ -1156,7 +1214,10 @@ impl Config {
     /// sends them into repetition loops (Qwen wants 0.6–1.0), and OpenAI's
     /// reasoning models reject any value but 1.
     pub fn temperature(&self) -> Option<f64> {
-        self.temperature.or_else(|| (self.provider == "deepseek").then_some(0.2))
+        self.model_settings()
+            .and_then(|m| m.temperature)
+            .or(self.temperature)
+            .or_else(|| (self.provider == "deepseek").then_some(0.2))
     }
 
     /// The protocol to speak: the `api` setting, else Anthropic's own
@@ -1166,7 +1227,7 @@ impl Config {
         if self.chatgpt_sub() {
             return ApiKind::Responses; // the Codex backend speaks only Responses
         }
-        match self.api.as_deref().map(str::trim) {
+        match self.apis.get(&self.provider).map(|a| a.trim()) {
             Some("messages" | "anthropic") => ApiKind::Messages,
             Some("responses") => ApiKind::Responses,
             Some("chat" | "chat_completions" | "openai") => ApiKind::Chat,
@@ -1190,11 +1251,28 @@ impl Config {
         self.price_list_for(&self.provider)
     }
 
-    /// Re-derive the single top-level `price_*` fields from the active
-    /// provider's list, so they always mirror it. A custom server without a
-    /// list zeros them (and the cost readout is hidden — see `price_list`).
+    /// The prices the cost readout uses: the active provider's list with the
+    /// active model's `models` overrides on top. A model with its own price
+    /// gets a cost readout even on a custom server without a list.
+    pub fn effective_price_list(&self) -> Option<PriceList> {
+        let base = self.price_list();
+        let Some(m) = self.model_settings().filter(|m| m.has_price() || (base.is_some() && m.price_currency.is_some())) else {
+            return base;
+        };
+        let mut p = base.unwrap_or_default();
+        if let Some(v) = m.price_in { p.price_in = v; }
+        if let Some(v) = m.price_out { p.price_out = v; }
+        if let Some(v) = m.price_cached_in { p.price_cached_in = Some(v); }
+        if let Some(c) = &m.price_currency { p.price_currency = c.trim().to_ascii_uppercase(); }
+        Some(p)
+    }
+
+    /// Re-derive the single top-level `price_*` fields from the effective
+    /// list (provider + model overrides), so they always mirror it. Without
+    /// one they're zeroed (and the cost readout is hidden). Call on every
+    /// provider *and* model switch.
     pub fn sync_prices(&mut self) {
-        match self.price_list() {
+        match self.effective_price_list() {
             Some(p) => {
                 self.price_in = p.price_in;
                 self.price_out = p.price_out;
@@ -1260,18 +1338,23 @@ impl Config {
 
     /// Mirror the active base URL and model into the active custom
     /// provider's entry, so switching away and back keeps them.
-    /// The active model's `model_context_windows` entry, matched exactly and
-    /// then case-insensitively (model ids are usually lowercase, but servers
-    /// such as llama-swap echo whatever the user named them).
-    pub fn model_context_window(&self) -> Option<u32> {
-        self.model_context_window_key().map(|k| self.model_context_windows[k])
+    /// The active model's `models` entry, matched exactly and then
+    /// case-insensitively (model ids are usually lowercase, but servers such
+    /// as llama-swap echo whatever the user named them).
+    pub fn model_settings(&self) -> Option<&ModelSettings> {
+        self.model_settings_key().map(|k| &self.models[k])
     }
 
-    fn model_context_window_key(&self) -> Option<&String> {
-        if let Some((k, _)) = self.model_context_windows.get_key_value(&self.model) {
+    fn model_settings_key(&self) -> Option<&String> {
+        if let Some((k, _)) = self.models.get_key_value(&self.model) {
             return Some(k);
         }
-        self.model_context_windows.keys().find(|k| k.eq_ignore_ascii_case(&self.model))
+        self.models.keys().find(|k| k.eq_ignore_ascii_case(&self.model))
+    }
+
+    /// The active model's own context window, if its `models` entry sets one.
+    pub fn model_context_window(&self) -> Option<u32> {
+        self.model_settings().and_then(|m| m.context_window)
     }
 
     /// The window the ctx bar and compaction use before any provider
@@ -1284,8 +1367,9 @@ impl Config {
     /// when it has one (that is the value in effect), else the global one.
     pub fn set_context_window(&mut self, n: u32) {
         let n = n.max(1);
-        if let Some(k) = self.model_context_window_key().cloned() {
-            self.model_context_windows.insert(k, n);
+        let key = self.model_settings_key().filter(|k| self.models[*k].context_window.is_some()).cloned();
+        if let Some(k) = key {
+            self.models.entry(k).or_default().context_window = Some(n);
         } else {
             self.context_window = n;
             self.context_window_explicit = true;
@@ -1524,9 +1608,15 @@ impl Config {
                 // The currency belongs to the active provider's list: the
                 // user-set one, else the built-in table, else a fresh list
                 // (a custom server whose currency was cycled in /config).
-                let mut list = self.price_list().unwrap_or_default();
-                list.price_currency = c;
-                self.prices.insert(self.provider.clone(), list);
+                // A model with its own currency keeps it there instead.
+                let key = self.model_settings_key().filter(|k| self.models[*k].price_currency.is_some()).cloned();
+                if let Some(k) = key {
+                    self.models.entry(k).or_default().price_currency = Some(c);
+                } else {
+                    let mut list = self.price_list().unwrap_or_default();
+                    list.price_currency = c;
+                    self.prices.insert(self.provider.clone(), list);
+                }
                 self.sync_prices();
             }
         }
@@ -1911,14 +2001,20 @@ mod tests {
             "provider": "deepseek",
             "model": "Gemma4-26B-A4B-QAT",
             "context_window": 64000,
-            "model_context_windows": {"Gemma4-26B-A4B-QAT": 131072, "gemma4-coding-Q8_0": 8192, "bad": "x"}
+            "models": {
+                "Gemma4-26B-A4B-QAT": {"context_window": 131072},
+                "bad": {"context_window": "x"},
+                "zero": {"context_window": 0}
+            },
+            // legacy map: folded in, never overriding a `models` value
+            "model_context_windows": {"gemma4-coding-Q8_0": 8192, "Gemma4-26B-A4B-QAT": 1}
         });
         let mut c = Config::default();
         c.absorb_disk(&v);
-        // the model's entry beats the global window; the bad entry is dropped
+        // the model's entry beats the global window; bad/zero entries are dropped
         assert_eq!(c.model_context_window(), Some(131072));
         assert_eq!(c.effective_context_window(), 131072);
-        assert_eq!(c.model_context_windows.len(), 2);
+        assert_eq!(c.models.len(), 2, "{:?}", c.models);
         // case-insensitive match
         c.model = "GEMMA4-CODING-q8_0".into();
         assert_eq!(c.effective_context_window(), 8192);
@@ -1932,16 +2028,72 @@ mod tests {
         // ...and the entry (under its stored spelling) for one with an entry
         c.model = "gemma4-26b-a4b-qat".into();
         c.apply_patch(&ConfigPatch::ContextWindow(65536));
-        assert_eq!(c.model_context_windows.get("Gemma4-26B-A4B-QAT"), Some(&65536));
+        assert_eq!(c.models["Gemma4-26B-A4B-QAT"].context_window, Some(65536));
         assert_eq!(c.context_window, 100_000);
-        // round-trips through the file
+        // round-trips through the file as `models`; the legacy key isn't rewritten
         let json = c.to_disk_json();
-        assert_eq!(json["model_context_windows"]["Gemma4-26B-A4B-QAT"], 65536);
+        assert_eq!(json["models"]["Gemma4-26B-A4B-QAT"]["context_window"], 65536);
+        assert!(json.get("model_context_windows").is_none());
         let mut back = Config::default();
         back.absorb_disk(&json);
-        assert_eq!(back.model_context_windows, c.model_context_windows);
-        // absent map stays out of the file
-        assert!(Config::default().to_disk_json().get("model_context_windows").is_none());
+        assert_eq!(back.models, c.models);
+        assert!(Config::default().to_disk_json().get("models").is_none());
+    }
+
+    #[test]
+    fn per_model_temperature_and_prices_follow_the_model() {
+        let v = serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-haiku-4-5",
+            "temperature": 0.5,
+            "models": {
+                "claude-haiku-4-5": {"price_in": 1.0, "price_out": 5.0, "temperature": 0.9},
+                "local-gemma": {"price_in": 0.0, "price_out": 0.0}
+            }
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        c.sync_prices();
+        assert_eq!(c.temperature(), Some(0.9));
+        let p = c.effective_price_list().unwrap();
+        assert_eq!((p.price_in, p.price_out), (1.0, 5.0));
+        assert_eq!(p.price_cached_in, built_in_prices("anthropic").unwrap().price_cached_in, "unset fields come from the provider");
+        assert_eq!(c.price_in, 1.0, "the mirror fields follow the model");
+        // the provider's own list is untouched, and that's what the file mirrors
+        assert_eq!(c.price_list().unwrap().price_in, 15.0);
+        let json = c.to_disk_json();
+        assert_eq!(json["price_in"], 15.0, "{json}");
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        assert_eq!(back.price_list().unwrap().price_in, 15.0, "a model's price never leaks into the provider's list");
+        // another model on the same provider: provider prices, global temperature
+        c.model = "claude-opus".into();
+        c.sync_prices();
+        assert_eq!((c.price_in, c.temperature()), (15.0, Some(0.5)));
+        // a custom server without a list still gets a cost readout for a priced model
+        c.provider = "box".into();
+        c.model = "local-gemma".into();
+        assert_eq!(c.price_list(), None);
+        assert_eq!(c.effective_price_list().map(|p| p.price_in), Some(0.0));
+        c.model = "other".into();
+        assert_eq!(c.effective_price_list(), None);
+    }
+
+    #[test]
+    fn the_wire_protocol_follows_the_provider() {
+        // legacy top-level `api` belongs to the provider active when written
+        let v = serde_json::json!({"provider": "vercel", "model": "m", "api": "messages"});
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        assert!(matches!(c.api_kind(), ApiKind::Messages));
+        assert_eq!(c.apis.get("vercel").map(String::as_str), Some("messages"));
+        c.provider = "box".into();
+        assert!(matches!(c.api_kind(), ApiKind::Chat), "a local server doesn't inherit the gateway's protocol");
+        c.provider = "anthropic".into();
+        assert!(matches!(c.api_kind(), ApiKind::Messages));
+        let json = c.to_disk_json();
+        assert!(json.get("api").is_none());
+        assert_eq!(json["apis"]["vercel"], "messages");
     }
 
     #[test]
