@@ -100,8 +100,9 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Context compaction** — `/compact [focus]` summarizes older turns to free
   the window (the optional focus tells the summary what to preserve); triggers
   automatically at 80% full, including mid-turn during long tool loops. The
-  window comes from `context_window`, else the provider's `/models`, else a
-  built-in table (128k for unknown models).
+  window comes from the model's entry in `model_context_windows` (e.g.
+  `{"Gemma4-26B-A4B-QAT": 131072}`), else `context_window`, else the
+  provider's `/models`, else a built-in table (128k for unknown models).
 - **Queued input** — keep typing while the agent works; Enter queues messages
   that send as turns finish.
 - **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to

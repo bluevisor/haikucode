@@ -1486,7 +1486,7 @@ impl App {
                 self.settings.theme = THEMES[i].to_string();
                 Config::persist_theme(THEMES[i]);
             }
-            9 => self.mode = edit_with(self.settings.context_window.to_string()),
+            9 => self.mode = edit_with(self.settings.effective_context_window().to_string()),
             10 => self.mode = edit_with(setting_max_tool_calls(self.settings.max_tool_calls)),
             // A pick-list, USD first. The currency belongs to the active
             // provider's price list: cycling it relabels the cost, it doesn't
@@ -1530,7 +1530,7 @@ impl App {
             }
             9 => {
                 let v: u32 = val.parse().map(|n: u32| n.max(1)).unwrap_or(self.ctx_limit);
-                self.settings.context_window = v;
+                self.settings.set_context_window(v);
                 self.ctx_limit = v;
                 let _ = h.cmd_tx.send(WorkerCmd::Patch(ConfigPatch::ContextWindow(v)));
             }
@@ -3666,7 +3666,7 @@ impl App {
             6 => perm_name(self.perm()).to_string(),
             7 => if s.auto_commit { "on".into() } else { "off".into() },
             8 => self.palette.name.to_string(),
-            9 => s.context_window.to_string(),
+            9 => s.effective_context_window().to_string(),
             10 => setting_max_tool_calls(s.max_tool_calls),
             11 => {
                 // Cycled off USD while the active provider still runs the

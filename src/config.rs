@@ -119,6 +119,12 @@ pub struct Config {
     /// never overwritten or rewritten to disk by auto-detection.
     #[serde(skip)]
     pub context_window_explicit: bool,
+    /// Per-model context windows (`model_context_windows` in config.json),
+    /// keyed by model id. An entry for the active model wins over
+    /// `context_window` and over auto-detection, so one config can mix a
+    /// 128k local server with an 8k one and a 1M hosted model.
+    #[serde(default)]
+    pub model_context_windows: BTreeMap<String, u32>,
     /// USD per 1M tokens, for the session cost readout. Mirrors the active
     /// provider's price list (re-derived on load and every provider switch);
     /// the per-provider store is `prices`, with `PRICES` as the built-in
@@ -463,6 +469,7 @@ impl Default for Config {
             theme: default_theme(),
             context_window: default_ctx(),
             context_window_explicit: false,
+            model_context_windows: BTreeMap::new(),
             price_in: default_price_in(),
             price_out: default_price_out(),
             price_currency: default_price_currency(),
@@ -682,6 +689,22 @@ impl Config {
         if let Some(n) = v.get("context_window").and_then(|x| x.as_u64()) {
             cfg.context_window = n as u32;
             cfg.context_window_explicit = true;
+        }
+        // Per-model windows; a non-numeric or zero entry is skipped on its own.
+        if let Some(m) = v.get("model_context_windows") {
+            match m.as_object() {
+                Some(obj) => {
+                    for (k, val) in obj {
+                        match val.as_u64() {
+                            Some(n) if n > 0 => {
+                                cfg.model_context_windows.insert(k.clone(), n.min(u32::MAX as u64) as u32);
+                            }
+                            _ => eprintln!("config: model_context_windows[{k:?}] is not a positive integer and was skipped"),
+                        }
+                    }
+                }
+                None => eprintln!("config: model_context_windows is not an object and was ignored"),
+            }
         }
         if let Some(n) = v.get("price_in").and_then(|x| x.as_f64()) {
             cfg.price_in = n;
@@ -942,6 +965,9 @@ impl Config {
         if on_disk.context_window_explicit {
             json["context_window"] = serde_json::json!(on_disk.context_window);
         }
+        if !on_disk.model_context_windows.is_empty() {
+            json["model_context_windows"] = serde_json::to_value(&on_disk.model_context_windows).unwrap_or_default();
+        }
         // The top-level price fields mirror the active provider's list. Skip
         // them when the provider has no list (a custom server with a hidden
         // cost) so a reload doesn't mistake the zeros for a user price list.
@@ -1096,6 +1122,38 @@ impl Config {
 
     /// Mirror the active base URL and model into the active custom
     /// provider's entry, so switching away and back keeps them.
+    /// The active model's `model_context_windows` entry, matched exactly and
+    /// then case-insensitively (model ids are usually lowercase, but servers
+    /// such as llama-swap echo whatever the user named them).
+    pub fn model_context_window(&self) -> Option<u32> {
+        self.model_context_window_key().map(|k| self.model_context_windows[k])
+    }
+
+    fn model_context_window_key(&self) -> Option<&String> {
+        if let Some((k, _)) = self.model_context_windows.get_key_value(&self.model) {
+            return Some(k);
+        }
+        self.model_context_windows.keys().find(|k| k.eq_ignore_ascii_case(&self.model))
+    }
+
+    /// The window the ctx bar and compaction use before any provider
+    /// detection: the active model's entry, else `context_window`.
+    pub fn effective_context_window(&self) -> u32 {
+        self.model_context_window().unwrap_or(self.context_window)
+    }
+
+    /// Pin a context window from `/config`: update the active model's entry
+    /// when it has one (that is the value in effect), else the global one.
+    pub fn set_context_window(&mut self, n: u32) {
+        let n = n.max(1);
+        if let Some(k) = self.model_context_window_key().cloned() {
+            self.model_context_windows.insert(k, n);
+        } else {
+            self.context_window = n;
+            self.context_window_explicit = true;
+        }
+    }
+
     pub fn sync_active_custom(&mut self) {
         let (base_url, model) = (self.base_url.clone(), self.model.clone());
         if let Some(c) = self.custom_providers.iter_mut().find(|c| c.name == self.provider) {
@@ -1213,10 +1271,7 @@ impl Config {
             ConfigPatch::Reasoning(r) => self.reasoning = normalize_reasoning(r),
             ConfigPatch::Permission(m) => self.permission = m.clone(),
             ConfigPatch::AutoCommit(b) => self.auto_commit = *b,
-            ConfigPatch::ContextWindow(n) => {
-                self.context_window = (*n).max(1);
-                self.context_window_explicit = true;
-            }
+            ConfigPatch::ContextWindow(n) => self.set_context_window(*n),
             ConfigPatch::MaxToolCalls(n) => self.max_tool_calls = *n,
             ConfigPatch::AuthMode(m) => {
                 self.auth_mode = if m == "sub" { "sub".into() } else { "api".into() };
@@ -1598,6 +1653,45 @@ mod tests {
         assert_eq!(c.temperature(), None, "others get the model's own sampling");
         c.temperature = Some(0.7);
         assert_eq!(c.temperature(), Some(0.7));
+    }
+
+    #[test]
+    fn per_model_context_windows() {
+        let v = serde_json::json!({
+            "provider": "deepseek",
+            "model": "Gemma4-26B-A4B-QAT",
+            "context_window": 64000,
+            "model_context_windows": {"Gemma4-26B-A4B-QAT": 131072, "gemma4-coding-Q8_0": 8192, "bad": "x"}
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        // the model's entry beats the global window; the bad entry is dropped
+        assert_eq!(c.model_context_window(), Some(131072));
+        assert_eq!(c.effective_context_window(), 131072);
+        assert_eq!(c.model_context_windows.len(), 2);
+        // case-insensitive match
+        c.model = "GEMMA4-CODING-q8_0".into();
+        assert_eq!(c.effective_context_window(), 8192);
+        // no entry: the global window
+        c.model = "deepseek-flash".into();
+        assert_eq!(c.model_context_window(), None);
+        assert_eq!(c.effective_context_window(), 64000);
+        // /config edits the global window for a model without an entry...
+        c.apply_patch(&ConfigPatch::ContextWindow(100_000));
+        assert_eq!((c.context_window, c.effective_context_window()), (100_000, 100_000));
+        // ...and the entry (under its stored spelling) for one with an entry
+        c.model = "gemma4-26b-a4b-qat".into();
+        c.apply_patch(&ConfigPatch::ContextWindow(65536));
+        assert_eq!(c.model_context_windows.get("Gemma4-26B-A4B-QAT"), Some(&65536));
+        assert_eq!(c.context_window, 100_000);
+        // round-trips through the file
+        let json = c.to_disk_json();
+        assert_eq!(json["model_context_windows"]["Gemma4-26B-A4B-QAT"], 65536);
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        assert_eq!(back.model_context_windows, c.model_context_windows);
+        // absent map stays out of the file
+        assert!(Config::default().to_disk_json().get("model_context_windows").is_none());
     }
 
     #[test]
