@@ -62,9 +62,10 @@ follow it.
 1. **Schema** — `api/tools_spec.rs`, `tools_spec()`: name, description, JSON parameters.
    The description is the model's only documentation; say what comes back and
    what not to do.
-2. **Implementation** — `tools.rs`: a plain function that takes typed
-   arguments and returns the result text. Keep it free of worker state so it
-   can be unit-tested directly.
+2. **Implementation** — `src/tools/` (the submodule for its kind, re-exported
+   from `tools.rs`): a plain function that takes typed arguments and returns
+   the result text. Keep it free of worker state so it can be unit-tested
+   directly.
 3. **Dispatch** — `agent/tool_calls.rs`:
    - Read-only, no prompt, no worker state: add it to `parallel_safe()` and
      `run_readonly()`. Several such calls from one response then run side by

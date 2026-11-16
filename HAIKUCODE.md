@@ -53,8 +53,14 @@ src/
   api/payload.rs      request bodies: messages on the wire, replayed reasoning, reasoning fields
   api/tools_spec.rs   the tool schema advertised to the model (+ MCP tools, sub-agent subset)
   api/models.rs       /models listing and context window, account balance, exchange rates
-  tools.rs            tool impls: bash (+ background), read/write/edit/list, grep, glob,
-                      web_fetch, web_search, todo, view_image, remember, recall
+  tools.rs            tool impls: path expansion + symlink guard; re-exports the submodules
+  tools/shell.rs      bash (sandboxed sh -c) and background jobs: bash_output, bash_kill
+  tools/files.rs      read_file, list_files, write_file, edit/multi_edit + their previews
+  tools/git.rs        auto-checkpoint commits, Cargo version bump, git context/status, rewind
+  tools/search.rs     grep and glob, honoring .gitignore inside a repo
+  tools/images.rs     view_image / @image: path detection, base64 data URIs
+  tools/web.rs        web_fetch (HTML → text) and web_search (DuckDuckGo/SearXNG/Brave/Tavily/DeepSeek)
+  tools/memory.rs     todo checklist, remember/recall memory notes
   agent.rs            worker thread: owns the conversation, runs the model/tool loop, sub-agents,
                       hooks + permission-rule enforcement, thrashing guard, `!cmd` shell runs
   agent/worker.rs     `spawn`: worker startup and the `WorkerCmd` dispatch loop, follow-up suggestions
@@ -67,7 +73,12 @@ src/
   policy.rs           permission rules: allow/deny patterns, bash segment splitting, rule persistence
   hooks.rs            lifecycle hooks (PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart)
   commands.rs         custom slash commands from .haikucode/commands/*.md and skills/*/SKILL.md
-  mcp.rs              stdio MCP client: spawn servers, JSON-RPC handshake, tools/list + tools/call
+  mcp.rs              MCP client: shared types (McpTool, ServerStatus, Fail), transport choice
+  mcp/transport.rs    stdio + Streamable HTTP transports (JSON-RPC, SSE), one server's handshake
+  mcp/config.rs       global + project .mcp.json servers, ${VAR} expansion, approvals store
+  mcp/oauth.rs        MCP authorization: metadata discovery, auth plan, client registration
+  mcp/client.rs       Mcp: every configured server, tools/resources/prompts calls, login
+  mcp/render.rs       tool/prompt list parsing, name sanitizing, prompt args, result text
   money.rs            Currency/Balance: keeps the cost and balance readouts in the
                       right units (DeepSeek bills CNY accounts in CNY, prices are USD)
   ui.rs               ratatui full-screen TUI: App state, transcript pushes, event loop, terminal setup
