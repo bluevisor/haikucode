@@ -46,7 +46,17 @@ src/
   mcp.rs              stdio MCP client: spawn servers, JSON-RPC handshake, tools/list + tools/call
   money.rs            Currency/Balance: keeps the cost and balance readouts in the
                       right units (DeepSeek bills CNY accounts in CNY, prices are USD)
-  ui.rs               ratatui full-screen TUI: transcript, composer, status bar
+  ui.rs               ratatui full-screen TUI: App state, transcript pushes, event loop, terminal setup
+  ui/events.rs        handle_event: applies the worker's UiEvents to the App
+  ui/keys.rs          key dispatch per mode: idle, busy, approval, password, question
+  ui/composer.rs      composer editing: paste, wrap layout, readline motions, history, completion
+  ui/mouse.rs         mouse: wheel scroll, drag selection, copy, flash notes, transcript scrolling
+  ui/commands.rs      submit/dispatch and the built-in slash commands, /diff, /undo, cost, /help
+  ui/provider.rs      /provider wizard, sign-in picker, provider switching
+  ui/settings.rs      /config panel, generic select picker, theme and status-line pickers
+  ui/render.rs        frame layout, transcript/output rendering, display cache, banner
+  ui/draw.rs          composer box, input line and the two status rows
+  ui/tests/           UI unit tests: shared helpers in mod.rs, themed files beside it
   ui/markdown.rs      renders the model's Markdown: lists, quotes, code, tables, inline styles
   ui/activity.rs      the composer prompt's marker, following what the agent is doing
   diff.rs             unified diff for edit/write previews

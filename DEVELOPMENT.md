@@ -50,7 +50,7 @@ compaction) and answers approvals on a separate `ApprovalResponse` channel.
 
 Most UI behavior can be tested without a terminal: build an `App`, feed it
 keys or `UiEvent`s, and assert on what it sends the worker
-(`test_handles()` in the `ui.rs` tests gives you the channel ends).
+(`test_handles()` in `src/ui/tests/mod.rs` gives you the channel ends).
 
 ## Adding a built-in tool
 
