@@ -221,10 +221,6 @@ pub struct CustomProvider {
     pub model: String,
 }
 
-/// One provider's price list, per 1M tokens. Stored per provider (the
-/// `prices` map in config.json) so the cost counter follows the active
-/// provider; the built-in `PRICES` table covers the presets.
-
 /// One model's overrides in `models` (config.json). Every field is optional;
 /// unset ones fall through to the global / per-provider value.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -254,6 +250,9 @@ impl ModelSettings {
     }
 }
 
+/// One provider's price list, per 1M tokens. Stored per provider (the
+/// `prices` map in config.json) so the cost counter follows the active
+/// provider; the built-in `PRICES` table covers the presets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PriceList {
     pub price_in: f64,
