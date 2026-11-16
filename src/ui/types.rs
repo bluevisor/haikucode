@@ -147,6 +147,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/provider list", "list every provider and how it signs in"),
     ("/provider add ", "add one: /provider add <name> <base_url> <model>"),
     ("/provider remove ", "forget a custom provider, its key and sign-in: /provider remove <name>"),
+    ("/provider edit ", "edit a custom server: /provider edit <name> (active server if omitted)"),
     ("/effort auto", "send nothing: the model's own default"),
     ("/effort off", "no reasoning (or the provider's lowest)"),
     ("/effort low", "quick, light reasoning"),
@@ -164,7 +165,7 @@ pub const SLASH_OPTIONS: &[(&str, &str)] = &[
     ("/statusline reset", "back to the default status bar"),
     ("/statusline ", "<items…> set them in order, e.g. model git ctx time"),
     ("/thinking full", "show reasoning, tool output and diffs"),
-    ("/thinking brief", "keep thoughts and show only the current activity"),
+    ("/thinking brief", "thinking summaries + current action (live only)"),
     ("/mcp approve ", "<server> trust a project's MCP server"),
     ("/mcp deny ", "<server> refuse a project's MCP server"),
     ("/mcp login ", "<server> sign in to a server that needs OAuth"),
@@ -286,8 +287,12 @@ pub enum AuthChoice {
 /// What the `/provider` wizard has collected so far.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderDraft {
-    /// True while adding a new provider; false when setting up a known one.
+    /// True while adding or editing a custom provider; false when setting up a known one.
     pub adding: bool,
+    /// Editing a saved provider keeps its name and starts at its address.
+    pub editing: bool,
+    /// An explicit '-' answer removes the saved key on commit.
+    pub clear_key: bool,
     pub name: String,
     pub base_url: String,
     pub api_key: String,

@@ -450,14 +450,15 @@ fn build_context(cfg: &Config) -> (Vec<Message>, Vec<String>) {
 /// the active LLM (model · provider · context window).
 fn status_lines(cfg: &Config, ascii: bool) -> Vec<String> {
     let sep = if ascii { " - " } else { " · " };
-    let ctx = if cfg.context_window >= 1_000_000 {
-        let m = cfg.context_window as f64 / 1e6;
+    let window = cfg.effective_context_window();
+    let ctx = if window >= 1_000_000 {
+        let m = window as f64 / 1e6;
         // 1M, not 1.0M; 1.5M keeps the decimal.
         format!("{}M ctx", if m.fract() == 0.0 { format!("{m:.0}") } else { format!("{m:.1}") })
-    } else if cfg.context_window >= 1000 {
-        format!("{}K ctx", cfg.context_window / 1000)
+    } else if window >= 1000 {
+        format!("{}K ctx", window / 1000)
     } else {
-        format!("{} ctx", cfg.context_window)
+        format!("{} ctx", window)
     };
     let mut lines = vec![
         format!("HW   {}", sysinfo::hardware_line(ascii)),
@@ -869,7 +870,7 @@ fn run_tui(
     // Capture UI-relevant config before the worker takes ownership of `cfg`.
     let ui_cfg_model = cfg.model.clone();
     let ui_cfg_theme = cfg.theme.clone();
-    let ctx_limit = cfg.context_window;
+    let ctx_limit = cfg.effective_context_window();
     let price_in = cfg.price_in;
     let price_out = cfg.price_out;
     let price_cached_in = cfg.price_cached_in;

@@ -92,6 +92,10 @@ memory, sessions, skills) into `~/.config/haikucode`.
   an empty paste for an image-only clipboard; Haiku Terminal and Terminal.app
   send nothing, so use Ctrl+V there. Image files dragged into the terminal
   attach instead of pasting as bare paths.
+- **Brief thinking view** — concise thinking summaries stay in the transcript;
+  the current action (reading, searching, editing, or running a command) updates
+  in one live line above the prompt and disappears when the turn finishes.
+  Ctrl+T or `/thinking full` reveals full reasoning, tool output, and diffs.
 - **Streaming TUI** — a Claude-style composer with a reverse-block cursor,
   live token streaming, and colored unified diffs previewed before every
   write/edit. Drag across the output — or the composer — to select text:
@@ -100,8 +104,9 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Context compaction** — `/compact [focus]` summarizes older turns to free
   the window (the optional focus tells the summary what to preserve); triggers
   automatically at 80% full, including mid-turn during long tool loops. The
-  window comes from `context_window`, else the provider's `/models`, else a
-  built-in table (128k for unknown models).
+  window comes from the model's entry in `model_context_windows` (e.g.
+  `{"Gemma4-26B-A4B-QAT": 131072}`), else `context_window`, else the
+  provider's `/models`, else a built-in table (128k for unknown models).
 - **Queued input** — keep typing while the agent works; Enter queues messages
   that send as turns finish.
 - **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to
@@ -245,7 +250,10 @@ memory, sessions, skills) into `~/.config/haikucode`.
   first, for any OpenAI-compatible endpoint (a LiteLLM or other gateway, a
   local server). Shortcuts: `/provider <name>` switches (or sets it up),
   `/provider add <name> <base_url> <model>`, `/provider remove <name>`
-  forgets one with its key and sign-in, `/provider list`. Each provider keeps
+  forgets one with its key and sign-in, `/provider list`. `/provider edit
+  [name]` (or Ctrl+E on a custom server in the picker) reopens a saved custom
+  server at its address, prefilled; editing one that isn't active saves it
+  without switching to it. Each provider keeps
   its own key, sign-in method and model; the `/config` sign-in row reruns
   steps 2–3 for the active one. The first-run setup (`haikucode --config`)
   asks the same three steps.

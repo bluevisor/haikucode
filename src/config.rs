@@ -124,6 +124,12 @@ pub struct Config {
     /// never overwritten or rewritten to disk by auto-detection.
     #[serde(skip)]
     pub context_window_explicit: bool,
+    /// Per-model context windows (`model_context_windows` in config.json),
+    /// keyed by model id. An entry for the active model wins over
+    /// `context_window` and over auto-detection, so one config can mix a
+    /// 128k local server with an 8k one and a 1M hosted model.
+    #[serde(default)]
+    pub model_context_windows: BTreeMap<String, u32>,
     /// USD per 1M tokens, for the session cost readout. Mirrors the active
     /// provider's price list (re-derived on load and every provider switch);
     /// the per-provider store is `prices`, with `PRICES` as the built-in
@@ -361,6 +367,28 @@ pub fn valid_custom_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate API base addresses before saving or attaching credentials.
+pub fn normalize_provider_url(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err("The URL must start with http:// or https:// and include a host".into());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| "Enter a full API base URL, e.g. http://localhost:1234/v1".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("The URL must start with http:// or https:// and include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Put credentials in the API key field, not in the URL".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() || value.chars().any(char::is_whitespace) {
+        return Err("Use an API base URL without spaces, query parameters or a fragment".into());
+    }
+    if ["/chat/completions", "/models", "/responses"].iter().any(|suffix| parsed.path().ends_with(suffix)) {
+        return Err("Use the API base URL (e.g. https://server.example/v1), without /chat/completions, /models or /responses".into());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -569,6 +597,7 @@ impl Default for Config {
             theme: default_theme(),
             context_window: default_ctx(),
             context_window_explicit: false,
+            model_context_windows: BTreeMap::new(),
             price_in: default_price_in(),
             price_out: default_price_out(),
             price_currency: default_price_currency(),
@@ -788,6 +817,22 @@ impl Config {
         if let Some(n) = v.get("context_window").and_then(|x| x.as_u64()) {
             cfg.context_window = n as u32;
             cfg.context_window_explicit = true;
+        }
+        // Per-model windows; a non-numeric or zero entry is skipped on its own.
+        if let Some(m) = v.get("model_context_windows") {
+            match m.as_object() {
+                Some(obj) => {
+                    for (k, val) in obj {
+                        match val.as_u64() {
+                            Some(n) if n > 0 => {
+                                cfg.model_context_windows.insert(k.clone(), n.min(u32::MAX as u64) as u32);
+                            }
+                            _ => eprintln!("config: model_context_windows[{k:?}] is not a positive integer and was skipped"),
+                        }
+                    }
+                }
+                None => eprintln!("config: model_context_windows is not an object and was ignored"),
+            }
         }
         if let Some(n) = v.get("price_in").and_then(|x| x.as_f64()) {
             cfg.price_in = n;
@@ -1055,6 +1100,9 @@ impl Config {
         if on_disk.context_window_explicit {
             json["context_window"] = serde_json::json!(on_disk.context_window);
         }
+        if !on_disk.model_context_windows.is_empty() {
+            json["model_context_windows"] = serde_json::to_value(&on_disk.model_context_windows).unwrap_or_default();
+        }
         // The top-level price fields mirror the active provider's list. Skip
         // them when the provider has no list (a custom server with a hidden
         // cost) so a reload doesn't mistake the zeros for a user price list.
@@ -1212,6 +1260,38 @@ impl Config {
 
     /// Mirror the active base URL and model into the active custom
     /// provider's entry, so switching away and back keeps them.
+    /// The active model's `model_context_windows` entry, matched exactly and
+    /// then case-insensitively (model ids are usually lowercase, but servers
+    /// such as llama-swap echo whatever the user named them).
+    pub fn model_context_window(&self) -> Option<u32> {
+        self.model_context_window_key().map(|k| self.model_context_windows[k])
+    }
+
+    fn model_context_window_key(&self) -> Option<&String> {
+        if let Some((k, _)) = self.model_context_windows.get_key_value(&self.model) {
+            return Some(k);
+        }
+        self.model_context_windows.keys().find(|k| k.eq_ignore_ascii_case(&self.model))
+    }
+
+    /// The window the ctx bar and compaction use before any provider
+    /// detection: the active model's entry, else `context_window`.
+    pub fn effective_context_window(&self) -> u32 {
+        self.model_context_window().unwrap_or(self.context_window)
+    }
+
+    /// Pin a context window from `/config`: update the active model's entry
+    /// when it has one (that is the value in effect), else the global one.
+    pub fn set_context_window(&mut self, n: u32) {
+        let n = n.max(1);
+        if let Some(k) = self.model_context_window_key().cloned() {
+            self.model_context_windows.insert(k, n);
+        } else {
+            self.context_window = n;
+            self.context_window_explicit = true;
+        }
+    }
+
     pub fn sync_active_custom(&mut self) {
         let (base_url, model) = (self.base_url.clone(), self.model.clone());
         if let Some(c) = self.custom_providers.iter_mut().find(|c| c.name == self.provider) {
@@ -1432,10 +1512,7 @@ impl Config {
             ConfigPatch::Reasoning(r) => self.reasoning = normalize_reasoning(r),
             ConfigPatch::Permission(m) => self.permission = m.clone(),
             ConfigPatch::AutoCommit(b) => self.auto_commit = *b,
-            ConfigPatch::ContextWindow(n) => {
-                self.context_window = (*n).max(1);
-                self.context_window_explicit = true;
-            }
+            ConfigPatch::ContextWindow(n) => self.set_context_window(*n),
             ConfigPatch::MaxToolCalls(n) => self.max_tool_calls = *n,
             ConfigPatch::PriceCurrency(c) => {
                 let c = c.trim().to_ascii_uppercase();
@@ -1466,6 +1543,18 @@ impl Config {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn server_addresses_reject_mistakes_before_saving_credentials() {
+        for valid in ["http://localhost:1234/v1", "http://127.0.0.1:11434/v1", "https://gateway.example/api/v1", "http://[::1]:8080/v1"] {
+            assert_eq!(super::normalize_provider_url(&format!(" {valid}/ ")).unwrap(), valid);
+        }
+        for invalid in ["", "localhost:1234", "https://", "https:host/v1", "http:/host/v1", "ftp://host/v1", "https://host:bad/v1",
+            "https://host/v1 with space", "https://host/v1?key=secret", "https://host/v1#fragment",
+            "https://user:secret@host/v1", "https://host/v1/chat/completions", "https://host/v1/models/"] {
+            assert!(super::normalize_provider_url(invalid).is_err(), "{invalid}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1817,6 +1906,45 @@ mod tests {
     }
 
     #[test]
+    fn per_model_context_windows() {
+        let v = serde_json::json!({
+            "provider": "deepseek",
+            "model": "Gemma4-26B-A4B-QAT",
+            "context_window": 64000,
+            "model_context_windows": {"Gemma4-26B-A4B-QAT": 131072, "gemma4-coding-Q8_0": 8192, "bad": "x"}
+        });
+        let mut c = Config::default();
+        c.absorb_disk(&v);
+        // the model's entry beats the global window; the bad entry is dropped
+        assert_eq!(c.model_context_window(), Some(131072));
+        assert_eq!(c.effective_context_window(), 131072);
+        assert_eq!(c.model_context_windows.len(), 2);
+        // case-insensitive match
+        c.model = "GEMMA4-CODING-q8_0".into();
+        assert_eq!(c.effective_context_window(), 8192);
+        // no entry: the global window
+        c.model = "deepseek-flash".into();
+        assert_eq!(c.model_context_window(), None);
+        assert_eq!(c.effective_context_window(), 64000);
+        // /config edits the global window for a model without an entry...
+        c.apply_patch(&ConfigPatch::ContextWindow(100_000));
+        assert_eq!((c.context_window, c.effective_context_window()), (100_000, 100_000));
+        // ...and the entry (under its stored spelling) for one with an entry
+        c.model = "gemma4-26b-a4b-qat".into();
+        c.apply_patch(&ConfigPatch::ContextWindow(65536));
+        assert_eq!(c.model_context_windows.get("Gemma4-26B-A4B-QAT"), Some(&65536));
+        assert_eq!(c.context_window, 100_000);
+        // round-trips through the file
+        let json = c.to_disk_json();
+        assert_eq!(json["model_context_windows"]["Gemma4-26B-A4B-QAT"], 65536);
+        let mut back = Config::default();
+        back.absorb_disk(&json);
+        assert_eq!(back.model_context_windows, c.model_context_windows);
+        // absent map stays out of the file
+        assert!(Config::default().to_disk_json().get("model_context_windows").is_none());
+    }
+
+    #[test]
     fn context_window_table_by_model() {
         assert_eq!(known_context_window("deepseek-v4-pro"), 1_000_000);
         assert_eq!(known_context_window("deepseek-v4-flash"), 1_000_000);
@@ -1959,10 +2087,10 @@ pub fn run_setup() -> Result<Config> {
             dim("the OpenAI-compatible endpoint, e.g. http://localhost:11434/v1");
             let b = prompt(&format!("  base URL{hint}: "))?;
             let b = nonempty(b, saved.as_ref().map(|c| c.base_url.as_str()).unwrap_or(""));
-            if b.starts_with("http://") || b.starts_with("https://") {
-                break b.trim_end_matches('/').to_string();
+            match normalize_provider_url(&b) {
+                Ok(b) => break b,
+                Err(e) => err(&e),
             }
-            err("the URL must start with http:// or https://");
         };
         (p, b, saved.map(|c| c.model).unwrap_or_default())
     } else {
