@@ -104,9 +104,23 @@ memory, sessions, skills) into `~/.config/haikucode`.
 - **Context compaction** — `/compact [focus]` summarizes older turns to free
   the window (the optional focus tells the summary what to preserve); triggers
   automatically at 80% full, including mid-turn during long tool loops. The
-  window comes from the model's entry in `model_context_windows` (e.g.
-  `{"Gemma4-26B-A4B-QAT": 131072}`), else `context_window`, else the
+  window comes from the model's `context_window` in `models` (see
+  **Per-model settings**), else the top-level `context_window`, else the
   provider's `/models`, else a built-in table (128k for unknown models).
+- **Per-model settings** — `models` in `config.json` overrides settings for
+  one model id (matched case-insensitively), wherever it's served from:
+  ```json
+  "models": {
+    "Gemma4-26B-A4B-QAT": {"context_window": 131072, "temperature": 1.0},
+    "gemma4-coding-Q8_0": {"context_window": 8192},
+    "claude-haiku-4-5":   {"price_in": 1.0, "price_out": 5.0}
+  }
+  ```
+  `context_window`, `temperature`, `price_in`, `price_out`, `price_cached_in`
+  and `price_currency` are each optional; unset ones fall back to the global
+  or per-provider value. Prices apply on top of the provider's list, so a
+  priced model on a custom server gets a cost readout too. Switching models
+  re-applies them. (The older `model_context_windows` map is still read.)
 - **Queued input** — keep typing while the agent works; Enter queues messages
   that send as turns finish.
 - **One-shot `--output`** — `haikucode "task" -o out.md` writes the final reply to
@@ -172,8 +186,8 @@ memory, sessions, skills) into `~/.config/haikucode`.
   back to back (a sampling loop, common with local reasoning models) is cut
   off with an error instead of streaming forever.
 - **Sampling** — haikucode sends no `temperature` unless you set one in
-  `config.json` (`"temperature": 0.7`), so each model's recommended sampling
-  applies; the DeepSeek preset keeps `0.2`.
+  `config.json` (`"temperature": 0.7`, or per model in `models`), so each
+  model's recommended sampling applies; the DeepSeek preset keeps `0.2`.
 - **Reasoning effort** — `/effort auto|off|low|medium|high|xhigh|max` (or the `/config`
   row) is translated per provider: DeepSeek `thinking` + `reasoning_effort`
   (`low`/`high`/`max`), GLM `thinking`, OpenAI/Gemini/Groq
@@ -184,9 +198,11 @@ memory, sessions, skills) into `~/.config/haikucode`.
   sends nothing. `xhigh` and `max` go out as-is to current Claude models
   (Opus 4.6/Sonnet 4.6 get `high` for `xhigh`), as `xhigh` to OpenAI GPT-5.2+
   and OpenRouter, and as `high` everywhere else.
-- **Native APIs** — `"api": "chat" | "messages" | "responses"` picks the wire
-  protocol; the anthropic preset defaults to Messages and the openai preset to
-  Responses. Within a run, Anthropic's signed thinking and Responses' encrypted
+- **Native APIs** — `"apis": {"<provider>": "chat" | "messages" | "responses"}`
+  picks the wire protocol per provider, so one set for a gateway doesn't
+  follow a switch to a local server; the anthropic preset defaults to Messages
+  and the openai preset to Responses. An older top-level `"api"` is read as the
+  setting for the provider that was active. Within a run, Anthropic's signed thinking and Responses' encrypted
   reasoning (stateless, `store: false`) are replayed across tool turns.
 - **Prompt caching & cost** — Anthropic cache breakpoints on the system prompt
   and the latest turn, an OpenAI `prompt_cache_key`, and cache hits read from

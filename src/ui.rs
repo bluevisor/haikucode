@@ -719,6 +719,7 @@ impl App {
             UiEvent::ModelChanged(m) => {
                 self.settings.model = m.clone();
                 self.settings.sync_active_custom();
+                self.sync_prices(); // a model can carry its own prices
                 self.model_info = m;
             }
             UiEvent::Usage(s) => {
@@ -3681,7 +3682,7 @@ impl App {
     /// user-set one, else the built-in table) or hide the cost (a custom
     /// server with no known price).
     fn sync_prices(&mut self) {
-        match self.settings.price_list() {
+        match self.settings.effective_price_list() {
             Some(p) => {
                 self.price_in = p.price_in;
                 self.price_out = p.price_out;

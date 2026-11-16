@@ -623,7 +623,7 @@ fn run_oneshot(
     let model = cfg.model.clone();
     // The cost counter follows the provider: a custom server without a price
     // list has no known cost (null in the JSON summary).
-    let price_list = cfg.price_list();
+    let price_list = cfg.effective_price_list();
     let price_currency = price_list
         .as_ref()
         .map(|p| p.price_currency.clone())
@@ -877,7 +877,7 @@ fn run_tui(
     let price_currency = money::Currency::parse(&cfg.price_currency);
     // A custom server without a price list has no known cost: the readout is
     // hidden rather than priced at a guess.
-    let cost_known = cfg.price_list().is_some();
+    let cost_known = cfg.effective_price_list().is_some();
     let settings = cfg.clone();
     let perm_start = start_perm(&cfg, auto);
 
