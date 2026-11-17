@@ -410,3 +410,27 @@ fn re_running_sign_in_keeps_the_active_presets_proxy_url() {
     let d = app.wizard.as_ref().expect("the sign-in step");
     assert_eq!((d.base_url.as_str(), d.model.as_str()), ("https://proxy.example/v1", "gpt-x"));
 }
+
+#[test]
+fn a_key_pasted_on_the_sign_in_list_opens_the_key_prompt_with_it() {
+    use crate::ui::types::{PickAction, ProviderStep};
+    let mut app = App::new(test_ui_config(), Vec::new());
+    let (h, rx) = test_handles();
+    app.open_provider_picker();
+    pick_row(&mut app, &h, "groq");
+    assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth)));
+
+    // Pasted on the list (the row says "paste a key"): not a filter.
+    app.on_paste("  gsk_abcd1234\n".into());
+    assert!(matches!(app.mode, Mode::ProviderInput { step: ProviderStep::ApiKey }));
+    assert_eq!(app.wiz_input, "gsk_abcd1234");
+    assert!(rx.try_iter().next().is_none(), "a paste never submits");
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &h);
+    assert_eq!(sent_kinds(&rx), ["key groq gsk_abcd1234", "auth groq api", "switch groq", "models"]);
+
+    // A blank paste stays on the list.
+    app.open_provider_picker();
+    pick_row(&mut app, &h, "groq");
+    app.on_paste("   ".into());
+    assert!(app.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth)), "blank paste stays on the list");
+}
