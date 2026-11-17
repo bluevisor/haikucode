@@ -158,6 +158,77 @@ fn without_tools(messages: &[Message]) -> Vec<Message> {
     out
 }
 
+/// Models that refused a request because it carried a system prompt this run,
+/// keyed `provider/model` (Gemini: "Developer instruction is not enabled for
+/// models/…").
+static NO_SYSTEM: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn takes_system(cfg: &Config) -> bool {
+    !NO_SYSTEM.lock().map(|l| l.contains(&image_key(cfg))).unwrap_or(false)
+}
+
+/// A 4xx saying the model takes no system (or "developer") message.
+fn rejects_system(err: &anyhow::Error) -> bool {
+    let Some(s) = err.downcast_ref::<HttpStatus>() else { return false };
+    let d = s.detail.to_ascii_lowercase();
+    matches!(s.code, 400 | 422)
+        && [
+            "developer instruction is not enabled",
+            "system instruction is not enabled",
+            "developer instruction is not supported",
+            "system instruction is not supported",
+            "does not support system",
+            "does not support developer",
+            "system role is not supported",
+            "system messages are not supported",
+        ]
+        .iter()
+        .any(|w| d.contains(w))
+}
+
+/// On a system-prompt rejection: remember it and say so, so the caller
+/// resends at once with the instructions folded into the conversation.
+fn retry_without_system(cfg: &Config, messages: &[Message], err: &anyhow::Error) -> Option<String> {
+    if !rejects_system(err) || !takes_system(cfg) || messages.iter().all(|m| m.role != "system") {
+        return None;
+    }
+    if let Ok(mut l) = NO_SYSTEM.lock() {
+        l.push(image_key(cfg));
+    }
+    Some(format!("{} takes no system prompt — resending with the instructions in the first message", cfg.model))
+}
+
+/// `messages` for a model without a system role: every system message's text
+/// moves to the front of the first user message, marked off as instructions.
+fn without_system(messages: &[Message]) -> Vec<Message> {
+    let (system, mut rest): (Vec<Message>, Vec<Message>) = messages.iter().cloned().partition(|m| m.role == "system");
+    let text = system.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n\n");
+    if text.is_empty() {
+        return rest;
+    }
+    let head = format!("<instructions>\n{text}\n</instructions>");
+    match rest.iter_mut().find(|m| m.role == "user") {
+        Some(m) => m.content = format!("{head}\n\n{}", m.content),
+        None => rest.insert(0, Message::user(head)),
+    }
+    rest
+}
+
+/// `messages` reshaped for what the active model has refused this run (tools,
+/// a system prompt), or None when it takes them as they are.
+fn adapted(cfg: &Config, messages: &[Message], with_tools: bool) -> Option<Vec<Message>> {
+    let no_tools = with_tools && !takes_tools(cfg);
+    let no_system = !takes_system(cfg);
+    if !no_tools && !no_system {
+        return None;
+    }
+    let mut out = if no_tools { without_tools(messages) } else { messages.to_vec() };
+    if no_system {
+        out = without_system(&out);
+    }
+    Some(out)
+}
+
 /// Sleep for `d`, waking early on cancel. Returns false when cancelled.
 fn sleep_unless_cancelled(d: Duration, cancel: &AtomicBool) -> bool {
     let deadline = std::time::Instant::now() + d;
@@ -233,16 +304,15 @@ pub fn chat_resilient(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let plain: Vec<Message>;
-        let (messages, tools) = if takes_tools(cfg) {
-            (messages, Some(tools))
-        } else {
-            plain = without_tools(messages);
-            (&plain[..], None)
-        };
+        let reshaped = adapted(cfg, messages, true);
+        let tools = takes_tools(cfg).then_some(tools);
+        let messages = reshaped.as_deref().unwrap_or(messages);
         match chat_stream(http, cfg, messages, tools, cancel, &mut on_content, &mut on_reasoning) {
             Err(e) => {
-                if let Some(note) = retry_without_images(cfg, messages, &e).or_else(|| retry_without_tools(cfg, &e)) {
+                let note = retry_without_images(cfg, messages, &e)
+                    .or_else(|| retry_without_tools(cfg, &e))
+                    .or_else(|| retry_without_system(cfg, messages, &e));
+                if let Some(note) = note {
                     on_retry(&note);
                     continue;
                 }
@@ -283,11 +353,15 @@ pub fn chat_plain(
     messages: &[Message],
     cancel: &AtomicBool,
 ) -> Result<(String, Option<Usage>)> {
-    let tries = 2;
+    // One more try than the transient-error retry, for the resend after a
+    // model's first system-prompt refusal.
+    let tries = 3;
     for attempt in 1..=tries {
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("cancelled"));
         }
+        let reshaped = adapted(cfg, messages, false);
+        let messages = reshaped.as_deref().unwrap_or(messages);
         match chat_stream(http, cfg, messages, None, cancel, |_| {}, |_| {}) {
             Ok((content, _, usage, _)) => {
                 if cancel.load(Ordering::Relaxed) {
@@ -296,10 +370,10 @@ pub fn chat_plain(
                 return Ok((content, usage));
             }
             Err(e) => {
-                if retry_without_images(cfg, messages, &e).is_some() {
+                if retry_without_images(cfg, messages, &e).is_some() || retry_without_system(cfg, messages, &e).is_some() {
                     continue;
                 }
-                let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries) else {
+                let Some(wait) = retry_delay(&e, attempt).filter(|_| attempt < tries - 1) else {
                     return Err(e);
                 };
                 if !sleep_unless_cancelled(wait, cancel) {
@@ -361,6 +435,26 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent[0].content.starts_with("You are Haiku Code.") && sent[0].content.contains("Tools are unavailable"));
         assert_eq!(without_tools(&[Message::user("hi")])[0].role, "system");
+    }
+
+    #[test]
+    fn a_system_prompt_rejection_folds_the_instructions_into_the_first_message() {
+        let cfg = Config { provider: "gemini".into(), model: "antigravity-nosystem-test".into(), ..Config::default() };
+        let err = |code, detail: &str| anyhow::Error::from(HttpStatus { code, retry_after: None, detail: detail.into() });
+        let gemini = r#"[{"error":{"code":400,"message":"Developer instruction is not enabled for models/antigravity-nosystem-test","status":"INVALID_ARGUMENT"}}]"#;
+        let convo = [Message::system("You are Haiku Code."), Message::user("hi"), Message::user("again")];
+        assert!(adapted(&cfg, &convo, true).is_none(), "untouched until the model refuses");
+        assert!(retry_without_system(&cfg, &convo, &err(400, "bad tool schema")).is_none());
+        assert!(retry_without_system(&cfg, &convo[1..], &err(400, gemini)).is_none(), "no system message to drop");
+        assert!(retry_without_system(&cfg, &convo, &err(400, gemini)).is_some());
+        assert!(retry_without_system(&cfg, &convo, &err(400, gemini)).is_none(), "only once");
+        let sent = adapted(&cfg, &convo, true).unwrap();
+        assert!(sent.iter().all(|m| m.role != "system"));
+        assert_eq!(sent[0].content, "<instructions>\nYou are Haiku Code.\n</instructions>\n\nhi");
+        assert_eq!(sent[1].content, "again");
+        // Internal no-tools calls (compaction) are reshaped the same way.
+        assert_eq!(adapted(&cfg, &convo, false).unwrap().len(), 2);
+        assert_eq!(without_system(&[Message::system("s")])[0].role, "user");
     }
 
     #[test]
