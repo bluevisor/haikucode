@@ -20,6 +20,15 @@ pub(super) fn messages_payload(messages: &[Message], supports_images: bool, mode
                 let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
                 if let Some(o) = v.as_object_mut() {
                     o.remove("native"); // haikucode's own bookkeeping, not the wire format
+                    if !from_chat_model(m, model) {
+                        // Another model's call signatures mean nothing here,
+                        // and a strict server rejects the unknown field.
+                        for call in o.get_mut("tool_calls").and_then(|c| c.as_array_mut()).into_iter().flatten() {
+                            if let Some(c) = call.as_object_mut() {
+                                c.remove("extra_content");
+                            }
+                        }
+                    }
                     if let Some(r) = chat_reasoning(m, model) {
                         o.insert("reasoning_content".into(), serde_json::json!(r));
                     }
@@ -51,18 +60,28 @@ pub(super) fn messages_payload(messages: &[Message], supports_images: bool, mode
         .collect()
 }
 
-/// The chat/completions native form of an assistant turn: just its streamed
-/// reasoning. Plain text bound to no signature, so unlike the Messages and
-/// Responses forms it survives session resume and compaction.
-pub(super) fn chat_native(cfg: &Config, reasoning: String) -> Option<serde_json::Value> {
-    (!reasoning.is_empty()).then(|| serde_json::json!({"api": "chat", "model": cfg.model, "reasoning_content": reasoning}))
+/// The chat/completions native form of an assistant turn: the model it came
+/// from and its streamed reasoning, kept when there is reasoning to replay or
+/// the turn's tool calls are `signed` (carry `extra_content`). Plain text
+/// bound to no history, so unlike the Messages and Responses forms it
+/// survives session resume and compaction.
+pub(super) fn chat_native(cfg: &Config, reasoning: String, signed: bool) -> Option<serde_json::Value> {
+    if !reasoning.is_empty() {
+        return Some(serde_json::json!({"api": "chat", "model": cfg.model, "reasoning_content": reasoning}));
+    }
+    signed.then(|| serde_json::json!({"api": "chat", "model": cfg.model}))
+}
+
+/// Did this stored assistant turn stream from chat/completions with `model`?
+fn from_chat_model(m: &Message, model: &str) -> bool {
+    m.native.as_ref().is_some_and(|n| m.role == "assistant" && n["api"] == "chat" && n["model"] == model)
 }
 
 /// A stored assistant turn's reasoning, if it streamed from chat/completions
 /// with `model` (another model never sees it).
 fn chat_reasoning<'a>(m: &'a Message, model: &str) -> Option<&'a str> {
-    let n = m.native.as_ref().filter(|_| m.role == "assistant")?;
-    (n["api"] == "chat" && n["model"] == model).then(|| n["reasoning_content"].as_str()).flatten()
+    let n = m.native.as_ref().filter(|_| from_chat_model(m, model))?;
+    n["reasoning_content"].as_str()
 }
 
 /// Is this native turn bound to the exact history it was generated over
@@ -165,7 +184,7 @@ mod tests {
     fn chat_reasoning_is_replayed_to_the_same_model_only() {
         let cfg = Config::default();
         let mut turn = Message { role: "assistant".into(), content: String::new(), images: vec![], tool_calls: None, tool_call_id: None, native: None };
-        turn.native = chat_native(&cfg, "Need to read the file.".into());
+        turn.native = chat_native(&cfg, "Need to read the file.".into(), false);
         let v = &messages_payload(&[turn.clone()], true, &cfg.model)[0];
         assert_eq!(v["reasoning_content"], "Need to read the file.");
         assert!(v.get("native").is_none(), "{v}");
@@ -175,7 +194,26 @@ mod tests {
         let back: Message = serde_json::from_str(&serde_json::to_string(&turn).unwrap()).unwrap();
         assert_eq!(chat_reasoning(&back, &cfg.model), Some("Need to read the file."));
         assert!(!native_is_history_bound(back.native.as_ref().unwrap()));
-        assert!(chat_native(&cfg, String::new()).is_none(), "no reasoning, no native turn");
+        assert!(chat_native(&cfg, String::new(), false).is_none(), "no reasoning, no native turn");
+    }
+
+    #[test]
+    fn a_signed_tool_call_goes_back_to_the_model_that_made_it_only() {
+        use crate::api::AccumCall;
+        let cfg = Config { provider: "google".into(), model: "gemini-3.8-flash".into(), ..Config::default() };
+        let sig = serde_json::json!({"google": {"thought_signature": "c2ln"}});
+        let call = AccumCall { id: "c1".into(), name: "list_files".into(), args: "{}".into(), extra: Some(sig.clone()) };
+        let mut turn = Message { role: "assistant".into(), content: String::new(), images: vec![], tool_calls: None, tool_call_id: None, native: None };
+        turn.tool_calls = Some(vec![call.into_tool_call(0)]);
+        turn.native = chat_native(&cfg, String::new(), true);
+        // Survives a saved session.
+        let turn: Message = serde_json::from_str(&serde_json::to_string(&turn).unwrap()).unwrap();
+        let v = &messages_payload(std::slice::from_ref(&turn), true, &cfg.model)[0];
+        assert_eq!(v["tool_calls"][0]["extra_content"], sig, "{v}");
+        assert!(v.get("reasoning_content").is_none(), "{v}");
+        let v = &messages_payload(&[turn], true, "deepseek-v4-pro")[0];
+        assert!(v["tool_calls"][0].get("extra_content").is_none(), "another model never sees it: {v}");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "list_files");
     }
 
     #[test]

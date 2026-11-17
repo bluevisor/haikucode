@@ -106,6 +106,7 @@ struct DeltaToolCall {
     index: usize,
     id: Option<String>,
     function: Option<DeltaFn>,
+    extra_content: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct DeltaFn {
@@ -250,6 +251,9 @@ fn chat_completions(
             if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
                 slot.id = id;
             }
+            if tc.extra_content.is_some() {
+                slot.extra = tc.extra_content;
+            }
             if let Some(f) = tc.function {
                 if let Some(n) = f.name.filter(|n| !n.is_empty()) {
                     slot.name = n;
@@ -262,7 +266,8 @@ fn chat_completions(
         Ok(false)
     })?;
     calls.retain(|c| !c.name.is_empty());
-    Ok((content, calls, usage, chat_native(cfg, reasoning)))
+    let signed = calls.iter().any(|c| c.extra.is_some());
+    Ok((content, calls, usage, chat_native(cfg, reasoning, signed)))
 }
 
 #[cfg(test)]

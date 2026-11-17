@@ -318,6 +318,7 @@ impl AnthropicAcc {
                 id: b["id"].as_str().unwrap_or("").to_string(),
                 name: b["name"].as_str().unwrap_or("").to_string(),
                 args: args.clone(),
+                extra: None,
             })
             .collect();
         let parts: Vec<Value> = self.blocks.into_iter().filter(|b| !b.is_null()).collect();
@@ -647,6 +648,7 @@ mod tests {
             id: id.into(),
             kind: "function".into(),
             function: FunctionCall { name: "read_file".into(), arguments: args.into() },
+            extra_content: None,
         }]);
         m
     }

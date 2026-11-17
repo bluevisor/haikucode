@@ -49,6 +49,11 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Provider data that must come back with the call: Gemini signs each
+    /// function call (`{"google": {"thought_signature": …}}`) and answers 400
+    /// to a history whose calls lost it. Sent only to the model that made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +68,8 @@ pub struct AccumCall {
     pub id: String,
     pub name: String,
     pub args: String,
+    /// The provider's `extra_content` for this call (see `ToolCall`).
+    pub extra: Option<serde_json::Value>,
 }
 
 impl AccumCall {
@@ -73,7 +80,7 @@ impl AccumCall {
     pub fn into_tool_call(self, fallback_idx: usize) -> ToolCall {
         let id = if self.id.is_empty() { format!("call_{fallback_idx}") } else { self.id };
         let args = if self.args.trim().is_empty() { "{}".into() } else { self.args };
-        ToolCall { id, kind: "function".into(), function: FunctionCall { name: self.name, arguments: args } }
+        ToolCall { id, kind: "function".into(), function: FunctionCall { name: self.name, arguments: args }, extra_content: self.extra }
     }
 }
 
