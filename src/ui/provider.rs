@@ -227,6 +227,39 @@ impl App {
         }
     }
 
+    /// A paste on the sign-in list is a key, not a filter: the row says
+    /// "API key — paste a key", so people paste right there. Open the key
+    /// prompt with the paste in it (Enter still saves). False when this
+    /// provider takes no key, so the paste filters as usual.
+    pub(super) fn paste_key_at_auth_picker(&mut self, pasted: &str) -> bool {
+        use crate::config::AuthMethod;
+        use types::AuthChoice;
+        let key = pasted.trim();
+        let Some(d) = self.wizard.as_mut() else { return false };
+        if key.is_empty() {
+            return false;
+        }
+        // The highlighted row's kind of key (API or coding plan), else the first.
+        let at_cursor = self.picker.as_ref().and_then(|p| d.choices.get(p.cursor).copied());
+        let method = match at_cursor {
+            Some(AuthChoice::EnterKey(m) | AuthChoice::Keep(m)) if matches!(m, AuthMethod::Api | AuthMethod::Plan) => {
+                Some(m)
+            }
+            _ => d.choices.iter().find_map(|c| match c {
+                AuthChoice::EnterKey(m) => Some(*m),
+                _ => None,
+            }),
+        };
+        let Some(method) = method else { return false };
+        d.method = method;
+        d.error = None;
+        self.picker = None;
+        self.ask(ProviderStep::ApiKey);
+        self.wiz_input = key.to_string();
+        self.wiz_cursor = self.wiz_input.chars().count();
+        true
+    }
+
     /// Open a typed step (prefilled where there's something to keep).
     pub(super) fn ask(&mut self, step: ProviderStep) {
         self.wiz_input = self.wizard.as_ref().map(|d| match step {

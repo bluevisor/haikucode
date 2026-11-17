@@ -21,6 +21,10 @@ impl App {
                 self.wiz_cursor += pasted.chars().count();
             }
             Mode::Select => {
+                let auth = self.picker.as_ref().is_some_and(|p| matches!(p.action, PickAction::Auth));
+                if auth && self.paste_key_at_auth_picker(&one_line().collect::<String>()) {
+                    return;
+                }
                 if let Some(p) = self.picker.as_mut() {
                     p.filter.extend(one_line());
                     p.cursor = 0;
