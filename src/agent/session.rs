@@ -230,6 +230,7 @@ mod tests {
             id: id.into(),
             kind: "function".into(),
             function: FunctionCall { name: "bash".into(), arguments: "{}".into() },
+            extra_content: None,
         };
         let mut msgs = vec![
             Message::system("s"),

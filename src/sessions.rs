@@ -587,6 +587,7 @@ mod tests {
             id: "c1".into(),
             kind: "function".into(),
             function: crate::api::FunctionCall { name: "write_file".into(), arguments: "{\"path\":\"a.html\"}".into() },
+            extra_content: None,
         }]);
         msgs.push(asst);
         msgs.push(Message::tool("c1".to_string(), "OK wrote a.html".to_string()));

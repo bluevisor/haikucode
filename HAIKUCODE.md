@@ -48,7 +48,7 @@ src/
   config/setup.rs     interactive first-run setup wizard
   config/tests_*.rs   config tests: disk round trips (tests_disk), providers/models/prices (tests_models)
   api.rs              OpenAI-compatible streaming SSE, tool schema, multimodal parts, retry, list_models
-  api/http.rs         HTTP agent, auth headers, typed error status, retry/backoff, text-only fallback
+  api/http.rs         HTTP agent, auth headers, typed error status, retry/backoff, text-only and no-tools fallbacks
   api/stream.rs       chat/completions SSE streaming and delta parsing, usage, sampling-loop guard
   api/payload.rs      request bodies: messages on the wire, replayed reasoning, reasoning fields
   api/tools_spec.rs   the tool schema advertised to the model (+ MCP tools, sub-agent subset)
